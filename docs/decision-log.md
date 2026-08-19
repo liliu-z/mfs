@@ -255,9 +255,22 @@ TS 侧 `embedCache|embeddingCache|vectorCache` 零命中。向量只在 Parquet 
 
 * StashBase 派生内容位于同一 app data root 下的 `derived.nosync/`，但不归当前 MFS 管理；当前没有用于 Copy 原文件的 MFS object store。
 
-* 当前全局 scope 依赖文件绝对路径，没有显式 `project_id`。所以它在物理上已经是“一份全局 Repository、多目录共享”，在领域模型和隔离约束上还不是完整的 multi-Project Repository。
+* 当前全局 scope 依赖文件绝对路径，没有显式 `project_id`。所以它在物理上已经是“一份全局 Engine 数据、多目录共享”，在领域模型和隔离约束上还不是完整的 multi-Project Engine。
 
 ## 3. 设计决策
+
+现行设计快速索引：
+
+| 主题 | 现行决策 |
+| --- | --- |
+| 定位与全局拓扑 | D-005、D-007、D-027 |
+| Link / Copy / sync | D-024、D-028、D-032 |
+| Revision 与查询一致性 | D-020、D-029、D-030 |
+| catalog、hash、缓存与事务 | D-016、D-017、D-018 |
+| Processor 与 Provider | D-008、D-009、D-010、D-019 |
+| 公开 Interface 与实现路线 | D-012、D-013、D-021、D-031 |
+
+其他编号保留为历史推理；标为 Superseded 的结论不得作为实现依据。
 
 ### D-001：MFS 是智能文件数据层
 
@@ -305,7 +318,7 @@ TS 侧 `embedCache|embeddingCache|vectorCache` 零命中。向量只在 Parquet 
 
 ### D-004：先 Library，再 CLI，再 Engine
 
-状态：Accepted。对应设计：§12。
+状态：**Superseded**（被 D-031 取代，2026-08-19）。原对应设计：§14。
 
 取代：早期的 Engine-first 建议。
 
@@ -325,7 +338,7 @@ TS 侧 `embedCache|embeddingCache|vectorCache` 零命中。向量只在 Parquet 
 
 ### D-005：一个 Engine 管多个 Source
 
-状态：Accepted，由 D-023 细化为一个 Repository/Engine 管多个 Project 与 Source。对应设计：§2、§12。
+状态：Accepted，由 D-027 细化为一个全局 Engine 管多个 Project 与 Source。对应设计：§1、§3、§12。
 
 决定：未来一个 StashBase 实例启动一个 Engine；Source 是逻辑状态和后台 task，不是独立进程。
 
@@ -367,7 +380,7 @@ TS 侧 `embedCache|embeddingCache|vectorCache` 零命中。向量只在 Parquet 
 
 ### D-008：MFS 拥有处理，StashBase 拥有展示
 
-状态：Accepted。对应设计：§3、§9。
+状态：Accepted。对应设计：§2、§10。
 
 决定：PDF/OCR/DOCX/audio 的提取、Derived Representation、任务、索引和 Evidence 迁入 MFS；StashBase 保留 viewer、播放器、交互和业务语义。
 
@@ -377,7 +390,7 @@ TS 侧 `embedCache|embeddingCache|vectorCache` 零命中。向量只在 Parquet 
 
 ### D-009：白名单 + Processor registry
 
-状态：Accepted。对应设计：§9。
+状态：Accepted。对应设计：§10。
 
 决定：所有文件可进入 Entry inventory；只有 Processing Profile 白名单启用的格式自动处理。Processor 可以显式注册和替换。
 
@@ -389,7 +402,7 @@ TS 侧 `embedCache|embeddingCache|vectorCache` 零命中。向量只在 Parquet 
 
 ### D-010：模型按能力拆分 Provider
 
-状态：Accepted。对应设计：§9。
+状态：Accepted。对应设计：§10。
 
 决定：Embedding、Text Generation、Vision 和 Transcription 使用不同 Interface，通过统一 registry 查找。
 
@@ -401,7 +414,7 @@ TS 侧 `embedCache|embeddingCache|vectorCache` 零命中。向量只在 Parquet 
 
 ### D-011：文件浏览、grep 和 ANNS 使用不同数据路径
 
-状态：Accepted，由 D-026 补充 linked fallback。对应设计：§8。
+状态：**Superseded**（被 D-029 取代，2026-08-19）。原对应设计：§8。
 
 决定：
 
@@ -418,7 +431,7 @@ keyword/vector/hybrid     -> Index Projection
 
 ### D-012：新建核心，不直接选择某个上游版本继续开发
 
-状态：Accepted。对应设计：§13。
+状态：Accepted。对应设计：§14。
 
 决定：
 
@@ -438,7 +451,7 @@ keyword/vector/hybrid     -> Index Projection
 
 ### D-013：兼容 CLI 体验，不兼容内部模块
 
-状态：Accepted。对应设计：§13。
+状态：Accepted。对应设计：§5、§14。
 
 决定：保留 `ls/tree/cat/grep/search/status` 等体验；为 Source 和文件 mutation 增加无歧义命令。`remove` 默认不能删除原文件，真实删除必须显式调用 file delete。
 
@@ -448,7 +461,7 @@ keyword/vector/hybrid     -> Index Projection
 
 ### D-014：MFS 拥有写入路径
 
-状态：**Superseded**（被 D-022、D-024 取代，2026-08-19）。曾取代 D-002。原对应设计：§1、§4、§5。
+状态：**Superseded**（最终被 D-027、D-028 取代，2026-08-19）。曾取代 D-002。原对应设计：§1、§4、§5。
 
 背景：F-005 显示"应用改完磁盘再通知索引"的胶水占 21 个调用点，其中 17 个是应用侧；F-006 显示这两步会各自成败，形成漂移，只能靠后续 sync 修复。
 
@@ -468,7 +481,7 @@ keyword/vector/hybrid     -> Index Projection
 
 ### D-015：不提供 watcher；sync 只服务外部改动，触发权在应用
 
-状态：**Superseded**（由 D-025 保留触发权结论并重定义 scan Interface，2026-08-19）。曾取代 D-006。
+状态：**Superseded**（触发权结论由 D-028 保留，scan Interface 被其重定义，2026-08-19）。曾取代 D-006。
 
 背景：F-010 显示 StashBase 已在 2026-06 主动删除 watcher，并列出了随之消失的整类缺陷；改为在事件点主动 pull，已被验证可行。
 
@@ -488,7 +501,7 @@ keyword/vector/hybrid     -> Index Projection
 
 ### D-016：三层 content-addressed hash，位置信息不进 key
 
-状态：Accepted（2026-08-18）。对应设计：§6。
+状态：Accepted（2026-08-18）。对应设计：§9。
 
 背景：F-009 显示没有 embedding 缓存，且 chunk id 把路径和行号写进了 key——开头插一行导致全文重新 embedding。F-011 显示派生结果按源文件**路径**寻址，改名即失效。
 
@@ -510,7 +523,7 @@ keyword/vector/hybrid     -> Index Projection
 
 ### D-017：SQLite 是元数据账本，向量库只存向量
 
-状态：Accepted（2026-08-18）。细化 P-002。对应设计：§10。
+状态：Accepted（2026-08-18）。细化 P-002。对应设计：§11。
 
 背景：F-008 确认 Milvus Lite 落盘是 Parquet 而非 SQLite；F-011 确认文件元数据（`file_hash`、`is_dir`、`embed_status`、`parent_dir`）寄生在 Parquet 列里。
 
@@ -520,11 +533,11 @@ keyword/vector/hybrid     -> Index Projection
 
 代价：多一个需要 migration 的持久化组件。
 
-约束：SQLite 的派生与索引状态可从 linked origin 或 copied object 重建；single-writer；崩溃恢复不依赖向量库充当事务账本。
+约束：single-writer；崩溃恢复不依赖向量库充当事务账本。Index Projection 可从 Canonical Text 重建；Copied 的 Canonical Text 可从 object 重建；Linked 只有在 live bytes 仍匹配目标 Revision 时才能重建。Project/Source/Entry identity 与 Copied object 必须纳入备份，不能宣称整个 `data_dir` 都是 cache。
 
 ### D-018：不做多文件原子事务
 
-状态：Accepted（2026-08-18），由 D-024 澄清 Copy 专用 CAS 不用于实现多文件事务。对应设计：§6、§10。
+状态：Accepted（2026-08-18），由 D-024 澄清 Copy 专用 CAS 不用于实现多文件事务。对应设计：§4、§7、§11。
 
 背景：讨论中曾把多文件原子提交当作"不 POSIX"的卖点，随后逐场景核对发现缺乏真实需求。
 
@@ -532,13 +545,15 @@ keyword/vector/hybrid     -> Index Projection
 
 决定：**单个 copied object 的发布必须原子；多 Entry 内容写入不承诺原子。** 不为多文件事务引入 WAL commit protocol。D-024 的 content-addressed object 只用于 Copy 去重和耐久性，不提供事务快照。
 
+单 object 协议是同一 `data_dir` 内临时写入 → hash/fsync → 原子 rename → catalog 事务加引用；崩溃可以留下待 GC 的无引用 blob，但 catalog 不能指向未完成文件。
+
 理由：多文件原子性的实现代价（内容寻址存储、垃圾回收、materialize 层）远超收益，且会牺牲外部工具兼容。
 
 重新评估：出现真正无法容忍中间态的场景时重开——但要先给出具体场景，不接受"更严谨"这类理由。
 
 ### D-019：配置与注册的判据是分发权
 
-状态：Accepted（2026-08-18）。细化 D-009、D-010。对应设计：§7。
+状态：Accepted（2026-08-18）。细化 D-009、D-010。对应设计：§10。
 
 背景：F-006 显示应用传入的 `provider/model/api_key` 是配置而非注入；F-012 显示转录依赖应用自建的三平台 native 二进制，MFS 无法接管。
 
@@ -560,7 +575,7 @@ keyword/vector/hybrid     -> Index Projection
 
 ### D-020：grep 必须在 MFS 内部
 
-状态：Accepted（2026-08-18），由 D-026 补充 linked/copy 可用性语义。细化 D-011。对应设计：§8。
+状态：Accepted（2026-08-18），由 D-029 补充 active Revision 语义。细化 D-011。对应设计：§8。
 
 背景：核实发现 keyword 检索完全绕过 MFS——`server/keyword-search.ts`(368 行) 直接调用 ripgrep 扫描原文与派生文件，还要自行处理 DOCX 派生 HTML、音频 transcript、转换未完成时的占位、HTML 正文提取。
 
@@ -572,7 +587,7 @@ keyword/vector/hybrid     -> Index Projection
 
 ### D-021：公开 API 必须挡住内部实现
 
-状态：Accepted（2026-08-18）。对应设计：§4。
+状态：Accepted（2026-08-18）。对应设计：§5。
 
 背景：F-005 显示调用方直接 import 四个内部模块；F-007、F-008 显示它 monkey-patch 了两个 MFS 内部方法（`Scanner.compute_file_hash`、`MilvusStore._query_all`）和两个上游方法。
 
@@ -584,7 +599,7 @@ keyword/vector/hybrid     -> Index Projection
 
 ### D-022：MFS 是多 Project 文件搜索 Repository
 
-状态：Accepted（2026-08-19）。取代 D-001、D-014。对应设计：§1、§3。
+状态：**Superseded**（被 D-027 取代，2026-08-19）。曾取代 D-001、D-014。
 
 背景：把 MFS 定义为“文件数据层并拥有写入路径”后，`managed/observed`、外部删除、scan 责任和原文副本位置持续互相矛盾。如果 MFS 既接管普通目录 CRUD，又保存中心副本和索引，它实际上已经成为 content database，却仍对外宣称是 filesystem。
 
@@ -604,7 +619,7 @@ keyword/vector/hybrid     -> Index Projection
 
 ### D-023：`state_root` 定义 Repository，Project 是逻辑隔离单元
 
-状态：Accepted（2026-08-19）。取代 D-003，细化 D-005。对应设计：§2、§4、§10、§11。
+状态：**Superseded**（被 D-027 取代，2026-08-19）。曾取代 D-003、细化 D-005。
 
 背景：讨论“一张表一个 Project 还是多个 Project”时，发现物理部署、逻辑隔离和产品 Project 被混成一个概念。F-003、F-013 证明当前 StashBase 已是一份全局 Milvus store 服务多个目录。
 
@@ -625,7 +640,7 @@ keyword/vector/hybrid     -> Index Projection
 
 ### D-024：内容策略是 linked/copied，不是 managed/observed
 
-状态：Accepted（2026-08-19）。对应设计：§4、§6、§8、§10。
+状态：Accepted（2026-08-19），由 D-028、D-029 细化生命周期和查询语义。对应设计：§4、§8、§11。
 
 背景：`managed/observed` 看起来像运行 mode，却同时暗含所有权、同步、删除传播和可用性，无法从字段名判断真实保证。保存 Canonical Text 已经产生派生副本；如果还要求原文件删除后 `read/grep` 不失败，就必须保存原始 bytes。
 
@@ -638,20 +653,23 @@ keyword/vector/hybrid     -> Index Projection
 决定：采用方案 3：
 
 * `linked` 保存 `origin_uri`、观察到的 `content_hash`、完整 Canonical Text 和索引，不保存完整原始 bytes；
-* `copied` 将原始 bytes 写入 Repository 的 content-addressed object store，并保留可选 `origin_uri` 作为 provenance；
+* `copied` 将原始 bytes 写入 Engine 的 content-addressed object store，并保留可选 `origin_uri` 作为 provenance；
 * linked 外部删除由完整 scan 确认并 tombstone；
-* copied 外部删除不传播，删除必须显式 `remove`；
-* 相同 bytes 跨 Entry/Project 可以物理去重，但 Entry identity 仍由 `source_key` 决定。
+* copied 外部删除不传播，删除必须显式 `remove_copied`；
+* 相同 bytes 跨 Entry/Project 可以物理去重，但 Entry identity 仍然独立；
+* `logical_path` 在 Project 内唯一，Link/Copy 路径冲突必须显式解决，不能静默遮蔽或合并。
+
+Linked Entry 不提供单条永久 `remove`：外部文件仍存在时，删掉账本只会在下次 sync 重新出现。单条排除通过 Source ignore 规则表达，整批移除使用 `detach_linked_source`。
 
 理由：linked 保持普通目录低成本接入；copied 用明确的存储成本换稳定 read/grep。策略名称直接描述 MFS 保存了什么，不再暗示 MFS 接管外部目录。
 
 代价：两种策略的 read/grep 可用性不同；copied 需要 object GC、容量管理和备份；linked fallback 只能恢复 Canonical Text，不能恢复完整二进制。D-018 拒绝的是“为多文件事务强制所有内容进入 CAS”，不禁止 Copy 专用的内容寻址去重。
 
-重新评估：若实际使用中绝大多数 Entry 都立即 materialize，可以考虑把 copied 设为默认；仍不删除 linked，除非不再支持外部工作目录。
+重新评估：若实际使用中绝大多数 Entry 都通过 Copy 导入，可以考虑把 copied 设为默认；仍不删除 linked，除非不再支持外部工作目录。
 
 ### D-025：调用方枚举，MFS 用 scan generation 对账
 
-状态：Accepted（2026-08-19）。取代 D-015。对应设计：§5、§6、§7。
+状态：**Superseded**（被 D-028 取代，2026-08-19）。曾取代 D-015。
 
 背景：StashBase 没有自己的 hash 账本；要求它从 MFS 拉全量 list/hash 再 diff 会复制状态和同步算法。另一方面，仅“无脑 add”无法识别删除，普通 add 也会把每轮扫描变成重复 Entry。
 
@@ -672,7 +690,7 @@ keyword/vector/hybrid     -> Index Projection
 
 ### D-026：搜索不依赖 linked 原文件，read/grep 必须 fallback + warning
 
-状态：Accepted（2026-08-19）。细化 D-011、D-020。对应设计：§8。
+状态：**Superseded**（被 D-029 取代，2026-08-19）。曾细化 D-011、D-020。
 
 背景：如果索引只保存外部 link，文件在下一次 scan 前被删除或改写，搜索命中可能指向不存在的路径，live grep 也会失败。把这种情况称为“MFS 不一致”混淆了内部一致性和相对外部目录的新鲜度。
 
@@ -684,11 +702,136 @@ keyword/vector/hybrid     -> Index Projection
 
 重新评估：如果产品不需要 live grep，可以统一对当前 Entry revision 的 Canonical Text grep，进一步简化状态；如果要求完整原始字节 fallback，应 materialize 为 copied。
 
+### D-027：一个 deployment 只有一个全局 MFS Engine
+
+状态：Accepted（2026-08-19）。取代 D-022、D-023。对应设计：§1、§3、§5、§11、§12。
+
+背景：将 `state_root` 建模为 Repository 并暴露 `open_repository(state_root)`，同时又声称 StashBase 使用一个全局 MFS，产生直接矛盾。F-003、F-013 已证明当前 StashBase 在启动时确定一个 app data root，由一个 sidecar 和一个 Milvus store 服务所有打开目录。
+
+考虑过：
+
+1. 每个调用方按需打开任意 Repository；
+2. 一个 StashBase deployment 启动一个全局 Engine，`data_dir` 只在 Bootstrap 配置，Runtime Interface 只接受 Project scope；
+3. 每个 Project 启动独立 Engine/data directory。
+
+决定：采用方案 2。领域模型从 Project 开始，不包含 Repository。`data_dir` 是 Engine 私有部署配置；调用方连接 Engine，不能直接打开或共享该目录。独立测试或强隔离部署可以启动另一个 Engine，但不改变 Runtime Interface。
+
+StashBase 迁移后的默认 `data_dir` 是 `<appData>/mfs/`；迁移前现状仍是 `<appData>/vector-store.nosync/milvus.db/`，两者必须在文档和迁移工具中明确区分。
+
+V1 将一个 StashBase folder/library 映射为一个 Project；一个 Project 默认只有一个 primary Linked Source，并可包含 Copied Entry。多个 Project 共享 catalog、索引连接、worker 和内容缓存，所有可见性从显式 `project_id` 开始。
+
+理由：删除 Repository 后，业务复杂度没有散落到调用方，说明它不是有价值的领域 Module；相反，`open_repository` 会把路径、锁、migration 和后端生命周期泄漏给所有客户端。全局 Engine 将这些复杂度留在 Bootstrap 内部。
+
+代价：同一进程不能把多个任意 data directory 当作业务资源动态打开。需要强物理隔离时必须启动独立 Engine。
+
+重新评估：只有出现真实的“一个宿主同时管理多个可热插拔 MFS 数据集”需求时，才重新设计多实例管理；不能仅为测试便利恢复 Repository 领域概念。
+
+### D-028：StashBase 触发 sync，MFS 完成 scan；Copy 不参与 Source reconcile
+
+状态：Accepted（2026-08-19）。取代 D-025，细化 D-024。对应设计：§2、§4、§5、§6。
+
+背景：D-025 让 StashBase 枚举目录并编排 `begin_scan/upsert/commit`，把 ignore、symlink、稳定读取、删除确认和大量跨进程传输暴露到调用方。F-005、F-010 已确认当前实现恰好相反：StashBase 选择触发点，Python `scan_diff` 在内部 walk、hash 并与唯一账本比较。
+
+决定：
+
+* Linked Source 注册 root；StashBase 调用 `sync_source(project_id, source_id)`；
+* MFS 内部完成枚举、fingerprint、hash、diff、rename 配对和完整扫描后的删除；
+* rename 只在 filesystem identity 可确认或同 hash 配对唯一时保留原 `entry_id`，有歧义时按 delete + add；
+* StashBase 不维护文件树/hash manifest，也不编排 scan session；
+* Copy 是一次性 `copy_file`，写入 Stored Blob 后不再与 `origin_uri` 同步；
+* Linked Source 删除只影响 Linked Entry，Source sync 永远不删除 Copied Entry；
+* full sync 确认 missing 后 Linked Entry tombstone，默认查询立即排除；保留期内仅显式诊断/恢复查询可见；
+* V1 不提供 linked→copied 的原地 `materialize`。
+
+理由：MFS 已拥有 Source root、旧 hash 和处理规则，scan 放在内部形成更深的 Module；调用方只决定用户何时需要新鲜数据。Link 和 Copy 分开后，外部删除语义不再依赖一个混合 Source 的 `missing` flag。
+
+代价：MFS 必须承担本地 filesystem scan 的正确性和性能；远端 Engine 不能直接读取客户端路径，Copy 必须上传 stream，未来远端 Source 需要真实 Adapter 后再扩展。
+
+重新评估：只有出现 MFS 无法访问 Source、且调用方枚举是唯一可行方案的第二种部署时，才增加 manifest ingest Adapter；它不能替换本地 Source 的 `sync_source`。
+
+### D-029：grep 查询 active Canonical Text，原始读取不做文本 fallback
+
+状态：Accepted（2026-08-19）。取代 D-026，细化 D-011、D-020、D-024。对应设计：§7、§8。
+
+背景：D-026 让 linked `read/grep` 先读 live origin，失败后回退 Canonical Text。它产生两个问题：`read` 有时返回原始 bytes、有时返回提取文本，类型不成立；grep 同时具有 live 和 snapshot 两套语义，结果无法稳定解释。
+
+决定：
+
+* `grep`、`read_text`、keyword、semantic 和 hybrid 都只查询 Entry 的 active Revision；
+* 默认查询排除 tombstoned Entry；外部删除在 sync 前可能命中旧 active Revision，full sync tombstone 后隐藏；
+* `grep` 精确匹配 active Canonical Text，不读取 live external file；
+* `read_original` 单独读取原始 bytes：Copied Entry 读 Stored Blob，Linked Entry 读当前外部文件；
+* Linked 原文件缺失、权限失败或 identity 变化时，`read_original` 返回 typed error，不用文本伪装 bytes；
+* 从搜索结果读取原文件时可传 `expect_revision`；linked 当前 bytes 不匹配该 Revision 时返回 `SourceChanged`，不让旧 Evidence 指向新内容；
+* 查询结果分别返回 active revision、Source observation、Readiness、最后检查时间和 warning；
+* 操作系统意义的 Live grep 是另一个明确操作，不与 MFS snapshot grep 混用。
+
+理由：MFS 是文件搜索核心，Canonical Text 才是统一可搜索数据。单一查询路径比“失败再 fallback”更深、更稳定，也让 PDF/OCR/transcript 与文本文件遵循同一语义。
+
+代价：默认 grep 不保证命中外部磁盘上尚未 sync 的最新字节；需要实时结果时先 full sync 或使用产品侧显式 Live grep。
+
+重新评估：如果以后保存完整原始 revision 并需要 byte-level regex，可以新增明确命名的查询模式，不能改变现有 grep 的 snapshot 语义。
+
+### D-030：Observed Revision 与 Active Revision 分离
+
+状态：Accepted（2026-08-19）。对应设计：§3、§7、§8、§11。
+
+背景：原设计声称“索引、Canonical Text 与当前 Entry revision 一致”，但 schema 没有 Revision，也没有异步处理完成前后的发布点。新内容已经观察到而提取或 embedding 尚未完成时，查询语义未定义。
+
+决定：Entry 保存 `observed_revision_id` 和 `active_revision_id`：
+
+* 新内容创建 immutable observed Revision，状态为 pending；
+* Processor、Canonical Text、Evidence 和必需 Index Projection 全部 ready 后，原子切换 active Revision；
+* 查询、grep 和 `read_text` 只使用 active Revision；
+* pending/failed 新 Revision 不污染旧 active Revision；
+* 没有 active Revision 时，查询返回 pending/failed coverage，不返回部分结果；
+* 旧任务完成时检查自己仍对应最新 observed Revision，不能覆盖更新内容。
+
+理由：把“内部一致性”落实成可测试的不变量，同时允许 linked 外部内容比 active Revision 更新。后者是 freshness，不是数据裂开。
+
+代价：多一层 Revision 账本、旧 revision 回收和原子 pointer publication；状态机比直接覆盖 Entry 行复杂。
+
+重新评估：只有处理和索引全部变为同步、且文件规模证明不会造成不可接受延迟时，才可能合并 observed/active；当前格式处理和 embedding 明确是异步任务，因此不满足。
+
+### D-031：先交付 Core + Engine vertical slice，再做 CLI 和产品迁移
+
+状态：Accepted（2026-08-19）。取代 D-004。对应设计：§14。
+
+背景：D-004 规定 Core → CLI → Engine，但 StashBase 是 TypeScript，真正需要验证的 seam 是长期 Engine 的跨进程 Runtime Interface。先做一次性 CLI 不能证明 single-writer、异步任务、事件和原子 Revision 发布成立。
+
+决定：先实现无 RPC 依赖的 Core，再立即用最薄 Engine 暴露同一 Interface，完成 Linked Source sync + active Revision + grep 的 vertical slice。CLI 和 TypeScript client 都作为 Engine/Core 的 Adapter，随后实现；StashBase 最后按能力迁移。
+
+理由：尽早验证最危险的跨语言、并发和生命周期边界，同时保持领域逻辑不依赖 RPC。CLI 仍然有价值，但不再阻塞 Engine。
+
+代价：早期需要同时维护 Core contract 和最小协议；协议版本化必须从第一版考虑。
+
+重新评估：如果 MFS 不再有跨语言长期调用方，可以省略 Engine Adapter，但不改变 Core Interface。
+
+### D-032：Linked Revision 处理期使用短期 staging，不承诺原文留存
+
+状态：Accepted（2026-08-19）。细化 D-024、D-028、D-030。对应设计：§6、§7、§11。
+
+背景：scan 算出 linked 文件的 hash 后，异步 Processor 可能晚些才读取文件。如果外部文件在此期间变化或消失，只保存 hash 会产生“Revision 标识 A、Canonical Text 来自 B”，或者任务无法重试。把处理改成全同步又不适合 OCR、转录和 embedding。
+
+考虑过：
+
+1. Processor 之后直接重读 live 文件；
+2. 所有 linked 原文件永久复制进 object store；
+3. stable read 后为 pending Revision 保留短期 staging，发布或失效后回收。
+
+决定：采用方案 3。MFS 校验读取前后 fingerprint，`content_hash` 和 Processor 必须消费同一份 bytes。异步处理可以持有 staging snapshot；ready、obsolete 或超出 TTL 后删除。staging 不提供 `read_original` fallback，也不纳入用户备份/耐久承诺。
+
+理由：保证 Revision 内部一致性和可重试性，同时维持 Link 与 Copy 的核心区别：前者没有长期原文可用性，后者有。
+
+代价：处理高峰会产生受控的临时磁盘占用，需要 TTL、启动清理、配额和磁盘不足错误。
+
+重新评估：如果 Processor 全部能在同一次 stable stream 内同步完成，可以取消持久 staging；如果业务要求 linked 原文永久可回读，应显式 Copy，而不是延长 staging 生命周期。
+
 ## 4. Proposed：编码前确认
 
 ### P-001：Python 作为首版 Core 语言
 
-理由：现有 MFS 和 StashBase 提取生态主要是 Python；PDF/OCR/embedding 库成熟；Library-first 最直接。
+理由：现有 MFS 和 StashBase 提取生态主要是 Python；PDF/OCR/embedding 库成熟；先实现无 RPC 依赖的 Core 最直接。
 
 风险：StashBase 需要 Engine 才能跨语言调用；高性能扫描或 hash 未来可能需要 native 加速。
 
@@ -696,7 +839,7 @@ keyword/vector/hybrid     -> Index Projection
 
 ### P-002：SQLite + Milvus Lite 默认组合
 
-职责划分已在 D-017 定死。待验证：keyword index 使用 SQLite FTS 还是向量库 BM25；同一 state root 的 single-writer lock；崩溃恢复与 migration。
+职责划分已在 D-017 定死。待验证：keyword index 使用 SQLite FTS 还是向量库 BM25；同一 `data_dir` 的 single-writer lock；崩溃恢复与 migration。
 
 注意 F-008：Milvus Lite 落盘是 Parquet + JSON manifest + WAL，不是 SQLite，两者不冲突。
 
@@ -708,9 +851,9 @@ keyword/vector/hybrid     -> Index Projection
 
 ### P-004：写入路径下移的迁移成本
 
-状态：**Superseded**（D-014 已被 D-022、D-024 取代）。
+状态：**Superseded**（D-014、D-022、D-025 均已被后续决策取代）。
 
-新迁移路径不接管 linked 外部目录写入。优先建立 Repository/Project/Entry 和 scan session，再增加 copied object store；StashBase 现有文件保存路径不因 MFS 迁移而强制改造。
+现行迁移路径见 D-027、D-028、D-030 和设计 §14：不接管 linked 外部目录写入，先建立 Engine/Project/Entry/Revision 与 `sync_source`，再增加 copied object store。StashBase 现有文件保存路径不因 MFS 迁移而强制改造。
 
 ### P-005：转录能力的归属形态
 
@@ -730,16 +873,20 @@ keyword/vector/hybrid     -> Index Projection
 | MFS 包含完整 StashBase 产品         | Rejected            | 数据层与 UI/编辑器/Agent 产品耦合                         |
 | 一目录一 Engine/DB                | Rejected as default | 重复 runtime，file lock，无法共享查询和批处理                |
 | watch 替代 scan                 | Rejected            | 事件可能丢失，无法处理离线变化                                |
-| V1 提供 watcher                  | Rejected            | 调用方触发 scan；watcher 不能替代完整枚举和 commit（D-025） |
+| V1 提供 watcher                  | Rejected            | 调用方只触发 sync；watcher 不能替代 MFS 的完整扫描（D-028） |
 | semantic query 伪装成 POSIX grep | Rejected            | 无法表达 top-k、filter、ranking、freshness 和 Evidence |
 | V1 可写 mount                   | Rejected            | 复杂度远超当前验证需求                                    |
 | 直接基于 upstream main            | Rejected            | 产品方向和 Interface 持续变化                           |
-| V1 系统 daemon                  | Deferred            | Library/CLI/Engine 足以验证核心需求                    |
+| V1 OS 级共享 daemon / service   | Deferred            | StashBase sidecar Engine 足以；暂不承担系统级安装和多租户服务管理 |
 | 多文件原子事务                       | Rejected            | 逐场景核对后无真实需求，代价远超收益（D-018）          |
 | 强制所有内容进入 content-addressed blob store | Rejected | linked 必须保留外部普通目录；只有 copied 内容使用 CAS（D-024） |
 | 元数据存在向量库里                    | Rejected            | 点查退化为全段扫描并踩到分页缺陷（F-008、D-017）      |
 | 把 grep 留在应用侧                   | Rejected            | 派生文本归 MFS 后，应用无从知道该扫哪些文件（D-020）   |
 | 缓存 key 含路径或行号                 | Rejected            | 插一行即导致全文重新 embedding（F-009、D-016）        |
+| Runtime `open_repository(state_root)` | Rejected         | `data_dir` 只属于 Engine Bootstrap，不是业务资源（D-027） |
+| 调用方枚举并编排 scan session          | Rejected         | 会泄漏同步算法并复制状态；本地 Source 由 MFS `sync_source`（D-028） |
+| Copy 参与 Source reconcile             | Rejected         | Copy 是一次性 import，后续更新与删除都必须显式（D-028） |
+| grep 先读 live、失败后文本 fallback     | Rejected         | 混合两套查询语义且会让原始 bytes 与文本类型混淆（D-029） |
 
 ## 6. 如何追加新决策
 
