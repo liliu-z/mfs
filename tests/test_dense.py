@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from mfs import MFS, CapabilityUnavailable, IndexUnavailable, Utf8TextProcessor
+from mfs import MFS, CapabilityUnavailable, IndexUnavailable, Utf8TextProcessor, WaitTimeout
 
 
 class TinyEmbedder:
@@ -42,8 +42,10 @@ def test_dense_and_hybrid_then_open_without_embedder(tmp_path: Path) -> None:
         with pytest.raises(CapabilityUnavailable):
             without.search("cat", mode="vector")
         assert without.upsert("n", "cat.txt", b"cat cat").outcome == "unchanged"
-        with pytest.raises(CapabilityUnavailable):
-            without.upsert("n", "cat.txt", b"changed cat")
+        assert not without.upsert("n", "cat.txt", b"changed cat").index_ready
+        with pytest.raises(WaitTimeout):
+            without.wait_ready(0.5)
+        assert without.query(select="doc").items[0].value.text == "changed cat"
     finally:
         without.close()
 
@@ -53,6 +55,7 @@ def test_reindex_upgrades_bm25_index_to_dense(tmp_path: Path) -> None:
     bm25 = MFS.open(state, processors=[Utf8TextProcessor()])
     bm25.create_namespace("n", "internal")
     bm25.upsert("n", "cat.txt", b"cat")
+    bm25.wait_ready(10)
     bm25.close()
 
     upgrading = MFS.open(state, processors=[Utf8TextProcessor()], embedder=TinyEmbedder())

@@ -9,7 +9,12 @@ from ._json import JSONValue
 
 type NamespaceKind = Literal["internal", "external"]
 type MutationOutcome = Literal["added", "updated", "unchanged", "removed", "not_found"]
-type IndexState = Literal["ready", "dirty", "mismatch"]
+type IndexState = Literal["ready", "pending", "dirty", "mismatch"]
+type Consistency = Literal["strong", "eventual"]
+type TaskStage = Literal["process", "chunk", "embed", "publish", "delete", "drop"]
+type TaskState = Literal[
+    "pending", "running", "retry_wait", "failed", "blocked", "cancelled", "succeeded"
+]
 type SnapshotId = str
 type SyncSkipReason = Literal[
     "excluded", "too_large", "symlink", "special_file", "unsupported_media_type"
@@ -84,6 +89,8 @@ class MutationReport:
     id: DocumentId
     outcome: MutationOutcome
     index_ready: bool
+    revision: str | None = None
+    operation_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +132,25 @@ class Status:
     index_state: IndexState
     dense_enabled: bool
     dense_available: bool
+    ready: bool = False
+    pending_count: int = 0
+    failed_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentStatus:
+    id: DocumentId
+    revision: str
+    text_revision: str | None
+    indexed_revision: str | None
+    stage: TaskStage
+    state: TaskState
+    attempts: int
+    error: str | None
+    next_retry_at: float | None
+    completed_batches: int = 0
+    total_batches: int = 0
+    executing: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +191,14 @@ def _tuple_or_one[T](value: T | Sequence[T]) -> tuple[T, ...]:
 
 
 @dataclass(frozen=True, slots=True, init=False)
+class AnyOf(Filter):
+    filters: tuple[Filter, ...]
+
+    def __init__(self, filters: Sequence[Filter]) -> None:
+        object.__setattr__(self, "filters", tuple(filters))
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class ByNamespace(Filter):
     namespaces: tuple[str, ...]
 
@@ -191,6 +225,44 @@ class TextMatch(Filter):
     pattern: str
     regex: bool = False
     case_sensitive: bool = False
+    smart_case: bool = False
+    whole_word: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PathPrefix(Filter):
+    value: str
+
+
+@dataclass(frozen=True, slots=True)
+class PathSuffix(Filter):
+    value: str
+
+
+@dataclass(frozen=True, slots=True)
+class NamePrefix(Filter):
+    value: str
+
+
+@dataclass(frozen=True, slots=True)
+class NameSuffix(Filter):
+    value: str
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class ByExtension(Filter):
+    extensions: tuple[str, ...]
+
+    def __init__(self, extensions: str | Sequence[str]) -> None:
+        object.__setattr__(self, "extensions", _tuple_or_one(extensions))
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class ByMediaType(Filter):
+    media_types: tuple[str, ...]
+
+    def __init__(self, media_types: str | Sequence[str]) -> None:
+        object.__setattr__(self, "media_types", _tuple_or_one(media_types))
 
 
 @dataclass(frozen=True, slots=True)

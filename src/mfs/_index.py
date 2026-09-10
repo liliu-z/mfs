@@ -6,15 +6,33 @@ import json
 import math
 from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
+import blake3
+from milvus_lite.server_manager import server_manager_instance
 from pymilvus import DataType, Function, FunctionType, MilvusClient
 
 from .errors import IndexFailed
 from .types import DocumentId
 
 COLLECTION = "chunks"
-OUTPUT_FIELDS = ["namespace", "doc_id", "ordinal", "text", "text_start", "text_end"]
+OUTPUT_FIELDS = [
+    "namespace",
+    "doc_id",
+    "ordinal",
+    "text",
+    "text_start",
+    "text_end",
+    "snapshot_id",
+    "source_location",
+    "media_type",
+    "incarnation",
+    "source_path",
+    "source_name",
+    "source_ext",
+    "source_path_rev",
+    "source_name_rev",
+]
 
 
 class IndexRow(TypedDict):
@@ -25,6 +43,10 @@ class IndexRow(TypedDict):
     text_start: int
     text_end: int
     dense_vector: list[float]
+    snapshot_id: NotRequired[str]
+    source_location: NotRequired[dict[str, Any]]
+    media_type: NotRequired[str]
+    incarnation: NotRequired[str]
 
 
 class SearchHit(TypedDict):
@@ -35,6 +57,8 @@ class SearchHit(TypedDict):
     text_start: int
     text_end: int
     score: float
+    snapshot_id: str
+    source_location: dict[str, Any]
 
 
 def dense_config(embedding_space: str, dimension: int) -> dict[str, object]:
@@ -47,7 +71,7 @@ def dense_config(embedding_space: str, dimension: int) -> dict[str, object]:
 
 def index_config(chunker: dict[str, object], dense: dict[str, object] | None) -> dict[str, object]:
     return {
-        "version": 1,
+        "version": 2,
         "chunker": chunker,
         "bm25": {
             "analyzer": {"tokenizer": "standard", "filter": ["lowercase"]},
@@ -60,6 +84,7 @@ def index_config(chunker: dict[str, object], dense: dict[str, object] | None) ->
 
 class ChunkIndex:
     def __init__(self, path: Path) -> None:
+        self._path = str(path)
         try:
             self.client: Any = MilvusClient(uri=str(path))
         except Exception as error:
@@ -70,58 +95,61 @@ class ChunkIndex:
             self.client.close()
         except Exception as error:
             raise IndexFailed(f"failed to close Milvus Lite: {error}") from error
+        finally:
+            # MilvusClient.close only releases its connection, not the embedded server/database.
+            server_manager_instance.release_server(self._path)
+
+    def load(self) -> None:
+        try:
+            self.client.load_collection(COLLECTION)
+        except Exception as error:
+            raise IndexFailed(f"failed to load chunk collection: {error}") from error
 
     def has_valid_collection(self, *, dense_dimension: int | None) -> bool:
         try:
             if not self.client.has_collection(COLLECTION):
                 return False
             description = self.client.describe_collection(COLLECTION)
-            if description.get("auto_id") is not True or description.get("enable_dynamic_field"):
-                return False
-            fields = description.get("fields", [])
-            by_name = {field.get("name"): field for field in fields}
-            expected_types = {
-                "id": DataType.INT64,
-                "namespace": DataType.VARCHAR,
-                "doc_id": DataType.VARCHAR,
-                "ordinal": DataType.INT64,
-                "text": DataType.VARCHAR,
-                "text_start": DataType.INT64,
-                "text_end": DataType.INT64,
-                "sparse_vector": DataType.SPARSE_FLOAT_VECTOR,
-            }
+            fields = {f["name"]: f for f in description["fields"]}
+            expected = set(OUTPUT_FIELDS) | {"id", "sparse_vector"}
             if dense_dimension is not None:
-                expected_types["dense_vector"] = DataType.FLOAT_VECTOR
-            if set(by_name) != set(expected_types):
-                return False
-            if any(
-                by_name[name].get("type") != data_type for name, data_type in expected_types.items()
+                expected.add("dense_vector")
+            if (
+                set(fields) != expected
+                or description.get("auto_id")
+                or description.get("enable_dynamic_field")
             ):
                 return False
-            if not by_name["id"].get("is_primary") or not by_name["id"].get("auto_id"):
+            if fields["id"]["type"] != DataType.VARCHAR or not fields["id"].get("is_primary"):
                 return False
-            if int(by_name["namespace"].get("params", {}).get("max_length", -1)) != 255:
+            if (
+                dense_dimension is not None
+                and int(fields["dense_vector"].get("params", {}).get("dim", -1)) != dense_dimension
+            ):
                 return False
-            if int(by_name["doc_id"].get("params", {}).get("max_length", -1)) != 2048:
+            expected_types = {name: DataType.VARCHAR for name in expected}
+            expected_types.update(
+                ordinal=DataType.INT64,
+                text_start=DataType.INT64,
+                text_end=DataType.INT64,
+                sparse_vector=DataType.SPARSE_FLOAT_VECTOR,
+                source_location=DataType.JSON,
+            )
+            if dense_dimension is not None:
+                expected_types["dense_vector"] = DataType.FLOAT_VECTOR
+            if any(fields[name]["type"] != kind for name, kind in expected_types.items()):
                 return False
-            text_params = by_name["text"].get("params", {})
+            text_params = fields["text"].get("params", {})
             if (
                 int(text_params.get("max_length", -1)) != 65535
                 or str(text_params.get("enable_analyzer", "")).lower() != "true"
             ):
                 return False
-            if dense_dimension is not None:
-                params = by_name["dense_vector"].get("params", {})
-                if int(params.get("dim", -1)) != dense_dimension:
-                    return False
             functions = description.get("functions", [])
-            if len(functions) != 1:
-                return False
-            function = functions[0]
-            if (
-                function.get("type") != FunctionType.BM25
-                or function.get("input_field_names") != ["text"]
-                or function.get("output_field_names") != ["sparse_vector"]
+            if len(functions) != 1 or (
+                functions[0].get("type") != FunctionType.BM25
+                or functions[0].get("input_field_names") != ["text"]
+                or functions[0].get("output_field_names") != ["sparse_vector"]
             ):
                 return False
             expected_indexes = {
@@ -133,9 +161,9 @@ class ChunkIndex:
                 expected_indexes["dense_vector"] = ("AUTOINDEX", "COSINE")
             if set(self.client.list_indexes(COLLECTION)) != set(expected_indexes):
                 return False
-            for index_name, expected in expected_indexes.items():
-                actual = self.client.describe_index(COLLECTION, index_name)
-                if (actual.get("index_type"), actual.get("metric_type")) != expected:
+            for name, expected_index in expected_indexes.items():
+                actual = self.client.describe_index(COLLECTION, name)
+                if (actual.get("index_type"), actual.get("metric_type")) != expected_index:
                     return False
             return True
         except Exception:
@@ -145,10 +173,24 @@ class ChunkIndex:
         try:
             if self.client.has_collection(COLLECTION):
                 self.client.drop_collection(COLLECTION)
-            schema = MilvusClient.create_schema(auto_id=True, enable_dynamic_field=False)
-            schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True)
+            schema = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=False)
+            schema.add_field(
+                field_name="id", datatype=DataType.VARCHAR, max_length=64, is_primary=True
+            )
             schema.add_field(field_name="namespace", datatype=DataType.VARCHAR, max_length=255)
             schema.add_field(field_name="doc_id", datatype=DataType.VARCHAR, max_length=2048)
+            for name, length in (
+                ("snapshot_id", 64),
+                ("incarnation", 64),
+                ("media_type", 255),
+                ("source_path", 2048),
+                ("source_name", 2048),
+                ("source_ext", 2048),
+                ("source_path_rev", 2048),
+                ("source_name_rev", 2048),
+            ):
+                schema.add_field(field_name=name, datatype=DataType.VARCHAR, max_length=length)
+            schema.add_field(field_name="source_location", datatype=DataType.JSON)
             schema.add_field(field_name="ordinal", datatype=DataType.INT64)
             schema.add_field(
                 field_name="text",
@@ -203,9 +245,22 @@ class ChunkIndex:
             raise IndexFailed(f"failed to create chunk collection: {error}") from error
 
     def replace(self, document_id: DocumentId, rows: Sequence[IndexRow]) -> None:
-        self.delete_document(document_id)
+        # Only this method's complete payload enters Milvus; retry uses identical primary keys.
+        self.insert(rows)
         if rows:
-            self.insert(rows)
+            keep = str(rows[0].get("snapshot_id", ""))
+            incarnation = str(rows[0].get("incarnation", ""))
+            expression = (
+                f"({_documents_expression([document_id])}) and "
+                f"(snapshot_id != {_literal(keep)} or incarnation != {_literal(incarnation)} "
+                f"or ordinal >= {len(rows)})"
+            )
+            try:
+                self.client.delete(COLLECTION, filter=expression)
+            except Exception as error:
+                raise IndexFailed(f"failed to retire previous chunks: {error}") from error
+        else:
+            self.delete_document(document_id)
         self.flush()
         actual = self.count_document(document_id)
         if actual != len(rows):
@@ -214,33 +269,60 @@ class ChunkIndex:
             )
 
     def insert(self, rows: Sequence[IndexRow]) -> None:
-        if not rows:
-            return
         data: list[dict[str, object]] = []
         for row in rows:
-            item: dict[str, object] = {key: row[key] for key in OUTPUT_FIELDS}
+            doc = row["doc_id"]
+            name = doc.rsplit("/", 1)[-1]
+            snapshot = row.get("snapshot_id", "")
+            incarnation = row.get("incarnation", "")
+            key = json.dumps(
+                [row["namespace"], incarnation, doc, snapshot, row["ordinal"]], ensure_ascii=False
+            )
+            item: dict[str, object] = {
+                "id": blake3.blake3(key.encode()).hexdigest(),
+                "namespace": row["namespace"],
+                "doc_id": doc,
+                "ordinal": row["ordinal"],
+                "text": row["text"],
+                "text_start": row["text_start"],
+                "text_end": row["text_end"],
+                "snapshot_id": snapshot,
+                "incarnation": incarnation,
+                "media_type": row.get("media_type", "text/plain"),
+                "source_location": row.get("source_location", {"version": 1, "sources": []}),
+                "source_path": doc,
+                "source_name": name,
+                "source_ext": Path(doc).suffix.lower(),
+                "source_path_rev": doc[::-1],
+                "source_name_rev": name[::-1],
+            }
             if row.get("dense_vector"):
                 item["dense_vector"] = row["dense_vector"]
             data.append(item)
         try:
             for start in range(0, len(data), 1000):
-                self.client.insert(COLLECTION, data[start : start + 1000])
+                self.client.upsert(COLLECTION, data[start : start + 1000])
         except Exception as error:
-            raise IndexFailed(f"failed to insert chunks: {error}") from error
+            raise IndexFailed(f"failed to upsert chunks: {error}") from error
 
-    def delete_document(self, document_id: DocumentId) -> None:
+    def delete_document(self, document_id: DocumentId, *, incarnation: str | None = None) -> None:
         expression = (
             f"namespace == {_literal(document_id.namespace)} and "
             f"doc_id == {_literal(document_id.doc_id)}"
         )
+        if incarnation is not None:
+            expression += f" and incarnation == {_literal(incarnation)}"
         try:
             self.client.delete(COLLECTION, filter=expression)
         except Exception as error:
             raise IndexFailed(f"failed to delete document chunks: {error}") from error
 
-    def delete_namespace(self, namespace: str) -> None:
+    def delete_namespace(self, namespace: str, *, incarnation: str | None = None) -> None:
         try:
-            self.client.delete(COLLECTION, filter=f"namespace == {_literal(namespace)}")
+            expression = f"namespace == {_literal(namespace)}"
+            if incarnation is not None:
+                expression += f" and incarnation == {_literal(incarnation)}"
+            self.client.delete(COLLECTION, filter=expression)
             self.flush()
         except Exception as error:
             raise IndexFailed(f"failed to delete namespace chunks: {error}") from error
@@ -268,7 +350,7 @@ class ChunkIndex:
             iterator = self.client.query_iterator(
                 collection_name=COLLECTION,
                 batch_size=1000,
-                filter="id >= 0",
+                filter='id != ""',
                 output_fields=OUTPUT_FIELDS,
             )
             try:
@@ -288,8 +370,9 @@ class ChunkIndex:
         text_or_vector: str | Sequence[float],
         *,
         mode: Literal["bm25", "vector"],
-        documents: Sequence[DocumentId] | None,
+        documents: Sequence[DocumentId] | None = None,
         limit: int,
+        expressions: Sequence[str] | None = None,
     ) -> tuple[list[SearchHit], bool]:
         batches: Iterable[Sequence[DocumentId] | None]
         if documents is None:
@@ -300,8 +383,14 @@ class ChunkIndex:
             batches = (documents[start : start + 200] for start in range(0, len(documents), 200))
         all_hits: dict[tuple[str, str, int], SearchHit] = {}
         possibly_more = False
-        for batch in batches:
-            expression = _documents_expression(batch) if batch is not None else ""
+        compiled = (
+            expressions
+            if expressions is not None
+            else tuple(
+                _documents_expression(batch) if batch is not None else "" for batch in batches
+            )
+        )
+        for expression in compiled:
             try:
                 raw = self.client.search(
                     collection_name=COLLECTION,
@@ -311,6 +400,7 @@ class ChunkIndex:
                     limit=limit,
                     output_fields=OUTPUT_FIELDS,
                     search_params={"metric_type": "BM25" if mode == "bm25" else "COSINE"},
+                    consistency_level="Strong",
                 )
             except Exception as error:
                 raise IndexFailed(f"{mode} search failed: {error}") from error
@@ -326,6 +416,8 @@ class ChunkIndex:
                     text=str(entity["text"]),
                     text_start=int(entity["text_start"]),
                     text_end=int(entity["text_end"]),
+                    snapshot_id=str(entity["snapshot_id"]),
+                    source_location=entity["source_location"],
                     score=(
                         -float(hit.get("distance", hit.get("score", 0.0)))
                         if mode == "bm25"

@@ -57,6 +57,7 @@ def test_multisegment_scan_over_16384_rows_is_complete_and_reopenable(tmp_path: 
     reopened = ChunkIndex(index_path)
     try:
         assert reopened.has_valid_collection(dense_dimension=None)
+        reopened.load()
         assert len(reopened.scan()) == 16_499
     finally:
         reopened.close()

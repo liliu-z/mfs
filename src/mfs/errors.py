@@ -116,3 +116,17 @@ class CorruptState(MFSError):
 
 class Closed(MFSError):
     code = "Closed"
+
+
+class WaitTimeout(MFSError):
+    code = "WaitTimeout"
+
+
+class IdempotencyConflict(MFSError):
+    code = "IdempotencyConflict"
+
+
+class RetryableError(MFSError):
+    """An injected adapter may raise this to request automatic bounded retries."""
+
+    code = "RetryableError"

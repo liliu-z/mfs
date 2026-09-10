@@ -10,7 +10,6 @@ from mfs import (
     ByNamespace,
     Closed,
     DocumentId,
-    IndexUnavailable,
     InstanceLocked,
     TextMatch,
     UnderPath,
@@ -28,6 +27,7 @@ def test_internal_lifecycle_query_filters_and_projection(tmp_path: Path) -> None
         assert mfs.upsert("notes", "folder/a.md", "café\nnext".encode()).outcome == "unchanged"
         mfs.upsert("other", "folder/a.md", b"cafe")
 
+        mfs.wait_ready(10)
         result = mfs.query([ByNamespace("notes"), TextMatch("é")], select="doc", limit=1)
         assert result.truncated is False
         assert result.items[0].value.id == DocumentId("notes", "folder/a.md")
@@ -118,6 +118,7 @@ def test_external_sync_under_path_and_reconcile(tmp_path: Path) -> None:
         assert [(item.path, item.reason) for item in report.skipped] == [
             ("raw.bin", "unsupported_media_type")
         ]
+        mfs.wait_ready(10)
         under = mfs.query([UnderPath("files", "sub")])
         assert [item.value.doc_id for item in under.items] == ["sub/b.md"]
 
@@ -140,6 +141,7 @@ def test_unsupported_media_on_later_sync_preserves_snapshot(tmp_path: Path) -> N
     mfs = MFS.open(state, processors=[Utf8TextProcessor()])
     mfs.create_namespace("files", "external", root)
     mfs.sync("files")
+    mfs.wait_ready(10)
     mfs.close()
 
     source.write_text("changed but unsupported")
@@ -160,6 +162,7 @@ def test_lock_close_dirty_recovery_and_reindex(tmp_path: Path) -> None:
     mfs = MFS.open(state, processors=[Utf8TextProcessor()])
     mfs.create_namespace("n", "internal")
     mfs.upsert("n", "a.txt", b"recover me")
+    mfs.wait_ready(10)
     with pytest.raises(InstanceLocked):
         MFS.open(state, processors=[Utf8TextProcessor()])
     mfs.close()
@@ -169,10 +172,10 @@ def test_lock_close_dirty_recovery_and_reindex(tmp_path: Path) -> None:
     (state / "INDEX_DIRTY").write_text("1\n")
     dirty = MFS.open(state, processors=[Utf8TextProcessor()])
     try:
-        assert dirty.status().index_state == "dirty"
+        dirty.wait_ready(10)
+        assert dirty.status().ready
         assert dirty.query(select="doc").items[0].value.text == "recover me"
-        with pytest.raises(IndexUnavailable):
-            dirty.search("recover", mode="bm25")
+        assert dirty.search("recover", mode="bm25").items
         report = dirty.reindex()
         assert (report.documents, report.chunks) == (1, 1)
         assert dirty.search("recover", mode="bm25").items

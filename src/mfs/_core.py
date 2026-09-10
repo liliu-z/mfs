@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import math
 import os
 import shutil
 import stat
-import sys
 import threading
+import time
 import uuid
 from collections.abc import Generator, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -17,9 +18,10 @@ import blake3
 from filelock import FileLock, Timeout
 
 from ._catalog import Catalog
+from ._filters import compile_filters
 from ._index import ChunkIndex, IndexRow, SearchHit, dense_config, index_config
 from ._json import JSONValue, canonical_json, compact_json, copy_json, load_json
-from ._locks import Lifecycle, ReadWriteLock
+from ._locks import Lifecycle
 from ._regex import regex_ranges
 from ._validation import (
     chunker_description,
@@ -29,45 +31,46 @@ from ._validation import (
     validate_chunk_ranges,
     validate_chunker,
     validate_embedder,
-    validate_external_path,
     validate_internal_id,
     validate_namespace,
     validate_processed,
     validate_processors,
-    validate_source_map,
 )
 from .adapters import DefaultChunker
 from .errors import (
     CapabilityUnavailable,
+    Closed,
     CorruptState,
     EmbeddingFailed,
+    IdempotencyConflict,
     IndexFailed,
     IndexUnavailable,
     InstanceLocked,
     InvalidConfiguration,
     InvalidFilter,
-    InvalidPath,
     InvalidPattern,
     InvalidQuery,
     MFSError,
     NamespaceConflict,
     NamespaceNotFound,
     ProcessingFailed,
+    RetryableError,
     RootOverlap,
     SchemaVersionUnsupported,
     SourceChanged,
     SourceUnavailable,
     StorageFailed,
     UnsupportedMediaType,
+    WaitTimeout,
     WrongNamespaceKind,
 )
 from .types import (
-    ByDocumentId,
-    ByNamespace,
     Chunk,
     Chunker,
+    Consistency,
     Document,
     DocumentId,
+    DocumentStatus,
     DropReport,
     Embedder,
     Filter,
@@ -88,12 +91,11 @@ from .types import (
     SourceMap,
     SourceSpan,
     Status,
-    SyncFailure,
     SyncPolicy,
     SyncReport,
-    SyncSkipped,
+    TaskStage,
+    TaskState,
     TextMatch,
-    UnderPath,
 )
 
 
@@ -104,13 +106,6 @@ class _Staged:
     content_hash: str
     size: int
     mtime_ns: int | None
-
-
-@dataclass(slots=True)
-class _Prepared:
-    record: dict[str, JSONValue]
-    rows: list[IndexRow]
-    staged: _Staged
 
 
 @dataclass(slots=True)
@@ -144,171 +139,1075 @@ class MFS:
         embedder: Embedder | None,
         sync_policy: SyncPolicy | None,
     ) -> None:
-        if os.name != "posix" or sys.platform == "win32":
-            raise InvalidConfiguration("MFS V1 only supports POSIX platforms")
+        if os.name != "posix":
+            raise InvalidConfiguration("MFS supports POSIX platforms")
         self._path = Path(mfs_path).expanduser().resolve()
         self._processors = validate_processors(processors)
         self._chunker = validate_chunker(chunker or DefaultChunker())
         self._embedder = validate_embedder(embedder)
-        self._processor_descriptions = {
-            id(processor): processor_description(processor) for processor in self._processors
-        }
-        self._processor_media_types = {
-            id(processor): tuple(processor.media_types) for processor in self._processors
-        }
-        self._processor_suffixes = {
-            id(processor): dict(processor.suffix_media_types) for processor in self._processors
-        }
+        self._processor_descriptions = {id(p): processor_description(p) for p in self._processors}
+        self._processor_media_types = {id(p): tuple(p.media_types) for p in self._processors}
+        self._processor_suffixes = {id(p): dict(p.suffix_media_types) for p in self._processors}
         self._chunker_description = chunker_description(self._chunker)
         self._embedder_space = self._embedder.embedding_space if self._embedder else None
         self._embedder_dimension = self._embedder.dimension if self._embedder else None
         self._sync_policy = self._validate_sync_policy(sync_policy or SyncPolicy())
-        self._mutation_lock = threading.Lock()
-        self._embedder_lock = threading.Lock()
-        self._rwlock = ReadWriteLock()
+        self._condition = threading.Condition(threading.RLock())
+        self._mutation_lock = threading.RLock()
+        self._processor_lock = threading.Lock()
+        self._chunker_lock = threading.Lock()
         self._lifecycle = Lifecycle()
-        self._catalog: Catalog
-        self._index: ChunkIndex
+        self._stopping = False
         self._state: IndexState = "dirty"
-
+        self._targets: dict[DocumentId, dict[str, Any]] = {}
+        self._pending: dict[DocumentId, str] = {}
+        self._namespaces: dict[str, dict[str, Any]] = {}
+        self._workers: list[threading.Thread] = []
+        self._executing: set[tuple[DocumentId, str]] = set()
         try:
-            if self._path.exists() and not self._path.is_dir():
-                raise CorruptState("mfs_path exists but is not a directory")
             self._path.mkdir(parents=True, exist_ok=True)
             existing = list(self._path.iterdir())
             initialize = not existing
             if existing and not (self._path / "catalog.sqlite").is_file():
-                raise CorruptState("non-empty mfs_path has no recognizable V1 catalog")
-            self._instance_lock = FileLock(self._path / "LOCK")
+                raise CorruptState("non-empty mfs_path has no recognizable catalog")
+            self._instance_lock = FileLock(self._path / "LOCK", thread_local=False)
             try:
                 self._instance_lock.acquire(timeout=0)
             except Timeout as error:
                 raise InstanceLocked(f"MFS instance is already open: {self._path}") from error
-            (self._path / "objects").mkdir(exist_ok=True)
-            (self._path / "staging").mkdir(exist_ok=True)
+            for name in ("objects", "artifacts", "staging"):
+                (self._path / name).mkdir(exist_ok=True)
             self._catalog = Catalog(self._path / "catalog.sqlite", initialize=initialize)
+            with self._catalog.transaction():
+                for name, record in self._catalog.list_namespaces():
+                    record.setdefault("incarnation", uuid.uuid4().hex)
+                    record.setdefault("binding", uuid.uuid4().hex)
+                    record.setdefault("root_actual", record.get("root"))
+                    self._catalog.put_namespace(name, record)
+                    self._namespaces[name] = record
             self._index = ChunkIndex(self._path / "milvus.db")
-            if initialize:
-                self._initialize_index()
+            desired = index_config(
+                cast(dict[str, object], self._chunker_description), self._provided_dense()
+            )
+            self._config: dict[str, object] = desired
+            if not initialize:
+                try:
+                    loaded = load_json((self._path / "index.json").read_text())
+                    if not isinstance(loaded, dict):
+                        raise ValueError("index config is not an object")
+                    if _as_int(loaded.get("version", 0), "index version") > 2:
+                        raise SchemaVersionUnsupported("unsupported index schema")
+                    self._config = cast(dict[str, object], loaded)
+                except SchemaVersionUnsupported:
+                    raise
+                except (OSError, ValueError):
+                    self._config = desired
+            dense = self._dense_config()
+            dimension = _as_int(dense["dimension"], "dense dimension") if dense else None
+            invalid = not self._index.has_valid_collection(dense_dimension=dimension)
+            # Migration and interrupted full rebuilds start from authoritative SQLite snapshots.
+            rebuild = initialize or invalid or (self._path / "INDEX_DIRTY").exists()
+            if rebuild:
+                self._index.recreate(dense_dimension=dimension)
+                self._config["version"] = 2
+                self._write_index_config(self._config)
             else:
-                self._load_index_state()
+                self._index.load()
+            with self._catalog.transaction():
+                for ns, doc, job in self._catalog.list_targets():
+                    if job["state"] in ("running", "blocked"):
+                        job["state"] = "pending"
+                        job["next_run"] = 0
+                        self._catalog.put_target(ns, doc, job)
+                    self._targets[DocumentId(ns, doc)] = job
+                for ns, doc, record in self._catalog.list_documents():
+                    identity = DocumentId(ns, doc)
+                    if identity not in self._targets:
+                        job = self._snapshot_job(identity, record)
+                        self._catalog.put_target(ns, doc, job)
+                        self._targets[identity] = job
+                if rebuild:
+                    for identity, original in list(self._targets.items()):
+                        job = copy.deepcopy(original)
+                        if (
+                            job["kind"] == "upsert"
+                            and job["stage"] != "process"
+                            and job["state"] != "cancelled"
+                        ):
+                            job.update(stage="chunk", state="pending", vectors=[], next_run=0)
+                            self._catalog.put_target(identity.namespace, identity.doc_id, job)
+                            self._targets[identity] = job
+                self._refresh_pending()
+            mismatch = self._config.get("chunker") != self._chunker_description
+            if self._embedder is not None:
+                mismatch |= self._dense_config() != self._provided_dense()
+            self._state = "mismatch" if mismatch else "ready"
+            with contextlib.suppress(FileNotFoundError):
+                (self._path / "INDEX_DIRTY").unlink()
             self._recover_objects()
+            for role in ("prepare", "index"):
+                thread = threading.Thread(target=self._worker, args=(role,), name=f"mfs-{role}")
+                thread.start()
+                self._workers.append(thread)
         except Exception:
-            with contextlib.suppress(Exception):
-                self._index.close()
-            with contextlib.suppress(Exception):
-                self._catalog.close()
+            self._stopping = True
+            with self._condition:
+                self._condition.notify_all()
+            for thread in self._workers:
+                thread.join()
+            for name in ("_index", "_catalog"):
+                with contextlib.suppress(Exception):
+                    getattr(self, name).close()
             with contextlib.suppress(Exception):
                 self._instance_lock.release()
             raise
 
+    def _provided_dense(self) -> dict[str, object] | None:
+        if self._embedder_space is None or self._embedder_dimension is None:
+            return None
+        return dense_config(self._embedder_space, self._embedder_dimension)
+
     @staticmethod
     def _validate_sync_policy(policy: SyncPolicy) -> SyncPolicy:
-        maximum = _runtime(policy.max_file_bytes)
+        maximum = policy.max_file_bytes
         if maximum is not None and (
-            isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 0
+            isinstance(_runtime(maximum), bool)
+            or not isinstance(_runtime(maximum), int)
+            or maximum < 0
         ):
             raise InvalidConfiguration("max_file_bytes must be non-negative or None")
         for pattern in policy.exclude_globs:
-            value = _runtime(pattern)
-            if not isinstance(value, str) or not value or "\0" in value or "\\" in value:
-                raise InvalidConfiguration("exclude_globs must be non-empty POSIX glob strings")
-        return SyncPolicy(tuple(policy.exclude_globs), policy.max_file_bytes)
+            if (
+                not isinstance(_runtime(pattern), str)
+                or not pattern
+                or "\0" in pattern
+                or "\\" in pattern
+            ):
+                raise InvalidConfiguration("exclude_globs must be non-empty POSIX patterns")
+            _glob_match(pattern, "")
+        return SyncPolicy(tuple(policy.exclude_globs), maximum)
 
-    def _initialize_index(self) -> None:
-        dense = (
-            dense_config(self._embedder_space, self._embedder_dimension)
-            if self._embedder_space is not None and self._embedder_dimension is not None
-            else None
+    def _dense_config(self) -> dict[str, object] | None:
+        dense = self._config.get("dense")
+        return cast(dict[str, object], dense) if isinstance(dense, dict) else None
+
+    def _is_ready(self) -> bool:
+        return self._state == "ready" and not self._pending
+
+    def _refresh_pending(self) -> None:
+        self._pending = {
+            identity: str(job["revision"])
+            for identity, job in self._targets.items()
+            if job["state"] != "succeeded"
+        }
+
+    def _remember(self, identity: DocumentId, job: dict[str, Any]) -> None:
+        self._targets[identity] = copy.deepcopy(job)
+        if job["state"] == "succeeded":
+            self._pending.pop(identity, None)
+        else:
+            self._pending[identity] = str(job["revision"])
+        self._condition.notify_all()
+
+    def _store_job(self, identity: DocumentId, job: dict[str, Any]) -> None:
+        with self._catalog.transaction():
+            self._catalog.put_target(identity.namespace, identity.doc_id, job)
+        self._remember(identity, job)
+
+    def _current(self, identity: DocumentId, job: dict[str, Any]) -> bool:
+        current = self._targets.get(identity)
+        return (
+            current is not None
+            and current["revision"] == job["revision"]
+            and current["state"] != "cancelled"
+            and current.get("attempt_token") == job.get("attempt_token")
         )
-        config = index_config(cast(dict[str, object], self._chunker_description), dense)
-        self._make_marker()
+
+    def _snapshot_job(self, identity: DocumentId, record: dict[str, Any]) -> dict[str, Any]:
+        revision = uuid.uuid4().hex
+        record = dict(record, revision=revision)
+        self._catalog.put_document(identity.namespace, identity.doc_id, record)
+        artifact = self._write_artifact(revision + "-snapshot", record)
+        return dict(
+            revision=revision,
+            kind="upsert",
+            stage="chunk",
+            state="pending",
+            attempts=0,
+            failures=0,
+            next_run=0,
+            error=None,
+            snapshot=artifact,
+            vectors=[],
+            incarnation=self._namespaces[identity.namespace]["incarnation"],
+            source_revision=record.get("revision"),
+            input=record["source"].get("object"),
+            content_hash=record["content_hash"],
+            media_type=record["media_type"],
+            processor=record["processor"],
+            source=record["source"],
+            binding=record.get("binding"),
+        )
+
+    @contextlib.contextmanager
+    def _call(self) -> Generator[None]:
+        with self._lifecycle.call():
+            yield
+
+    def close(self) -> None:
+        with self._condition:
+            self._stopping = True
+            self._condition.notify_all()
+        if not self._lifecycle.begin_close():
+            return
         try:
-            self._index.recreate(dense_dimension=self._embedder_dimension)
-            self._write_index_config(config)
-            self._clear_marker()
+            for thread in self._workers:
+                thread.join()
+            try:
+                self._index.close()
+            finally:
+                self._catalog.close()
+                self._instance_lock.release()
+        finally:
+            self._lifecycle.finish_close()
+
+    def wait_ready(self, timeout: float | None = None) -> None:
+        with self._call():
+            self._wait_ready(timeout)
+
+    def _wait_ready(self, timeout: float | None) -> None:
+        self._validate_timeout(timeout)
+        with self._condition:
+            if self._state in ("dirty", "mismatch"):
+                raise IndexUnavailable(f"index state is {self._state}; call reindex()")
+            completed = self._condition.wait_for(
+                lambda: self._stopping or self._state != "ready" or not self._pending, timeout
+            )
+            if self._stopping:
+                raise Closed("MFS instance is closing")
+            if self._state != "ready":
+                raise IndexUnavailable(f"index state is {self._state}")
+            if not completed:
+                raise WaitTimeout(f"{len(self._pending)} indexing targets have not completed")
+
+    @staticmethod
+    def _validate_timeout(timeout: float | None) -> None:
+        if timeout is not None and (
+            isinstance(_runtime(timeout), bool)
+            or not isinstance(_runtime(timeout), (int, float))
+            or not math.isfinite(timeout)
+            or timeout < 0
+        ):
+            raise InvalidQuery("timeout must be a finite non-negative number or None")
+
+    def create_namespace(
+        self, namespace: str, kind: NamespaceKind, root: Path | None = None
+    ) -> NamespaceInfo:
+        with self._call(), self._mutation_lock:
+            validate_namespace(namespace)
+            if kind not in ("internal", "external"):
+                raise InvalidConfiguration("namespace kind must be internal or external")
+            spelling: Path | None = None
+            actual: Path | None = None
+            if kind == "external":
+                if root is None:
+                    raise InvalidConfiguration("external namespace requires a root")
+                spelling = Path(os.path.abspath(Path(root).expanduser()))
+                try:
+                    actual = spelling.resolve(strict=True)
+                    if not actual.is_dir():
+                        raise OSError("root is not a directory")
+                except OSError as error:
+                    raise SourceUnavailable(str(error)) from error
+                if _paths_overlap(actual, self._path):
+                    raise RootOverlap("external root and mfs_path must not overlap")
+            elif root is not None:
+                raise InvalidConfiguration("internal namespace must not have a root")
+            with self._condition:
+                previous = self._namespaces.get(namespace)
+                if previous is not None:
+                    if previous["kind"] == kind and previous["root"] == (
+                        str(spelling) if spelling else None
+                    ):
+                        return self._namespace_info(namespace, previous)
+                    raise NamespaceConflict(f"namespace {namespace!r} has another binding")
+                record = dict(
+                    version=2,
+                    kind=kind,
+                    root=str(spelling) if spelling else None,
+                    root_actual=str(actual) if actual else None,
+                    incarnation=uuid.uuid4().hex,
+                    binding=uuid.uuid4().hex,
+                )
+                with self._catalog.transaction():
+                    self._catalog.put_namespace(namespace, record)
+                self._namespaces[namespace] = record
+                return self._namespace_info(namespace, record)
+
+    @staticmethod
+    def _namespace_info(namespace: str, record: dict[str, Any]) -> NamespaceInfo:
+        return NamespaceInfo(
+            namespace,
+            cast(NamespaceKind, record["kind"]),
+            Path(record["root"]) if record["root"] is not None else None,
+        )
+
+    def _required_namespace(self, namespace: str) -> NamespaceInfo:
+        validate_namespace(namespace)
+        record = self._namespaces.get(namespace)
+        if record is None:
+            raise NamespaceNotFound(f"namespace {namespace!r} does not exist")
+        return self._namespace_info(namespace, record)
+
+    def get_namespace(self, namespace: str) -> NamespaceInfo:
+        with self._call(), self._condition:
+            return self._required_namespace(namespace)
+
+    def list_namespaces(self) -> tuple[NamespaceInfo, ...]:
+        with self._call(), self._condition:
+            return tuple(
+                self._namespace_info(n, self._namespaces[n])
+                for n in sorted(self._namespaces, key=str.encode)
+            )
+
+    def drop_namespace(self, namespace: str) -> DropReport:
+        with self._call(), self._mutation_lock, self._condition:
+            validate_namespace(namespace)
+            if namespace not in self._namespaces:
+                return DropReport(namespace, False, not self._pending and self._state == "ready")
+            # One durable namespace cleanup survives an immediate same-name recreation.
+            identity = DocumentId(namespace, "")
+            job = self._delete_job("drop")
+            previous_drop = self._targets.get(identity, {})
+            job["incarnations"] = list(
+                dict.fromkeys(
+                    [
+                        *previous_drop.get("incarnations", []),
+                        self._namespaces[namespace]["incarnation"],
+                    ]
+                )
+            )
+            with self._catalog.transaction():
+                self._catalog.delete_namespace(namespace)
+                self._catalog.delete_targets(namespace)
+                self._catalog.put_target(namespace, "", job)
+            self._namespaces.pop(namespace)
+            self._targets = {i: j for i, j in self._targets.items() if i.namespace != namespace}
+            self._refresh_pending()
+            self._remember(identity, job)
+            return DropReport(namespace, True, False)
+
+    def status(self) -> Status:
+        with self._call(), self._condition:
+            ready = self._state == "ready" and not self._pending
+            return Status(
+                self._catalog.namespace_count(),
+                self._catalog.document_count(),
+                self._state if self._state != "ready" or ready else "pending",
+                self._dense_config() is not None,
+                self._embedder is not None and self._dense_config() == self._provided_dense(),
+                ready,
+                len(self._pending),
+                sum(j["state"] in ("failed", "blocked") for j in self._targets.values()),
+            )
+
+    def document_status(self, document_id: DocumentId) -> DocumentStatus | None:
+        with self._call(), self._condition:
+            job = self._targets.get(document_id)
+            if job is None:
+                return None
+            text_revision = self._catalog.get_document_revision(
+                document_id.namespace, document_id.doc_id
+            )
+            return DocumentStatus(
+                document_id,
+                str(job["revision"]),
+                text_revision,
+                job.get("indexed_revision"),
+                cast(TaskStage, job["stage"]),
+                cast(TaskState, job["state"]),
+                int(job["attempts"]),
+                job.get("error"),
+                job.get("next_run") or None,
+                len(job.get("vectors", [])),
+                int(job.get("batches", 0)),
+                any(identity == document_id for identity, _ in self._executing),
+            )
+
+    def list_document_statuses(
+        self, namespace: str | None = None, *, limit: int = 100, offset: int = 0
+    ) -> tuple[DocumentStatus, ...]:
+        with self._call(), self._condition:
+            if limit < 1 or offset < 0:
+                raise InvalidQuery("limit must be positive and offset non-negative")
+            ids = sorted(
+                (
+                    i
+                    for i in self._targets
+                    if i.namespace and (namespace is None or i.namespace == namespace)
+                ),
+                key=_sort_id,
+            )
+            return tuple(
+                s
+                for i in ids[offset : offset + limit]
+                if (s := self.document_status(i)) is not None
+            )
+
+    def upsert(
+        self,
+        namespace: str,
+        doc_id: str,
+        data: Path | bytes,
+        media_type: str | None = None,
+        *,
+        idempotency_key: str | None = None,
+    ) -> MutationReport:
+        with self._call(), self._mutation_lock:
+            validate_internal_id(doc_id)
+            if self._required_namespace(namespace).kind != "internal":
+                raise WrongNamespaceKind("upsert requires an internal namespace")
+            staged = (
+                self._stage_bytes(data) if isinstance(data, bytes) else self._stage_path(Path(data))
+            )
+            try:
+                return self._admit(
+                    DocumentId(namespace, doc_id),
+                    staged,
+                    media_type=media_type,
+                    fallback=data if isinstance(data, Path) else None,
+                    idempotency_key=idempotency_key,
+                )
+            finally:
+                self._remove_staging(staged.directory)
+
+    def _admit(
+        self,
+        identity: DocumentId,
+        staged: _Staged,
+        *,
+        media_type: str | None = None,
+        fallback: Path | None = None,
+        idempotency_key: str | None = None,
+        force: bool = False,
+    ) -> MutationReport:
+        media, processor = self._select_processor(
+            identity.doc_id, staged.path, media_type, fallback
+        )
+        description = self._processor_descriptions[id(processor)]
+        if idempotency_key is not None and (
+            not isinstance(_runtime(idempotency_key), str)
+            or not idempotency_key
+            or len(idempotency_key.encode()) > 2048
+        ):
+            raise InvalidQuery("idempotency_key must be a non-empty string of at most 2048 bytes")
+        with self._condition:
+            if self._stopping:
+                raise Closed("MFS is closing")
+            ns = self._namespaces[identity.namespace]
+            fingerprint = dict(
+                content_hash=staged.content_hash,
+                media_type=media,
+                processor=description,
+                binding=ns["binding"],
+            )
+            request_hash = blake3.blake3(
+                canonical_json(
+                    dict(
+                        namespace=identity.namespace,
+                        doc_id=identity.doc_id,
+                        incarnation=ns["incarnation"],
+                        **fingerprint,
+                    )
+                )
+            ).hexdigest()
+            if idempotency_key is not None:
+                prior = self._catalog.get_operation(idempotency_key)
+                if prior is not None:
+                    if prior[0] != request_hash:
+                        raise IdempotencyConflict(
+                            "idempotency key was used for a different request"
+                        )
+                    r = prior[1]
+                    return MutationReport(
+                        identity, r["outcome"], r["index_ready"], r["revision"], r["operation_id"]
+                    )
+            previous = self._targets.get(identity)
+            unchanged = (
+                not force
+                and previous is not None
+                and previous["kind"] == "upsert"
+                and all(previous.get(k) == v for k, v in fingerprint.items())
+            )
+            operation_id = uuid.uuid4().hex
+            if unchanged:
+                assert previous is not None
+                report = MutationReport(
+                    identity,
+                    "unchanged",
+                    previous["state"] == "succeeded",
+                    previous["revision"],
+                    operation_id,
+                )
+                if idempotency_key is not None:
+                    with self._catalog.transaction():
+                        self._catalog.put_operation(idempotency_key, request_hash, asdict(report))
+                return report
+            revision = uuid.uuid4().hex
+            object_name = "objects/" + revision
+            os.replace(staged.path, self._path / object_name)
+            self._fsync_directory(self._path / "objects")
+            external = ns["kind"] == "external"
+            source = dict(
+                size=staged.size,
+                mtime_ns=staged.mtime_ns if external else None,
+                object=None if external else object_name,
+            )
+            # Preserve descendants until this replacement file has usable text, then index.
+            children = (
+                {
+                    i.doc_id: j["revision"]
+                    for i, j in self._targets.items()
+                    if i.namespace == identity.namespace
+                    and i.doc_id.startswith(identity.doc_id + "/")
+                    and j["kind"] == "upsert"
+                }
+                if external
+                else {}
+            )
+            job = dict(
+                revision=revision,
+                kind="upsert",
+                stage="process",
+                state="pending",
+                attempts=0,
+                failures=0,
+                next_run=0,
+                error=None,
+                input=object_name,
+                source=source,
+                incarnation=ns["incarnation"],
+                children=children,
+                indexed_revision=previous.get("indexed_revision") if previous else None,
+                vectors=[],
+                **fingerprint,
+            )
+            existed = previous is not None and previous["kind"] == "upsert"
+            report = MutationReport(
+                identity, "updated" if existed else "added", False, revision, operation_id
+            )
+            try:
+                with self._catalog.transaction():
+                    self._catalog.put_target(identity.namespace, identity.doc_id, job)
+                    if idempotency_key is not None:
+                        self._catalog.put_operation(idempotency_key, request_hash, asdict(report))
+            except Exception:
+                # A lost ACK must not leave durable accepted work out of the live pending set.
+                durable = self._catalog.get_target(identity.namespace, identity.doc_id)
+                if durable is not None:
+                    self._remember(identity, durable)
+                raise
+            self._remember(identity, job)
+            return report
+
+    @staticmethod
+    def _delete_job(kind: str = "delete") -> dict[str, Any]:
+        return dict(
+            revision=uuid.uuid4().hex,
+            kind=kind,
+            stage=kind,
+            state="pending",
+            attempts=0,
+            failures=0,
+            next_run=0,
+            error=None,
+        )
+
+    def _remove(self, identity: DocumentId) -> MutationReport:
+        with self._condition:
+            old = self._targets.get(identity)
+            if old is None or old["kind"] != "upsert":
+                return MutationReport(
+                    identity, "not_found", not self._pending and self._state == "ready"
+                )
+            job = self._delete_job()
+            job["incarnation"] = old.get("incarnation")
+            with self._catalog.transaction():
+                self._catalog.delete_document(identity.namespace, identity.doc_id)
+                self._catalog.put_target(identity.namespace, identity.doc_id, job)
+            self._remember(identity, job)
+            return MutationReport(identity, "removed", False, job["revision"], uuid.uuid4().hex)
+
+    def remove(self, namespace: str, doc_id: str) -> MutationReport:
+        with self._call(), self._mutation_lock:
+            validate_internal_id(doc_id)
+            if self._required_namespace(namespace).kind != "internal":
+                raise WrongNamespaceKind(
+                    "remove requires an internal namespace; use sync for external files"
+                )
+            return self._remove(DocumentId(namespace, doc_id))
+
+    def retry(self, document_id: DocumentId, stage: TaskStage | None = None) -> None:
+        with self._call(), self._condition:
+            previous = self._targets.get(document_id)
+            if previous is None:
+                raise InvalidQuery("document has no task")
+            if previous["state"] == "running":
+                raise InvalidQuery("task is still executing")
+            job = copy.deepcopy(previous)
+            if stage is not None and stage != job["stage"]:
+                raise InvalidQuery(
+                    "retry resumes the failed stage; use reprocess for new processing"
+                )
+            if job["state"] == "succeeded":
+                return
+            job.update(
+                state="pending", next_run=0, failures=0, error=None, attempt_token=uuid.uuid4().hex
+            )
+            self._store_job(document_id, job)
+
+    def cancel(self, document_id: DocumentId) -> None:
+        with self._call(), self._condition:
+            previous = self._targets.get(document_id)
+            if previous is None:
+                raise InvalidQuery("document has no task")
+            if previous["state"] == "succeeded":
+                return
+            job = copy.deepcopy(previous)
+            job["state"] = "cancelled"
+            job["attempt_token"] = uuid.uuid4().hex
+            self._store_job(document_id, job)
+
+    def reprocess(self, document_id: DocumentId) -> MutationReport:
+        with self._call(), self._mutation_lock:
+            info = self._required_namespace(document_id.namespace)
+            if info.kind == "external":
+                report = self._sync(
+                    document_id.namespace, document_id.doc_id, verify="content", force=True
+                )
+                if report.failed or report.skipped or not report.changed:
+                    raise SourceUnavailable("external input could not be reprocessed")
+                job = self._targets[document_id]
+                return MutationReport(document_id, "updated", False, job["revision"])
+            with self._condition:
+                job = self._targets.get(document_id)
+                if job is None or job["kind"] != "upsert":
+                    raise InvalidQuery("document does not exist")
+                input_name = job.get("input") or job.get("source", {}).get("object")
+            staged = self._stage_path(self._path / str(input_name))
+            try:
+                return self._admit(document_id, staged, media_type=job["media_type"], force=True)
+            finally:
+                self._remove_staging(staged.directory)
+
+    def _worker(self, role: str) -> None:
+        while True:
+            with self._condition:
+                if self._stopping:
+                    return
+                now = time.time()
+                chosen: tuple[DocumentId, dict[str, Any]] | None = None
+                next_run: float | None = None
+                for identity, item in self._targets.items():
+                    if item["state"] not in ("pending", "retry_wait"):
+                        continue
+                    if (item["stage"] == "process") != (role == "prepare"):
+                        continue
+                    if role == "index" and self._state != "ready" and item["kind"] != "rebuild":
+                        continue
+                    dependency = item.get("depends_on")
+                    if dependency:
+                        parent = self._targets.get(DocumentId(identity.namespace, dependency))
+                        if parent is not None and parent["state"] != "succeeded":
+                            continue
+                    due = float(item.get("next_run", 0))
+                    if due > now:
+                        next_run = due if next_run is None else min(next_run, due)
+                        continue
+                    # Namespace cleanup runs before rows for a newly created incarnation.
+                    if chosen is None or item["kind"] in ("drop", "rebuild"):
+                        chosen = identity, copy.deepcopy(item)
+                        if item["kind"] in ("drop", "rebuild"):
+                            break
+                if chosen is None:
+                    self._condition.wait(None if next_run is None else max(0.01, next_run - now))
+                    continue
+                identity, job = chosen
+                job.update(
+                    state="running",
+                    attempts=int(job.get("attempts", 0)) + 1,
+                    attempt_token=uuid.uuid4().hex,
+                )
+                try:
+                    self._store_job(identity, job)
+                except Exception:
+                    # A failed claim has not executed an external action. Retry durable state later.
+                    self._condition.wait(0.25)
+                    continue
+                execution = (identity, str(job["attempt_token"]))
+                self._executing.add(execution)
+            try:
+                if role == "prepare":
+                    self._process_job(identity, job)
+                else:
+                    self._index_job(identity, job)
+            except Exception as error:
+                self._fail_job(identity, job, error)
+            finally:
+                with self._condition:
+                    self._executing.discard(execution)
+                    self._condition.notify_all()
+
+    def _fail_job(self, identity: DocumentId, job: dict[str, Any], error: Exception) -> None:
+        with self._condition:
+            if not self._current(identity, job):
+                return
+            # Handlers may have changed their local stage before a transaction rolled back.
+            # Resume the durable stage, or adopt a transaction that committed before raising.
+            previous = self._targets[identity]
+            try:
+                durable = self._catalog.get_target(identity.namespace, identity.doc_id)
+            except Exception:
+                durable = None
+            if durable is not None and durable != previous:
+                self._remember(identity, durable)
+                return
+            job = copy.deepcopy(durable or previous)
+            failures = int(job.get("failures", 0)) + 1
+            cause: BaseException | None = error
+            retryable = False
+            visited: set[int] = set()
+            while cause is not None and id(cause) not in visited:
+                visited.add(id(cause))
+                retryable |= isinstance(
+                    cause, (RetryableError, TimeoutError, ConnectionError, OSError, StorageFailed)
+                )
+                cause = cause.__cause__
+            state = (
+                "blocked"
+                if isinstance(error, CapabilityUnavailable)
+                else "retry_wait"
+                if retryable and failures < 5
+                else "failed"
+            )
+            job.update(
+                state=state,
+                failures=failures,
+                error=str(error),
+                next_run=time.time() + min(30, 0.25 * 2 ** (failures - 1))
+                if state == "retry_wait"
+                else 0,
+            )
+            try:
+                self._store_job(identity, job)
+            except Exception as persistence_error:
+                # Keep failed work pending even when the completion/error transaction itself fails.
+                job.update(
+                    state="retry_wait",
+                    next_run=time.time() + 0.5,
+                    error=f"{error}; state persistence failed: {persistence_error}",
+                )
+                self._remember(identity, job)
+
+    def _advance(self, identity: DocumentId, job: dict[str, Any], **changes: Any) -> None:
+        with self._condition:
+            if not self._current(identity, job):
+                return
+            job.update(state="pending", error=None, failures=0, next_run=0, **changes)
+            self._store_job(identity, job)
+
+    def _prepare_snapshot(self, job: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        artifact = "artifacts/" + job["revision"] + "-snapshot.json"
+        if (self._path / artifact).exists():
+            cached: object = self._read_artifact(artifact)
+            if not isinstance(cached, dict):
+                raise CorruptState("processed artifact is not an object")
+            snapshot = cast(dict[str, Any], cached)
+            if snapshot.get("revision") != job["revision"]:
+                raise CorruptState("processed artifact does not match target revision")
+            return artifact, snapshot
+        processor = next(
+            (
+                p
+                for p in self._processors
+                if self._processor_descriptions[id(p)] == job["processor"]
+            ),
+            None,
+        )
+        if processor is None:
+            raise CapabilityUnavailable("registered Processor does not match accepted input")
+        with self._processor_lock:
+            processed = validate_processed(
+                processor.process(self._path / job["input"], job["media_type"])
+            )
+        record: dict[str, Any] = dict(
+            version=2,
+            revision=job["revision"],
+            media_type=job["media_type"],
+            content_hash=job["content_hash"],
+            processor=job["processor"],
+            text=processed.text,
+            source_map=self._source_map_json(processed.source_map),
+            source=job["source"],
+            binding=job["binding"],
+            incarnation=job["incarnation"],
+        )
+        record["snapshot_id"] = blake3.blake3(compact_json(record).encode()).hexdigest()
+        self._write_artifact(job["revision"] + "-snapshot", record)
+        return artifact, record
+
+    def _process_job(self, identity: DocumentId, job: dict[str, Any]) -> None:
+        artifact, record = self._prepare_snapshot(job)
+        with self._condition:
+            if not self._current(identity, job):
+                return
+            updates: list[tuple[DocumentId, dict[str, Any]]] = []
+            with self._catalog.transaction():
+                self._catalog.put_document(identity.namespace, identity.doc_id, record)
+                for child, revision in job.get("children", {}).items():
+                    child_id = DocumentId(identity.namespace, child)
+                    previous = self._targets.get(child_id)
+                    if previous is None or previous["revision"] != revision:
+                        continue
+                    deletion = self._delete_job()
+                    deletion.update(
+                        depends_on=identity.doc_id, incarnation=previous.get("incarnation")
+                    )
+                    self._catalog.delete_document(identity.namespace, child)
+                    self._catalog.put_target(identity.namespace, child, deletion)
+                    updates.append((child_id, deletion))
+                job.update(
+                    stage="chunk", state="pending", snapshot=artifact, error=None, failures=0
+                )
+                self._catalog.put_target(identity.namespace, identity.doc_id, job)
+            for child_id, deletion in updates:
+                self._remember(child_id, deletion)
+            self._remember(identity, job)
+
+    def _index_job(self, identity: DocumentId, job: dict[str, Any]) -> None:
+        if job["kind"] == "rebuild":
+            self._rebuild_job(identity, job)
+            return
+        with self._condition:
+            if not self._current(identity, job):
+                return
+        stage = job["stage"]
+        if stage == "drop":
+            for incarnation in job.get("incarnations", [None]):
+                self._index.delete_namespace(identity.namespace, incarnation=incarnation)
+        elif stage == "delete":
+            self._index.delete_document(identity, incarnation=job.get("incarnation"))
+            self._index.flush()
+        elif stage == "chunk":
+            record = self._read_artifact(job["snapshot"])
+            text = str(record["text"])
+            with self._chunker_lock:
+                ranges = validate_chunk_ranges(
+                    text, self._chunker.chunk(text, self._source_map(record))
+                )
+            encoded = text.encode()
+            chunks = [
+                dict(
+                    ordinal=i,
+                    text_start=r.text_start,
+                    text_end=r.text_end,
+                    text=encoded[r.text_start : r.text_end].decode(),
+                )
+                for i, r in enumerate(ranges)
+            ]
+            artifact = self._write_artifact(job["revision"] + "-chunks", chunks)
+            self._advance(
+                identity,
+                job,
+                stage="embed" if self._dense_config() and chunks else "publish",
+                chunks=artifact,
+                vectors=[],
+                batches=(len(chunks) + 127) // 128,
+            )
+            return
+        elif stage == "embed":
+            chunks = self._read_artifact(job["chunks"])
+            batch = len(job.get("vectors", []))
+            texts = [str(c["text"]) for c in chunks[batch * 128 : (batch + 1) * 128]]
+            vectors = self._embed_documents(texts)
+            artifact = self._write_artifact(job["revision"] + f"-vectors-{batch}", vectors)
+            paths = [*job.get("vectors", []), artifact]
+            self._advance(
+                identity,
+                job,
+                stage="publish" if len(paths) == job["batches"] else "embed",
+                vectors=paths,
+            )
+            return
+        elif stage == "publish":
+            rows = self._job_rows(identity, job)
+            with self._condition:
+                if not self._current(identity, job):
+                    return
+            self._index.replace(identity, rows)
+        else:
+            raise CorruptState(f"unknown task stage {stage!r}")
+        with self._condition:
+            if self._current(identity, job):
+                job.update(
+                    state="succeeded", indexed_revision=job["revision"], error=None, failures=0
+                )
+                self._store_job(identity, job)
+
+    def _job_rows(self, identity: DocumentId, job: dict[str, Any]) -> list[IndexRow]:
+        record = self._read_artifact(job["snapshot"])
+        chunks = self._read_artifact(job["chunks"])
+        vectors = [
+            vector for name in job.get("vectors", []) for vector in self._read_artifact(name)
+        ]
+        if self._dense_config() is not None and len(vectors) != len(chunks):
+            raise CorruptState("publication is missing dense vectors")
+        source_map = self._source_map(record)
+        rows: list[IndexRow] = []
+        for i, chunk in enumerate(chunks):
+            location = self._source_location(source_map, chunk["text_start"], chunk["text_end"])
+            rows.append(
+                IndexRow(
+                    namespace=identity.namespace,
+                    doc_id=identity.doc_id,
+                    ordinal=i,
+                    text=chunk["text"],
+                    text_start=chunk["text_start"],
+                    text_end=chunk["text_end"],
+                    dense_vector=vectors[i] if vectors else [],
+                    snapshot_id=record["snapshot_id"],
+                    source_location=dict(version=1, sources=list(location.sources)),
+                    media_type=record["media_type"],
+                    incarnation=job["incarnation"],
+                )
+            )
+        return rows
+
+    def reindex(self, timeout: float | None = None) -> ReindexReport:
+        with self._call(), self._mutation_lock:
+            self._validate_timeout(timeout)
+            desired_dense = self._provided_dense() or self._dense_config()
+            if desired_dense is not None and self._provided_dense() != desired_dense:
+                raise CapabilityUnavailable("reindex requires the configured Embedder")
+            identity = DocumentId("", "")
+            with self._condition:
+                job = dict(
+                    revision=uuid.uuid4().hex,
+                    kind="rebuild",
+                    stage="rebuild",
+                    state="pending",
+                    attempts=0,
+                    failures=0,
+                    next_run=0,
+                    error=None,
+                    config=index_config(
+                        cast(dict[str, object], self._chunker_description), desired_dense
+                    ),
+                )
+                self._store_job(identity, job)
+                self._state = "dirty"
+            deadline = None if timeout is None else time.monotonic() + timeout
+            with self._condition:
+                while not self._is_ready():
+                    if self._stopping:
+                        raise Closed("MFS is closing")
+                    control = self._targets[identity]
+                    candidates = (
+                        self._targets.values() if control["state"] == "succeeded" else [control]
+                    )
+                    failures = [
+                        j for j in candidates if j["state"] in ("failed", "blocked", "cancelled")
+                    ]
+                    if failures:
+                        raise IndexFailed(str(failures[0].get("error") or failures[0]["state"]))
+                    remaining = None if deadline is None else deadline - time.monotonic()
+                    if remaining is not None and remaining <= 0:
+                        raise WaitTimeout("reindex did not finish before timeout")
+                    self._condition.wait(remaining)
+            return ReindexReport(
+                self._catalog.document_count(),
+                len(self._index.scan()),
+                self._dense_config() is not None,
+            )
+
+    def _rebuild_job(self, identity: DocumentId, job: dict[str, Any]) -> None:
+        config = cast(dict[str, object], job["config"])
+        dense = config.get("dense")
+        dimension = int(cast(dict[str, Any], dense)["dimension"]) if dense else None
+        marker = self._path / "INDEX_DIRTY"
+        with marker.open("w") as stream:
+            stream.write("rebuild\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        self._fsync_directory(self._path)
+        self._index.recreate(dense_dimension=dimension)
+        self._write_index_config(config)
+        with self._condition:
+            updates: list[tuple[DocumentId, dict[str, Any]]] = []
+            with self._catalog.transaction():
+                for target_id, previous in self._targets.items():
+                    if (
+                        target_id == identity
+                        or previous["stage"] == "process"
+                        or previous["state"] == "cancelled"
+                    ):
+                        continue
+                    target = copy.deepcopy(previous)
+                    if target["kind"] == "upsert":
+                        target.update(
+                            stage="chunk",
+                            state="pending",
+                            vectors=[],
+                            error=None,
+                            failures=0,
+                            next_run=0,
+                        )
+                    else:
+                        target.update(state="succeeded", indexed_revision=target["revision"])
+                    self._catalog.put_target(target_id.namespace, target_id.doc_id, target)
+                    updates.append((target_id, target))
+                job.update(state="succeeded", indexed_revision=job["revision"])
+                self._catalog.put_target(identity.namespace, identity.doc_id, job)
+            for target_id, target in updates:
+                self._remember(target_id, target)
+            self._remember(identity, job)
             self._config = config
             self._state = "ready"
-        except Exception:
-            self._state = "dirty"
-            raise
-
-    def _load_index_state(self) -> None:
-        marker = (self._path / "INDEX_DIRTY").exists()
-        config_path = self._path / "index.json"
-        try:
-            raw = load_json(config_path.read_text("utf-8"))
-            if not isinstance(raw, dict):
-                raise ValueError("index config is not an object")
-            version = raw.get("version")
-            if isinstance(version, int) and version > 1:
-                raise SchemaVersionUnsupported(f"index schema version {version} is unsupported")
-            if version != 1 or "chunker" not in raw or "bm25" not in raw or "dense" not in raw:
-                raise ValueError("index config does not match V1")
-            self._config = cast(dict[str, object], raw)
-            dense_value = raw.get("dense")
-            dimension = (
-                _as_int(cast(dict[str, object], dense_value).get("dimension"), "dense dimension")
-                if isinstance(dense_value, dict)
-                else None
-            )
-            collection_valid = self._index.has_valid_collection(dense_dimension=dimension)
-        except SchemaVersionUnsupported:
-            raise
-        except Exception:
-            self._config = {}
-            collection_valid = False
-        if marker or not collection_valid or not self._config:
-            self._state = "dirty"
-            return
-        expected_chunker = self._chunker_description
-        dense = self._config.get("dense")
-        mismatch = self._config.get("chunker") != expected_chunker
-        if self._embedder_space is not None and self._embedder_dimension is not None:
-            desired = dense_config(self._embedder_space, self._embedder_dimension)
-            mismatch = mismatch or dense != desired
-        self._state = "mismatch" if mismatch else "ready"
+            self._condition.notify_all()
+        marker.unlink()
+        self._fsync_directory(self._path)
 
     def _write_index_config(self, value: dict[str, object]) -> None:
-        temporary = self._path / f".index-{uuid.uuid4().hex}.tmp"
+        self._write_json(self._path / "index.json", value)
+
+    def _write_artifact(self, name: str, value: Any) -> str:
+        relative = "artifacts/" + name + ".json"
+        self._write_json(self._path / relative, value)
+        return relative
+
+    def _write_json(self, path: Path, value: Any) -> None:
+        temporary = path.parent / ("." + uuid.uuid4().hex + ".tmp")
         try:
             with temporary.open("x", encoding="utf-8") as stream:
                 stream.write(compact_json(value))
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, self._path / "index.json")
-            self._fsync_directory(self._path)
+            os.replace(temporary, path)
+            self._fsync_directory(path.parent)
         except OSError as error:
-            raise StorageFailed(f"failed to persist index config: {error}") from error
+            raise StorageFailed(f"failed to persist {path.name}: {error}") from error
         finally:
-            with contextlib.suppress(OSError):
+            with contextlib.suppress(FileNotFoundError):
                 temporary.unlink()
 
-    def _make_marker(self) -> None:
-        marker = self._path / "INDEX_DIRTY"
+    def _read_artifact(self, relative: str) -> Any:
+        path = self._path / relative
+        if path.parent != self._path / "artifacts" or path.is_symlink():
+            raise CorruptState("artifact path escapes managed storage")
         try:
-            descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            try:
-                os.write(descriptor, b"1\n")
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-            self._fsync_directory(self._path)
-        except FileExistsError:
-            self._state = "dirty"
-            raise IndexUnavailable("index is already dirty") from None
-        except OSError as error:
-            if marker.exists():
-                self._state = "dirty"
-            raise StorageFailed(f"failed to create dirty marker: {error}") from error
-
-    def _clear_marker(self) -> None:
-        try:
-            (self._path / "INDEX_DIRTY").unlink()
-            self._fsync_directory(self._path)
-        except OSError as error:
-            self._state = "dirty"
-            raise StorageFailed(f"failed to clear dirty marker: {error}") from error
+            return load_json(path.read_text("utf-8"))
+        except (OSError, ValueError) as error:
+            raise CorruptState(f"cannot read artifact: {error}") from error
 
     @staticmethod
     def _fsync_directory(path: Path) -> None:
@@ -319,316 +1218,282 @@ class MFS:
             os.close(descriptor)
 
     def _recover_objects(self) -> None:
-        namespaces: dict[str, NamespaceInfo] = {}
-        for namespace, record in self._catalog.list_namespaces():
-            namespaces[namespace] = self._namespace_info(namespace, record)
-        referenced: set[Path] = set()
-        for namespace, doc_id, record in self._catalog.list_documents():
-            try:
-                if record.get("version") != 1:
-                    raise ValueError("document version is not 1")
-                media_type = record["media_type"]
-                if (
-                    not isinstance(media_type, str)
-                    or normalized_media_type(media_type) != media_type
-                ):
-                    raise ValueError("media type is invalid")
-                for field in ("content_hash", "snapshot_id"):
-                    value = record[field]
-                    if (
-                        not isinstance(value, str)
-                        or len(value) != 64
-                        or any(character not in "0123456789abcdef" for character in value)
-                    ):
-                        raise ValueError(f"{field} is not lowercase BLAKE3 hex")
-                processor = record["processor"]
-                if not isinstance(processor, dict):
-                    raise ValueError("processor description is invalid")
-                processor_data = cast(dict[str, object], processor)
-                if not processor_data.get("id") or not processor_data.get("version"):
-                    raise ValueError("processor id/version is empty")
-                canonical_json(processor_data.get("options"))
-                text = record["text"]
-                if not isinstance(text, str):
-                    raise ValueError("text is not a string")
-                source_map = self._source_map(record)
-                validate_source_map(source_map, len(text.encode("utf-8", errors="strict")))
-                source = record["source"]
-                if not isinstance(source, dict):
-                    raise ValueError("source is invalid")
-                source_data = cast(dict[str, object], source)
-                size = source_data["size"]
-                if isinstance(size, bool) or not isinstance(size, int) or size < 0:
-                    raise ValueError("source size is invalid")
-                object_name = source_data["object"]
-                namespace_info = namespaces[namespace]
-                if namespace_info.kind == "internal" and source_data.get("mtime_ns") is not None:
-                    raise ValueError("internal source must not persist mtime")
-                if namespace_info.kind == "external" and object_name is not None:
-                    raise ValueError("external source must not reference an object")
-                if namespace_info.kind == "internal" and object_name is None:
-                    raise ValueError("internal source must reference an object")
-                if namespace_info.kind == "external":
-                    mtime_ns = source_data.get("mtime_ns")
-                    if isinstance(mtime_ns, bool) or not isinstance(mtime_ns, int):
-                        raise ValueError("external source mtime is invalid")
-                if object_name is None:
+        referenced: set[str] = set()
+        for _, _, record in self._catalog.list_documents():
+            original = record.get("source", {}).get("object")
+            if original:
+                referenced.add(original)
+        for job in self._targets.values():
+            if job["kind"] == "upsert" and job["stage"] == "process":
+                completed = "artifacts/" + job["revision"] + "-snapshot.json"
+                if (self._path / completed).exists():
+                    # PROCESS may have persisted output just before the text transaction crashed.
+                    referenced.add(completed)
+            for key in ("input", "snapshot", "chunks"):
+                if job.get(key):
+                    referenced.add(job[key])
+            referenced.update(job.get("vectors", []))
+        for name in referenced:
+            path = self._path / name
+            if (
+                path.parent not in (self._path / "objects", self._path / "artifacts")
+                or path.is_symlink()
+                or not path.is_file()
+            ):
+                raise CorruptState(f"missing or unsafe managed artifact {name!r}")
+        for folder in ("objects", "artifacts", "staging"):
+            for path in (self._path / folder).iterdir():
+                if str(path.relative_to(self._path)) in referenced:
                     continue
-                if not isinstance(object_name, str):
-                    raise ValueError("object path is not a string")
-                object_path = (self._path / object_name).resolve(strict=True)
-                objects_root = (self._path / "objects").resolve(strict=True)
-                if object_path.parent != objects_root or not object_path.is_file():
-                    raise ValueError("object path is missing or outside objects")
-                referenced.add(object_path)
-            except Exception as error:
-                raise CorruptState(
-                    f"invalid document record {namespace}/{doc_id}: {error}"
-                ) from error
-        for path in (self._path / "objects").iterdir():
-            if path.is_file() and path.resolve() not in referenced:
-                with contextlib.suppress(OSError):
-                    path.unlink()
-        for path in (self._path / "staging").iterdir():
-            with contextlib.suppress(OSError):
                 if path.is_dir() and not path.is_symlink():
                     shutil.rmtree(path)
                 else:
                     path.unlink()
 
-    def _ready(self) -> None:
-        if self._state != "ready":
-            raise IndexUnavailable(f"index state is {self._state}; call reindex()")
+    def query(
+        self, filters: Sequence[Filter] = (), select: Select = "doc_id", limit: int | None = None
+    ) -> QueryResult[Any]:
+        with self._call():
+            self._validate_query_options(select, limit, search=False)
+            documents = self._filter_documents(filters)
+            items: list[QueryItem[Any]] = []
+            for item in documents:
+                if select == "doc_id":
+                    items.append(QueryItem(item.id, item.matches))
+                elif select == "doc":
+                    items.append(QueryItem(self._document(item.id, item.record), item.matches))
+                else:
+                    # Chunk projection is computed from the SQLite snapshot, independent of Milvus.
+                    with self._chunker_lock:
+                        ranges = validate_chunk_ranges(
+                            item.record["text"],
+                            self._chunker.chunk(item.record["text"], self._source_map(item.record)),
+                        )
+                    encoded = item.record["text"].encode()
+                    for ordinal, span in enumerate(ranges):
+                        matches = tuple(
+                            m
+                            for m in item.matches
+                            if m.text_start < span.text_end and span.text_start < m.text_end
+                        )
+                        if item.matches and not matches:
+                            continue
+                        chunk = Chunk(
+                            item.id,
+                            item.record["snapshot_id"],
+                            ordinal,
+                            encoded[span.text_start : span.text_end].decode(),
+                            span.text_start,
+                            span.text_end,
+                            self._source_location(
+                                self._source_map(item.record), span.text_start, span.text_end
+                            ),
+                        )
+                        items.append(QueryItem(chunk, matches))
+            truncated = limit is not None and len(items) > limit
+            return QueryResult(tuple(items if limit is None else items[:limit]), truncated)
 
-    @contextlib.contextmanager
-    def _call(self) -> Generator[None, None, None]:
-        with self._lifecycle.call():
-            yield
-
-    def close(self) -> None:
-        if not self._lifecycle.begin_close():
-            return
-        error: Exception | None = None
-        try:
-            try:
-                self._index.close()
-            except Exception as close_error:
-                error = close_error
-            try:
-                self._catalog.close()
-            except Exception as close_error:
-                error = error or close_error
-            self._instance_lock.release()
-        finally:
-            self._lifecycle.finish_close()
-        if error is not None:
-            raise error
-
-    def create_namespace(
-        self, namespace: str, kind: NamespaceKind, root: Path | None = None
-    ) -> NamespaceInfo:
-        with self._call(), self._mutation_lock:
-            validate_namespace(namespace)
-            if kind not in ("internal", "external"):
-                raise InvalidConfiguration("namespace kind must be 'internal' or 'external'")
-            if kind == "internal":
-                if root is not None:
-                    raise InvalidConfiguration("internal namespace must not have a root")
-                resolved_root = None
-            else:
-                if root is None:
-                    raise InvalidConfiguration("external namespace requires a root")
-                try:
-                    resolved_root = Path(root).expanduser().resolve(strict=True)
-                except OSError as error:
-                    raise SourceUnavailable(f"external root is unavailable: {error}") from error
-                if not resolved_root.is_dir() or not os.access(resolved_root, os.R_OK):
-                    raise SourceUnavailable("external root must be a readable directory")
-                if _paths_overlap(self._path, resolved_root):
-                    raise RootOverlap("external root and mfs_path must not overlap")
-            existing = self._catalog.get_namespace(namespace)
-            expected = {
-                "version": 1,
-                "kind": kind,
-                "root": str(resolved_root) if resolved_root is not None else None,
+    def _filter_documents(self, filters: Sequence[Filter]) -> list[_FilteredDocument]:
+        with self._condition:
+            names: dict[str, NamespaceKind] = {
+                n: cast(NamespaceKind, r["kind"]) for n, r in self._namespaces.items()
             }
-            if existing is not None:
-                if existing == expected:
-                    return self._namespace_info(namespace, existing)
-                raise NamespaceConflict(
-                    f"namespace {namespace!r} already has a different kind or root"
+        compiled = compile_filters(filters, names, search=False)
+        for item in compiled.text:
+            self._text_matches(
+                "", item
+            )  # Invalid patterns fail even when there are no candidate documents.
+        result: list[_FilteredDocument] = []
+        for ns, doc, record in self._catalog.select_documents(compiled.sql, compiled.params):
+            ranges: list[tuple[int, int]] = []
+            for text_filter in compiled.text:
+                matches = self._text_matches(record["text"], text_filter)
+                if not matches:
+                    break
+                ranges.extend(matches)
+            else:
+                source_map = self._source_map(record)
+                result.append(
+                    _FilteredDocument(
+                        DocumentId(ns, doc),
+                        record,
+                        tuple(
+                            Match(start, end, self._source_location(source_map, start, end))
+                            for start, end in _merge_ranges(ranges)
+                        ),
+                    )
                 )
-            with self._rwlock.write():
-                self._catalog.put_namespace(namespace, cast(dict[str, JSONValue], expected))
-            return NamespaceInfo(namespace, kind, resolved_root)
-
-    def get_namespace(self, namespace: str) -> NamespaceInfo:
-        with self._call(), self._rwlock.read():
-            validate_namespace(namespace)
-            record = self._catalog.get_namespace(namespace)
-            if record is None:
-                raise NamespaceNotFound(f"namespace {namespace!r} does not exist")
-            return self._namespace_info(namespace, record)
-
-    def list_namespaces(self) -> tuple[NamespaceInfo, ...]:
-        with self._call(), self._rwlock.read():
-            values = [
-                self._namespace_info(name, record)
-                for name, record in self._catalog.list_namespaces()
-            ]
-            return tuple(sorted(values, key=lambda item: item.namespace.encode()))
+        return result
 
     @staticmethod
-    def _namespace_info(namespace: str, record: dict[str, Any]) -> NamespaceInfo:
+    def _text_matches(text: str, text_filter: TextMatch) -> list[tuple[int, int]]:
+        pattern = text_filter.pattern
+        if not isinstance(_runtime(pattern), str) or not pattern or len(pattern.encode()) > 16384:
+            raise InvalidFilter("TextMatch pattern must be 1..16384 UTF-8 bytes")
         try:
-            kind = cast(NamespaceKind, record["kind"])
-            root = Path(record["root"]) if kind == "external" else None
-            if kind not in ("internal", "external") or (kind == "external") != (root is not None):
-                raise ValueError("invalid kind/root")
-            return NamespaceInfo(namespace, kind, root)
+            sensitive = text_filter.case_sensitive or (
+                text_filter.smart_case and any(c.isupper() for c in pattern)
+            )
+            ranges = regex_ranges(text, pattern, regex=text_filter.regex, case_sensitive=sensitive)
         except Exception as error:
-            raise CorruptState(f"invalid namespace record {namespace!r}") from error
+            raise InvalidPattern(f"invalid RE2 pattern: {error}") from error
+        if text_filter.whole_word:
 
-    def drop_namespace(self, namespace: str) -> DropReport:
-        with self._call(), self._mutation_lock:
-            validate_namespace(namespace)
-            record = self._catalog.get_namespace(namespace)
-            if record is None:
-                return DropReport(namespace, False, self._state == "ready")
-            documents = self._catalog.list_namespace_documents(namespace)
-            if not documents:
-                with self._rwlock.write():
-                    self._catalog.delete_namespace(namespace)
-                return DropReport(namespace, True, self._state == "ready")
-            self._ready()
-            object_paths = [self._object_path(item) for _, item in documents]
-            with self._rwlock.write():
-                self._make_marker()
-                try:
-                    self._index.delete_namespace(namespace)
-                    self._catalog.delete_namespace(namespace)
-                except Exception:
-                    self._state = "dirty"
-                    raise
-                ready = self._cleanup_marker_after_commit()
-            for object_path in object_paths:
-                if object_path is not None:
-                    with contextlib.suppress(OSError):
-                        object_path.unlink()
-            return DropReport(namespace, True, ready)
+            def word(character: str) -> bool:
+                return character == "_" or character.isalnum()
 
-    def status(self) -> Status:
-        with self._call(), self._rwlock.read():
-            dense = self._dense_config()
-            available = (
-                dense is not None
-                and self._embedder is not None
-                and dense.get("embedding_space") == self._embedder_space
-                and dense.get("dimension") == self._embedder_dimension
-                and self._state != "mismatch"
-            )
-            return Status(
-                namespace_count=self._catalog.namespace_count(),
-                document_count=self._catalog.document_count(),
-                index_state=self._state,
-                dense_enabled=dense is not None,
-                dense_available=available,
-            )
+            ranges = [
+                (start, end)
+                for start, end in ranges
+                if (start == 0 or not word(text[start - 1]))
+                and (end == len(text) or not word(text[end]))
+            ]
+        offsets = [0]
+        for character in text:
+            offsets.append(offsets[-1] + len(character.encode()))
+        return [(offsets[start], offsets[end]) for start, end in ranges]
 
-    def _dense_config(self) -> dict[str, object] | None:
-        dense = self._config.get("dense")
-        return cast(dict[str, object], dense) if isinstance(dense, dict) else None
+    @staticmethod
+    def _validate_query_options(select: str, limit: int | None, *, search: bool) -> None:
+        if select not in ("doc_id", "chunk", "doc"):
+            raise InvalidQuery(f"invalid select {select!r}")
+        if limit is not None and (
+            isinstance(_runtime(limit), bool) or not isinstance(_runtime(limit), int)
+        ):
+            raise InvalidQuery("limit must be an integer")
+        if search and (limit is None or not 1 <= limit <= 1000):
+            raise InvalidQuery("search limit must be 1..1000")
+        if not search and limit is not None and not 1 <= limit <= 100000:
+            raise InvalidQuery("query limit must be 1..100000 or None")
 
-    def _cleanup_marker_after_commit(self) -> bool:
-        try:
-            self._clear_marker()
-        except StorageFailed:
-            self._state = "dirty"
-            return False
-        self._state = "ready"
-        return True
-
-    def upsert(
+    def search(
         self,
-        namespace: str,
-        doc_id: str,
-        data: Path | bytes,
-        media_type: str | None = None,
-    ) -> MutationReport:
-        with self._call(), self._mutation_lock:
-            validate_namespace(namespace)
-            validate_internal_id(doc_id)
-            info = self._required_namespace(namespace)
-            if info.kind != "internal":
-                raise WrongNamespaceKind("upsert is only valid for internal namespaces")
-            self._ready()
-            document_id = DocumentId(namespace, doc_id)
-            staged = (
-                self._stage_bytes(data) if isinstance(data, bytes) else self._stage_path(Path(data))
-            )
-            try:
-                previous = self._catalog.get_document(namespace, doc_id)
-                prepared = self._prepare(
-                    document_id,
-                    staged,
-                    previous,
-                    explicit_media_type=media_type,
-                    fallback_path=data if isinstance(data, Path) else None,
-                    external=False,
+        text: str,
+        filters: Sequence[Filter] = (),
+        mode: SearchMode = "hybrid",
+        select: Select = "chunk",
+        limit: int = 10,
+        *,
+        consistency: Consistency = "strong",
+        timeout: float | None = None,
+    ) -> SearchResult[Any]:
+        with self._call():
+            if not isinstance(_runtime(text), str) or not text or len(text.encode()) > 65536:
+                raise InvalidQuery("search text must be 1..65536 UTF-8 bytes")
+            if mode not in ("bm25", "vector", "hybrid") or consistency not in (
+                "strong",
+                "eventual",
+            ):
+                raise InvalidQuery("invalid search mode or consistency")
+            self._validate_query_options(select, limit, search=True)
+            self._validate_timeout(timeout)
+            if select == "doc":
+                raise InvalidQuery(
+                    "ranked search returns chunk/doc_id; read documents separately with query"
                 )
-                if prepared is None:
-                    return MutationReport(document_id, "unchanged", True)
-                old_object = self._object_path(previous) if previous is not None else None
-                object_relative = f"objects/{uuid.uuid4().hex}"
-                object_path = self._path / object_relative
-                try:
-                    os.replace(staged.path, object_path)
-                    with object_path.open("rb") as stream:
-                        os.fsync(stream.fileno())
-                    self._fsync_directory(object_path.parent)
-                except OSError as error:
-                    raise StorageFailed(f"failed to store internal object: {error}") from error
-                source = cast(dict[str, JSONValue], prepared.record["source"])
-                source["object"] = object_relative
-                try:
-                    ready = self._publish_replace(document_id, prepared.record, prepared.rows)
-                except Exception:
-                    if self._state == "ready":
-                        with contextlib.suppress(OSError):
-                            object_path.unlink()
-                    raise
-                if old_object is not None:
-                    with contextlib.suppress(OSError):
-                        old_object.unlink()
-                outcome: Literal["added", "updated"] = "added" if previous is None else "updated"
-                return MutationReport(document_id, outcome, ready)
-            finally:
-                self._remove_staging(staged.directory)
+            with self._condition:
+                names: dict[str, NamespaceKind] = {
+                    n: cast(NamespaceKind, r["kind"]) for n, r in self._namespaces.items()
+                }
+            expressions = compile_filters(filters, names, search=True).expressions
+            vector = self._embed_query(text) if mode in ("vector", "hybrid") else None
+            if consistency == "strong":
+                self._wait_ready(timeout)
+            candidate_limit = min(1000, max(100, limit * 10))
+            channels: list[list[SearchHit]] = []
+            while True:
+                channels = []
+                more = False
+                if mode in ("bm25", "hybrid"):
+                    hits, extra = self._index.search(
+                        text, mode="bm25", expressions=expressions, limit=candidate_limit
+                    )
+                    channels.append(hits)
+                    more |= extra
+                if vector is not None:
+                    hits, extra = self._index.search(
+                        vector, mode="vector", expressions=expressions, limit=candidate_limit
+                    )
+                    channels.append(hits)
+                    more |= extra
+                ranked = _rrf(channels) if mode == "hybrid" else channels[0]
+                if (
+                    select == "chunk"
+                    or len({(h["namespace"], h["doc_id"]) for h in ranked}) >= limit
+                    or not more
+                    or candidate_limit == 1000
+                ):
+                    break
+                candidate_limit = min(1000, candidate_limit * 2)
+            items: list[SearchItem[Any]] = []
+            seen: set[DocumentId] = set()
+            for hit in ranked:
+                identity = DocumentId(hit["namespace"], hit["doc_id"])
+                if select == "doc_id":
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    value: Any = identity
+                else:
+                    location = hit["source_location"]
+                    value = Chunk(
+                        identity,
+                        hit["snapshot_id"],
+                        hit["ordinal"],
+                        hit["text"],
+                        hit["text_start"],
+                        hit["text_end"],
+                        SourceLocation(1, tuple(copy_json(v) for v in location["sources"])),
+                    )
+                items.append(SearchItem(value, hit["score"], ()))
+            return SearchResult(tuple(items[:limit]), more or len(items) > limit)
 
-    def remove(self, namespace: str, doc_id: str) -> MutationReport:
+    def sync(
+        self, namespace: str, path: str = ".", *, verify: Literal["stat", "content"] = "stat"
+    ) -> SyncReport:
         with self._call(), self._mutation_lock:
-            validate_namespace(namespace)
-            validate_internal_id(doc_id)
-            info = self._required_namespace(namespace)
-            if info.kind != "internal":
-                raise WrongNamespaceKind("remove is only valid for internal namespaces")
-            self._ready()
-            document_id = DocumentId(namespace, doc_id)
-            previous = self._catalog.get_document(namespace, doc_id)
-            if previous is None:
-                return MutationReport(document_id, "not_found", True)
-            old_object = self._object_path(previous)
-            ready = self._publish_delete(document_id)
-            if old_object is not None:
-                with contextlib.suppress(OSError):
-                    old_object.unlink()
-            return MutationReport(document_id, "removed", ready)
+            return self._sync(namespace, path, verify=verify)
 
-    def _required_namespace(self, namespace: str) -> NamespaceInfo:
-        record = self._catalog.get_namespace(namespace)
-        if record is None:
-            raise NamespaceNotFound(f"namespace {namespace!r} does not exist")
-        return self._namespace_info(namespace, record)
+    def _sync(self, namespace: str, path: str, *, verify: str, force: bool = False) -> SyncReport:
+        from ._sync import sync_namespace
+
+        return sync_namespace(self, namespace, path, verify=verify, force=force)
+
+    def _excluded(self, relative: str) -> bool:
+        parts = relative.split("/")
+        return any(
+            _glob_match(pattern.rstrip("/"), "/".join(parts[:end]))
+            for end in range(1, len(parts) + 1)
+            for pattern in self._sync_policy.exclude_globs
+        )
+
+    def _stage_descriptor(self, descriptor: int) -> _Staged:
+        directory = self._new_staging()
+        output = directory / "input"
+        try:
+            for _ in range(2):
+                before = os.fstat(descriptor)
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                digest = blake3.blake3()
+                with output.open("wb") as stream:
+                    while block := os.read(descriptor, 1024 * 1024):
+                        stream.write(block)
+                        digest.update(block)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                after = os.fstat(descriptor)
+                if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) == (
+                    after.st_size,
+                    after.st_mtime_ns,
+                    after.st_ctime_ns,
+                ):
+                    return _Staged(
+                        directory, output, digest.hexdigest(), after.st_size, after.st_mtime_ns
+                    )
+            raise SourceChanged("file changed during stable read")
+        except Exception:
+            self._remove_staging(directory)
+            raise
 
     def _stage_bytes(self, data: bytes) -> _Staged:
         directory = self._new_staging()
@@ -706,77 +1571,6 @@ class MFS:
         with contextlib.suppress(OSError):
             shutil.rmtree(directory)
 
-    def _prepare(
-        self,
-        document_id: DocumentId,
-        staged: _Staged,
-        previous: dict[str, Any] | None,
-        *,
-        explicit_media_type: str | None,
-        fallback_path: Path | None,
-        external: bool,
-    ) -> _Prepared | None:
-        media_type, processor = self._select_processor(
-            document_id.doc_id, staged.path, explicit_media_type, fallback_path
-        )
-        description = self._processor_descriptions[id(processor)]
-        if (
-            previous is not None
-            and previous.get("content_hash") == staged.content_hash
-            and previous.get("media_type") == media_type
-            and previous.get("processor") == description
-        ):
-            return None
-        try:
-            processed = validate_processed(processor.process(staged.path, media_type))
-            ranges = validate_chunk_ranges(
-                processed.text, self._chunker.chunk(processed.text, processed.source_map)
-            )
-        except MFSError:
-            raise
-        except Exception as error:
-            raise ProcessingFailed(
-                f"processing failed for {document_id.namespace}/{document_id.doc_id}: {error}",
-                document_id=document_id,
-            ) from error
-        encoded = processed.text.encode("utf-8")
-        chunk_texts = [encoded[item.text_start : item.text_end].decode("utf-8") for item in ranges]
-        vectors = self._embed_documents(chunk_texts) if self._dense_config() is not None else None
-        snapshot_input = {
-            "content_hash": staged.content_hash,
-            "media_type": media_type,
-            "processor": description,
-        }
-        snapshot_id = blake3.blake3(canonical_json(snapshot_input)).hexdigest()
-        record: dict[str, JSONValue] = {
-            "version": 1,
-            "media_type": media_type,
-            "content_hash": staged.content_hash,
-            "snapshot_id": snapshot_id,
-            "processor": description,
-            "text": processed.text,
-            "source_map": self._source_map_json(processed.source_map),
-            "source": {
-                "size": staged.size,
-                "mtime_ns": staged.mtime_ns if external else None,
-                "object": None,
-            },
-        }
-        rows: list[IndexRow] = []
-        for index, chunk_range in enumerate(ranges):
-            rows.append(
-                IndexRow(
-                    namespace=document_id.namespace,
-                    doc_id=document_id.doc_id,
-                    ordinal=index,
-                    text=chunk_texts[index],
-                    text_start=chunk_range.text_start,
-                    text_end=chunk_range.text_end,
-                    dense_vector=vectors[index] if vectors is not None else [],
-                )
-            )
-        return _Prepared(record, rows, staged)
-
     def _select_processor(
         self,
         doc_id: str,
@@ -806,7 +1600,8 @@ class MFS:
         if suffix_match is not None:
             return suffix_match
         try:
-            head = staged_path.read_bytes()[: 64 * 1024]
+            with staged_path.open("rb") as stream:
+                head = stream.read(64 * 1024)
             sniffed: list[tuple[str, Processor]] = []
             for processor in self._processors:
                 media_type = processor.sniff(head)
@@ -841,8 +1636,7 @@ class MFS:
         for start in range(0, len(texts), 128):
             batch = texts[start : start + 128]
             try:
-                with self._embedder_lock:
-                    vectors = embedder.embed_documents(batch)
+                vectors = embedder.embed_documents(batch)
                 dimension = self._embedder_dimension
                 if dimension is None:
                     raise CapabilityUnavailable("active operation requires an Embedder")
@@ -856,8 +1650,7 @@ class MFS:
     def _embed_query(self, text: str) -> list[float]:
         embedder = self._matching_embedder()
         try:
-            with self._embedder_lock:
-                vector = embedder.embed_query(text)
+            vector = embedder.embed_query(text)
             dimension = self._embedder_dimension
             if dimension is None:
                 raise CapabilityUnavailable("active operation requires an Embedder")
@@ -896,31 +1689,6 @@ class MFS:
             result.append(converted)
         return result
 
-    def _publish_replace(
-        self, document_id: DocumentId, record: dict[str, JSONValue], rows: Sequence[IndexRow]
-    ) -> bool:
-        with self._rwlock.write():
-            self._make_marker()
-            try:
-                self._index.replace(document_id, rows)
-                self._catalog.put_document(document_id.namespace, document_id.doc_id, record)
-            except Exception:
-                self._state = "dirty"
-                raise
-            return self._cleanup_marker_after_commit()
-
-    def _publish_delete(self, document_id: DocumentId) -> bool:
-        with self._rwlock.write():
-            self._make_marker()
-            try:
-                self._index.delete_document(document_id)
-                self._index.flush()
-                self._catalog.delete_document(document_id.namespace, document_id.doc_id)
-            except Exception:
-                self._state = "dirty"
-                raise
-            return self._cleanup_marker_after_commit()
-
     def _object_path(self, record: dict[str, Any] | None) -> Path | None:
         if record is None:
             return None
@@ -929,7 +1697,10 @@ class MFS:
             if value is None:
                 return None
             candidate = self._path / str(value)
-            if candidate.parent.resolve() != (self._path / "objects").resolve():
+            if (
+                candidate.parent.resolve() != (self._path / "objects").resolve()
+                or candidate.is_symlink()
+            ):
                 raise ValueError("object path escapes objects")
             return candidate
         except Exception as error:
@@ -993,608 +1764,6 @@ class MFS:
                     sources.append(copy_json(span.source))
                     seen.add(encoded)
         return SourceLocation(1, tuple(sources))
-
-    def _chunk(self, row: dict[str, object] | SearchHit, record: dict[str, Any]) -> Chunk:
-        document_id = DocumentId(str(row["namespace"]), str(row["doc_id"]))
-        start = _as_int(row["text_start"], "chunk text_start")
-        end = _as_int(row["text_end"], "chunk text_end")
-        return Chunk(
-            document_id=document_id,
-            snapshot_id=str(record["snapshot_id"]),
-            ordinal=_as_int(row["ordinal"], "chunk ordinal"),
-            text=str(row["text"]),
-            text_start=start,
-            text_end=end,
-            source_location=self._source_location(self._source_map(record), start, end),
-        )
-
-    def query(
-        self,
-        filters: Sequence[Filter] = (),
-        select: Select = "doc_id",
-        limit: int | None = None,
-    ) -> QueryResult[Any]:
-        with self._call(), self._rwlock.read():
-            self._validate_query_options(select, limit, search=False)
-            documents = self._filter_documents(filters)
-            items: list[QueryItem[Any]] = []
-            if select == "doc_id":
-                items = [QueryItem(item.id, item.matches) for item in documents]
-            elif select == "doc":
-                items = [
-                    QueryItem(self._document(item.id, item.record), item.matches)
-                    for item in documents
-                ]
-            else:
-                self._ready()
-                wanted = {item.id: item for item in documents}
-                for row in self._sorted_rows(self._index.scan()):
-                    document_id = DocumentId(str(row["namespace"]), str(row["doc_id"]))
-                    filtered = wanted.get(document_id)
-                    if filtered is None:
-                        continue
-                    chunk_matches = tuple(
-                        match
-                        for match in filtered.matches
-                        if match.text_start < _as_int(row["text_end"], "chunk text_end")
-                        and _as_int(row["text_start"], "chunk text_start") < match.text_end
-                    )
-                    if filtered.matches and not chunk_matches:
-                        continue
-                    items.append(QueryItem(self._chunk(row, filtered.record), chunk_matches))
-            truncated = limit is not None and len(items) > limit
-            if limit is not None:
-                items = items[:limit]
-            return QueryResult(tuple(items), truncated)
-
-    @staticmethod
-    def _validate_query_options(select: str, limit: int | None, *, search: bool) -> None:
-        if select not in ("doc_id", "chunk", "doc"):
-            raise InvalidQuery(f"invalid select: {select!r}")
-        if search:
-            if limit is None or not 1 <= limit <= 1000:
-                raise InvalidQuery("search limit must be between 1 and 1000")
-        elif limit is not None and not 1 <= limit <= 100000:
-            raise InvalidQuery("query limit must be None or between 1 and 100000")
-
-    @staticmethod
-    def _sorted_rows(rows: Sequence[dict[str, object]]) -> list[dict[str, object]]:
-        return sorted(
-            rows,
-            key=lambda row: (
-                str(row["namespace"]).encode(),
-                str(row["doc_id"]).encode(),
-                _as_int(row["ordinal"], "chunk ordinal"),
-            ),
-        )
-
-    def _filter_documents(self, filters: Sequence[Filter]) -> list[_FilteredDocument]:
-        records = {
-            DocumentId(namespace, doc_id): record
-            for namespace, doc_id, record in self._catalog.list_documents()
-        }
-        candidates = set(records)
-        text_filters: list[TextMatch] = []
-        for item in filters:
-            if isinstance(item, ByNamespace):
-                if not item.namespaces:
-                    raise InvalidFilter("ByNamespace values must not be empty")
-                names = set(item.namespaces)
-                for namespace in names:
-                    validate_namespace(namespace)
-                    self._required_namespace(namespace)
-                candidates &= {
-                    document_id for document_id in candidates if document_id.namespace in names
-                }
-            elif isinstance(item, ByDocumentId):
-                if not item.ids:
-                    raise InvalidFilter("ByDocumentId values must not be empty")
-                ids = set(item.ids)
-                for document_id in ids:
-                    info = self._required_namespace(document_id.namespace)
-                    if info.kind == "internal":
-                        validate_internal_id(document_id.doc_id)
-                    else:
-                        validate_external_path(document_id.doc_id, allow_root=False)
-                candidates &= ids
-            elif isinstance(item, UnderPath):
-                info = self._required_namespace(item.namespace)
-                if info.kind != "external":
-                    raise InvalidFilter("UnderPath requires an external namespace")
-                path = validate_external_path(item.path, allow_root=True)
-                candidates &= {
-                    document_id
-                    for document_id in candidates
-                    if document_id.namespace == item.namespace
-                    and (
-                        path == "."
-                        or document_id.doc_id == path
-                        or document_id.doc_id.startswith(path + "/")
-                    )
-                }
-            elif isinstance(item, TextMatch):
-                text_filters.append(item)
-            else:
-                raise InvalidFilter(f"unsupported Filter type: {type(item).__name__}")
-        result: list[_FilteredDocument] = []
-        for document_id in sorted(candidates, key=_sort_id):
-            record = records[document_id]
-            matches: list[tuple[int, int]] = []
-            accepted = True
-            for text_filter in text_filters:
-                current = self._text_matches(str(record["text"]), text_filter)
-                if not current:
-                    accepted = False
-                    break
-                matches.extend(current)
-            if not accepted:
-                continue
-            merged = _merge_ranges(matches)
-            source_map = self._source_map(record)
-            result.append(
-                _FilteredDocument(
-                    document_id,
-                    record,
-                    tuple(
-                        Match(start, end, self._source_location(source_map, start, end))
-                        for start, end in merged
-                    ),
-                )
-            )
-        return result
-
-    @staticmethod
-    def _text_matches(text: str, text_filter: TextMatch) -> list[tuple[int, int]]:
-        value = _runtime(text_filter.pattern)
-        if not isinstance(value, str) or not value or len(value.encode("utf-8")) > 16 * 1024:
-            raise InvalidFilter("TextMatch pattern must be 1..16384 UTF-8 bytes")
-        pattern = value
-        try:
-            character_ranges = regex_ranges(
-                text,
-                pattern,
-                regex=text_filter.regex,
-                case_sensitive=text_filter.case_sensitive,
-            )
-        except Exception as error:
-            raise InvalidPattern(f"invalid RE2 pattern: {error}") from error
-        offsets = [0]
-        for character in text:
-            offsets.append(offsets[-1] + len(character.encode("utf-8")))
-        return [(offsets[start], offsets[end]) for start, end in character_ranges]
-
-    def search(
-        self,
-        text: str,
-        filters: Sequence[Filter] = (),
-        mode: SearchMode = "hybrid",
-        select: Select = "chunk",
-        limit: int = 10,
-    ) -> SearchResult[Any]:
-        with self._call(), self._rwlock.read():
-            text_value = _runtime(text)
-            if (
-                not isinstance(text_value, str)
-                or not text_value
-                or len(text_value.encode("utf-8")) > 64 * 1024
-            ):
-                raise InvalidQuery("search text must be 1..65536 UTF-8 bytes")
-            text = text_value
-            if mode not in ("bm25", "vector", "hybrid"):
-                raise InvalidQuery(f"invalid search mode: {mode!r}")
-            self._validate_query_options(select, limit, search=True)
-            self._ready()
-            documents = self._filter_documents(filters)
-            by_id = {item.id: item for item in documents}
-            restricted = [item.id for item in documents] if filters else None
-            candidate_limit = (
-                1000 if select in ("doc_id", "doc") else min(1000, max(100, limit * 10))
-            )
-            channels: list[list[SearchHit]] = []
-            backend_truncated = False
-            if mode in ("bm25", "hybrid"):
-                hits, more = self._index.search(
-                    text, mode="bm25", documents=restricted, limit=candidate_limit
-                )
-                channels.append(hits)
-                backend_truncated |= more
-            if mode in ("vector", "hybrid"):
-                vector = self._embed_query(text)
-                hits, more = self._index.search(
-                    vector, mode="vector", documents=restricted, limit=candidate_limit
-                )
-                channels.append(hits)
-                backend_truncated |= more
-            ranked = _rrf(channels) if mode == "hybrid" else channels[0]
-            ranked = [hit for hit in ranked if DocumentId(hit["namespace"], hit["doc_id"]) in by_id]
-            items: list[SearchItem[Any]] = []
-            if select == "chunk":
-                for hit in ranked:
-                    document_id = DocumentId(hit["namespace"], hit["doc_id"])
-                    filtered = by_id[document_id]
-                    items.append(
-                        SearchItem(
-                            self._chunk(hit, filtered.record), hit["score"], filtered.matches
-                        )
-                    )
-            else:
-                seen: set[DocumentId] = set()
-                for hit in ranked:
-                    document_id = DocumentId(hit["namespace"], hit["doc_id"])
-                    if document_id in seen:
-                        continue
-                    seen.add(document_id)
-                    filtered = by_id[document_id]
-                    value: Any = (
-                        document_id
-                        if select == "doc_id"
-                        else self._document(document_id, filtered.record)
-                    )
-                    items.append(SearchItem(value, hit["score"], filtered.matches))
-            truncated = backend_truncated or len(items) > limit
-            return SearchResult(tuple(items[:limit]), truncated)
-
-    def reindex(self) -> ReindexReport:
-        with self._call(), self._mutation_lock, self._rwlock.write():
-            current_dense = self._dense_config()
-            if self._embedder_space is not None and self._embedder_dimension is not None:
-                target_dense = dense_config(self._embedder_space, self._embedder_dimension)
-            else:
-                target_dense = current_dense
-            if not (self._path / "INDEX_DIRTY").exists():
-                self._make_marker()
-            try:
-                if target_dense is not None:
-                    if self._embedder is None:
-                        raise CapabilityUnavailable(
-                            "reindexing a dense index requires its Embedder"
-                        )
-                    if (
-                        target_dense.get("embedding_space") != self._embedder_space
-                        or target_dense.get("dimension") != self._embedder_dimension
-                    ):
-                        raise CapabilityUnavailable(
-                            "provided Embedder does not match the target index"
-                        )
-                documents = self._catalog.list_documents()
-                rows: list[IndexRow] = []
-                chunk_texts: list[str] = []
-                row_metadata: list[tuple[DocumentId, int, int, int, str]] = []
-                for namespace, doc_id, record in documents:
-                    text = str(record["text"])
-                    source_map = self._source_map(record)
-                    try:
-                        ranges = validate_chunk_ranges(text, self._chunker.chunk(text, source_map))
-                    except MFSError:
-                        raise
-                    except Exception as error:
-                        raise ProcessingFailed(f"Chunker failed during reindex: {error}") from error
-                    encoded = text.encode("utf-8")
-                    for ordinal, chunk_range in enumerate(ranges):
-                        chunk_text = encoded[chunk_range.text_start : chunk_range.text_end].decode(
-                            "utf-8"
-                        )
-                        chunk_texts.append(chunk_text)
-                        row_metadata.append(
-                            (
-                                DocumentId(namespace, doc_id),
-                                ordinal,
-                                chunk_range.text_start,
-                                chunk_range.text_end,
-                                chunk_text,
-                            )
-                        )
-                vectors = (
-                    self._embed_documents(chunk_texts, target=self._embedder)
-                    if target_dense is not None
-                    else None
-                )
-                for index, (document_id, ordinal, start, end, chunk_text) in enumerate(
-                    row_metadata
-                ):
-                    rows.append(
-                        IndexRow(
-                            namespace=document_id.namespace,
-                            doc_id=document_id.doc_id,
-                            ordinal=ordinal,
-                            text=chunk_text,
-                            text_start=start,
-                            text_end=end,
-                            dense_vector=vectors[index] if vectors is not None else [],
-                        )
-                    )
-                dimension = (
-                    _as_int(target_dense["dimension"], "dense dimension")
-                    if target_dense is not None
-                    else None
-                )
-                self._index.recreate(dense_dimension=dimension)
-                self._index.insert(rows)
-                self._index.flush()
-                if len(self._index.scan()) != len(rows):
-                    raise IndexFailed("reindex row count validation failed")
-                config = index_config(
-                    cast(dict[str, object], self._chunker_description), target_dense
-                )
-                self._write_index_config(config)
-                self._config = config
-                self._clear_marker()
-                self._state = "ready"
-            except Exception:
-                self._state = "dirty"
-                raise
-            return ReindexReport(len(documents), len(rows), target_dense is not None)
-
-    def sync(self, namespace: str, path: str = ".") -> SyncReport:
-        with self._call(), self._mutation_lock:
-            validate_namespace(namespace)
-            requested = validate_external_path(path, allow_root=True)
-            info = self._required_namespace(namespace)
-            if info.kind != "external" or info.root is None:
-                raise WrongNamespaceKind("sync is only valid for external namespaces")
-            self._ready()
-            root = info.root
-            changed: list[DocumentId] = []
-            removed: list[DocumentId] = []
-            failed: dict[tuple[str, str], SyncFailure] = {}
-            skipped: dict[tuple[str, str], SyncSkipped] = {}
-            seen: set[str] = set()
-            nonmembers: set[str] = set()
-            complete = True
-            stop = False
-
-            def failure(relative: str, error: Exception) -> None:
-                if isinstance(error, MFSError):
-                    code, message = error.code, error.message
-                else:
-                    code, message = "SourceUnavailable", str(error)
-                failed[(relative, code)] = SyncFailure(relative, code, message)
-
-            def skip(relative: str, reason: str) -> None:
-                skipped[(relative, reason)] = SyncSkipped(relative, cast(Any, reason))
-
-            def process_file(
-                source: Path, relative: str, source_stat: os.stat_result, force: bool
-            ) -> None:
-                nonlocal complete, stop
-                seen.add(relative)
-                previous = self._catalog.get_document(namespace, relative)
-                if not force and self._stat_unchanged(relative, source_stat, previous):
-                    return
-                staged: _Staged | None = None
-                try:
-                    staged = self._stage_path(source)
-                    prepared = self._prepare(
-                        DocumentId(namespace, relative),
-                        staged,
-                        previous,
-                        explicit_media_type=None,
-                        fallback_path=None,
-                        external=True,
-                    )
-                    if prepared is None:
-                        return
-                    ready = self._publish_replace(
-                        DocumentId(namespace, relative), prepared.record, prepared.rows
-                    )
-                    changed.append(DocumentId(namespace, relative))
-                    if not ready:
-                        complete = False
-                        stop = True
-                except UnsupportedMediaType:
-                    skip(relative, "unsupported_media_type")
-                except (
-                    CapabilityUnavailable,
-                    EmbeddingFailed,
-                    ProcessingFailed,
-                    SourceChanged,
-                    SourceUnavailable,
-                ) as error:
-                    failure(relative, error)
-                except (IndexFailed, IndexUnavailable, StorageFailed) as error:
-                    failure(relative, error)
-                    if self._state != "ready":
-                        complete = False
-                        stop = True
-                finally:
-                    if staged is not None:
-                        self._remove_staging(staged.directory)
-
-            def walk(directory: Path, relative_dir: str) -> None:
-                nonlocal complete
-                try:
-                    with os.scandir(directory) as iterator:
-                        entries = sorted(iterator, key=lambda item: item.name.encode())
-                except OSError as error:
-                    complete = False
-                    failure(
-                        relative_dir or ".", SourceUnavailable(str(error), path=relative_dir or ".")
-                    )
-                    return
-                for entry in entries:
-                    if stop:
-                        return
-                    relative = f"{relative_dir}/{entry.name}" if relative_dir else entry.name
-                    try:
-                        entry_stat = entry.stat(follow_symlinks=False)
-                    except OSError as error:
-                        complete = False
-                        failure(relative, SourceUnavailable(str(error), path=relative))
-                        continue
-                    if self._excluded(relative):
-                        nonmembers.add(relative)
-                        skip(relative, "excluded")
-                    elif stat.S_ISLNK(entry_stat.st_mode):
-                        nonmembers.add(relative)
-                        skip(relative, "symlink")
-                    elif stat.S_ISDIR(entry_stat.st_mode):
-                        walk(Path(entry.path), relative)
-                    elif stat.S_ISREG(entry_stat.st_mode):
-                        maximum = self._sync_policy.max_file_bytes
-                        if maximum is not None and entry_stat.st_size > maximum:
-                            nonmembers.add(relative)
-                            skip(relative, "too_large")
-                        else:
-                            process_file(Path(entry.path), relative, entry_stat, False)
-                    else:
-                        nonmembers.add(relative)
-                        skip(relative, "special_file")
-
-            try:
-                target, actual_relative = self._observe_target(root, requested)
-                if target is None:
-                    # A missing target under an observable parent is a complete observation.
-                    pass
-                else:
-                    target_stat = target.lstat()
-                    report_path = actual_relative if requested != "." else "."
-                    if requested != "." and self._excluded(actual_relative):
-                        nonmembers.add(actual_relative)
-                        skip(actual_relative, "excluded")
-                    elif stat.S_ISLNK(target_stat.st_mode):
-                        nonmembers.add(actual_relative)
-                        skip(actual_relative, "symlink")
-                    elif stat.S_ISREG(target_stat.st_mode):
-                        maximum = self._sync_policy.max_file_bytes
-                        if maximum is not None and target_stat.st_size > maximum:
-                            nonmembers.add(actual_relative)
-                            skip(actual_relative, "too_large")
-                        else:
-                            process_file(target, actual_relative, target_stat, True)
-                    elif stat.S_ISDIR(target_stat.st_mode):
-                        walk(target, "" if requested == "." else actual_relative)
-                    else:
-                        nonmembers.add(actual_relative)
-                        skip(actual_relative, "special_file")
-                    del report_path
-            except (InvalidPath, SourceUnavailable) as error:
-                complete = False
-                failure(requested, error)
-
-            if not stop:
-                existing = [
-                    doc_id for doc_id, _ in self._catalog.list_namespace_documents(namespace)
-                ]
-                deletions: list[str] = []
-                for doc_id in existing:
-                    in_requested = (
-                        requested == "."
-                        or doc_id == requested
-                        or doc_id.startswith(requested + "/")
-                    )
-                    explicit_nonmember = any(
-                        doc_id == prefix or doc_id.startswith(prefix + "/") for prefix in nonmembers
-                    )
-                    if explicit_nonmember or (complete and in_requested and doc_id not in seen):
-                        deletions.append(doc_id)
-                for doc_id in sorted(set(deletions), key=str.encode):
-                    try:
-                        ready = self._publish_delete(DocumentId(namespace, doc_id))
-                        removed.append(DocumentId(namespace, doc_id))
-                        if not ready:
-                            complete = False
-                            stop = True
-                            break
-                    except (IndexFailed, IndexUnavailable, StorageFailed) as error:
-                        failure(doc_id, error)
-                        complete = False
-                        stop = True
-                        break
-
-            return SyncReport(
-                namespace=namespace,
-                path=requested,
-                complete=complete and not stop,
-                changed=tuple(sorted(set(changed), key=_sort_id)),
-                removed=tuple(sorted(set(removed), key=_sort_id)),
-                failed=tuple(
-                    sorted(
-                        failed.values(), key=lambda item: (item.path.encode(), item.code.encode())
-                    )
-                ),
-                skipped=tuple(
-                    sorted(
-                        skipped.values(),
-                        key=lambda item: (item.path.encode(), item.reason.encode()),
-                    )
-                ),
-                index_ready=self._state == "ready",
-            )
-
-    def _stat_unchanged(
-        self, relative: str, source_stat: os.stat_result, previous: dict[str, Any] | None
-    ) -> bool:
-        if previous is None:
-            return False
-        suffix = suffix_for(relative)
-        match: tuple[str, Processor] | None = None
-        for processor in self._processors:
-            media_type = self._processor_suffixes[id(processor)].get(suffix)
-            if media_type is not None:
-                match = (media_type, processor)
-                break
-        if match is None:
-            return False
-        media_type, processor = match
-        source = previous.get("source", {})
-        return (
-            source.get("size") == source_stat.st_size
-            and source.get("mtime_ns") == source_stat.st_mtime_ns
-            and previous.get("media_type") == media_type
-            and previous.get("processor") == self._processor_descriptions[id(processor)]
-        )
-
-    def _observe_target(self, root: Path, requested: str) -> tuple[Path | None, str]:
-        if requested == ".":
-            try:
-                root_stat = root.stat()
-            except OSError as error:
-                raise SourceUnavailable(
-                    f"external root is unavailable: {error}", path="."
-                ) from error
-            if not stat.S_ISDIR(root_stat.st_mode) or not os.access(root, os.R_OK):
-                raise SourceUnavailable("external root is not a readable directory", path=".")
-            return root, "."
-        current = root
-        actual: list[str] = []
-        parts = requested.split("/")
-        for index, part in enumerate(parts):
-            try:
-                entries = list(os.scandir(current))
-            except OSError as error:
-                raise SourceUnavailable(
-                    f"cannot observe parent: {error}", path="/".join(actual) or "."
-                ) from error
-            entry = next((candidate for candidate in entries if candidate.name == part), None)
-            if entry is None:
-                requested_candidate = current / part
-                for candidate in entries:
-                    if candidate.name.casefold() != part.casefold():
-                        continue
-                    try:
-                        if os.path.samefile(candidate.path, requested_candidate):
-                            entry = candidate
-                            break
-                    except OSError:
-                        continue
-            if entry is None:
-                return None, requested
-            actual.append(entry.name)
-            candidate_path = Path(entry.path)
-            if index < len(parts) - 1:
-                try:
-                    candidate_stat = entry.stat(follow_symlinks=False)
-                except OSError as error:
-                    raise SourceUnavailable(str(error), path="/".join(actual)) from error
-                if stat.S_ISLNK(candidate_stat.st_mode):
-                    raise InvalidPath("sync path traverses a symlink", path="/".join(actual))
-                if not stat.S_ISDIR(candidate_stat.st_mode):
-                    return None, requested
-            current = candidate_path
-        return current, "/".join(actual)
-
-    def _excluded(self, relative: str) -> bool:
-        return any(_glob_match(pattern, relative) for pattern in self._sync_policy.exclude_globs)
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:

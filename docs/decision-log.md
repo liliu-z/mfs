@@ -2,6 +2,10 @@
 
 > 本文只记录当前仍有效的事实、决策理由、代价和重新评估条件。实现语义以 [design.md](design.md) 为准。
 
+> 2026-09-09：异步处理/索引、SQLite 任务恢复、过滤下推和 strong/eventual 已实现。
+> 当前规范见 [design.md](design.md)，线程与状态设计见 [indexing-lifecycle.md](indexing-lifecycle.md)。
+> D-003/D-004/D-007 中两表限制、同步 mutation、无后台任务等历史约束由 D-009 替代。
+
 ## 1. 已核实事实
 
 ### F-001：StashBase 使用一个全局索引实例
@@ -130,11 +134,11 @@ Core vertical slice 只需要 UTF-8 TXT/Markdown 与 PDF，即可覆盖原文处
 
 重新评估：出现第二个可工作的 catalog、vector backend 或 source implementation，并且替换不改变领域语义时再增加 seam。
 
-### D-007：Python 3.12 greenfield Core
+### D-007：Python 3.13 greenfield Core
 
 状态：Accepted。
 
-决定：从空实现搭建同步 Python 3.12 Core Library，使用 `src/mfs`、uv lock、Hatchling、pytest、Ruff 和 Pyright；V1 支持 macOS/Linux，不做 CLI、RPC/sidecar、TypeScript client、StashBase 集成、Windows 或上游兼容。允许从 `zilliztech/mfs` v0.1.0 移植局部代码并保留适用 attribution。
+决定：从空实现搭建同步 Python 3.13 Core Library，使用 `src/mfs`、uv lock、Hatchling、pytest、Ruff 和 Pyright；V1 支持 macOS/Linux，不做 CLI、RPC/sidecar、TypeScript client、StashBase 集成、Windows 或上游兼容。允许从 `zilliztech/mfs` v0.1.0 移植局部代码并保留适用 attribution。
 
 理由：当前目标是先把领域 Interface、数据 authority 和恢复语义做正确；复用成熟叶子实现可以节省工作，但继承上游整体架构会把 CLI、queue 和 Milvus metadata 模型带回 Core。
 
@@ -166,7 +170,21 @@ Core vertical slice 只需要 UTF-8 TXT/Markdown 与 PDF，即可覆盖原文处
 
 领域实现可以开始。进入 Milvus implementation 前必须：
 
-1. 用 Python 3.12 选择 exact `pymilvus`/`milvus-lite` 组合，执行 design §15 的 BM25+dense、filter escaping、multi-segment 全量枚举、delete/flush/reopen 与 empty-index conformance tests。
+1. 用 Python 3.13 选择 exact `pymilvus`/`milvus-lite` 组合，执行 design §15 的 BM25+dense、filter escaping、multi-segment 全量枚举、delete/flush/reopen 与 empty-index conformance tests。
 2. 在 `pyproject.toml` 与 `uv.lock` exact lock PDF、regex、RFC 8785、BLAKE3、Milvus 和 file-lock 依赖，并验证 macOS/Linux 安装。
 3. 建立 marker/Milvus/SQLite/fsync failure injection，以及 macOS/Linux 的 lock、file identity、path case 测试矩阵。
 4. 首次发布前保存 benchmark 环境与结果；它是后续支持范围的依据，不是当前编码前置条件。
+
+### D-009：持久目标与联合索引发布
+
+决定：SQLite 保留目标、文本与任务状态；固定一个 PROCESS worker 和一个索引 worker。
+BM25/dense 一个 collection，完整准备后一起写入，失败从原阶段重试。grep 读取已提交文本。
+实例 ready 覆盖所有未完成目标，strong 等待准入，eventual 直接搜索，无搜索读写锁或双路快照保证。
+所有结构化 ranked filter 下推至 Milvus，结果自带文本与定位；全文另行 query。
+
+代价：接收 ACK 不再等于可检索；文档生成失败需要显式状态呈现。联合发布期间的多批写入不是原子事务。
+Python 线程不安全强杀，应用回调需要控制其外部调用时长。Embedder 查询与文档调用必须支持并发。
+当前无引用产物在重启时回收，在线 GC 与任务优先级保留为后续优化。
+
+依据：真实 Milvus 的并发读写、故障注入、进程终止恢复和过滤下推回归测试。
+V1 catalog 自动升级；StashBase 应用迁移和真实 corpus 评估尚未实施，见 [对接说明](stashbase-integration.md)。
