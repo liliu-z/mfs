@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from mfs import MFS, DocumentId, StorageFailed, Utf8TextProcessor, WaitTimeout
+from mfs import MFS, DocumentId, GCPolicy, StorageFailed, Utf8TextProcessor, WaitTimeout
 from mfs._index import IndexRow
 
 
@@ -64,11 +64,17 @@ raise AssertionError("crash boundary was not reached")
     processors = (
         [] if boundary in ("after_process_artifact", "after_publish") else [Utf8TextProcessor()]
     )
-    mfs = MFS.open(state, processors=processors)
+    mfs = MFS.open(
+        state,
+        processors=processors,
+        gc_policy=GCPolicy(enabled=False, idle_seconds=0, grace_seconds=0),
+    )
     try:
         mfs.wait_ready(10)
         if boundary == "before_accept_commit":
             assert not mfs.query().items
+            for _ in range(3):
+                assert mfs.collect_garbage().error is None
             assert not list((state / "objects").iterdir())
         else:
             assert mfs.query(select="doc").items[0].value.text == "durable needle"
@@ -180,7 +186,7 @@ def test_pending_delete_keeps_ready_false_and_eventual_old_hit(
     entered, release = threading.Event(), threading.Event()
     try:
         mfs.create_namespace("n", "internal")
-        mfs.upsert("n", "a.txt", b"old content")
+        inserted = mfs.upsert("n", "a.txt", b"old content")
         mfs.wait_ready(10)
         original = mfs._index.delete_document
 
@@ -190,14 +196,20 @@ def test_pending_delete_keeps_ready_false_and_eventual_old_hit(
             original(identity, incarnation=incarnation)
 
         monkeypatch.setattr(mfs._index, "delete_document", delayed)
-        mfs.remove("n", "a.txt")
+        removed = mfs.remove("n", "a.txt")
         assert entered.wait(5)
+        status = mfs.document_status(inserted.id)
+        assert (
+            status and status.text_revision is None and status.indexed_revision == inserted.revision
+        )
         assert not mfs.query().items
         assert mfs.search("old", mode="bm25", consistency="eventual").items
         with pytest.raises(WaitTimeout):
             mfs.wait_ready(0)
         release.set()
-        mfs.wait_ready(10)
+        mfs.wait(removed, 10)
+        status = mfs.document_status(inserted.id)
+        assert status and status.indexed_revision is None
         assert not mfs.search("old", mode="bm25").items
     finally:
         release.set()

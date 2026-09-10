@@ -2,6 +2,7 @@
 
 2026-09-09。本文与 [生命周期设计](indexing-lifecycle.md) 描述当前实现；
 原同步接口存档于 [V1 历史规范](design-v1.md)。运行环境为 Python 3.13、macOS/Linux。
+Preparation、操作等待、内容复用和低频 GC 已实现，见 [生命周期补齐](lifecycle-extensions.md)。
 
 ## 1. 身份与存储
 
@@ -29,7 +30,7 @@ SourceMap/SourceLocation 的范围使用处理文本的 UTF-8 byte offset，不�
 这时返回的 `revision` 已接收，`index_ready=False` 不代表写入失败。
 
 后台执行顺序是 PROCESS → SQLite 提交文本 → CHUNK → EMBED → PUBLISH。
-一个准备线程执行 PROCESS，一个索引线程执行 CHUNK/EMBED 与全部 Milvus 写操作。
+PreparationPolicy 默认 2 个 light、1 个 heavy worker 执行 PROCESS；一个索引线程执行 CHUNK/EMBED 与全部 Milvus 写操作。
 回调仍是同步 Python 函数，不需要 async/await。dense 卡住不阻止准备线程提交其他文档文本。
 
 - grep / query 读取已经提交的文本。OCR 尚未完成时无法查询新文本。
@@ -50,6 +51,7 @@ Milvus 大文档 upsert 和旧 rows 删除可分批，不承诺文档级原子�
 | search(consistency="strong") | 等实例 ready，再执行所选检索 |
 | search(consistency="eventual") | 直接检索现有 Milvus 索引 |
 | wait_ready(timeout) | 等待同一个实例级 ready |
+| wait(receipt, timeout) | 仅等待回执的持久目标及其清理完成 |
 
 BM25/vector/hybrid 共享一致性。任何未完成的处理、索引、删除、失败或取消任务都会使 ready 为 false。
 ready 由持久目标推导，不是独立的永久布尔标志；启动时先恢复 pending，再启动线程。
@@ -98,8 +100,10 @@ Namespace 清理任务在状态列表中用 `DocumentId(namespace, "")` 表示�
 其他错误停在 failed；缺 Processor/Embedder 停在 blocked。retry 只继续当前阶段，
 已保存 OCR 和成功 embedding 批次被复用；重新运行 Processor 用 reprocess。
 
-cancel 不强杀线程；executing 可以暂时仍为 true。取消不会假装已接收的数据已经完成，ready 仍为 false。
-close 等待实际执行退出，再释放 SQLite、Milvus 和实例锁；应用回调必须具有合适的超时。
+cancel 持久保存用户取消门，并通知 ProcessingContext；executing 可以暂时仍为 true。
+新 bytes 不解除取消，retry/reprocess 显式解除；取消不会假装数据已经完成，ready 仍为 false。
+close 通知 Context、清理受管理子进程并等待执行/产物句柄退出，再释放 SQLite、Milvus 和实例锁。
+任意 Python 回调不能强杀，Adapter 应检查取消并设置合适的网络超时。
 
 ## 5. 查询、下推与定位
 
@@ -154,11 +158,11 @@ changed 是已接收版本，后台错误看 DocumentStatus，index_ready 是返
 ## 7. 注入与恢复
 
 Processor 的 id/version/options 描述在 open 时冻结，PROCESS 返回完整 text 与 SourceMap。
-变更算法应更改版本/options。同一准备 worker 串行 PROCESS；sniff 可与 PROCESS 并发，必须轻量且线程安全。
+变更算法应更改版本/options。Processor 按其 workload/concurrency 声明调度；sniff 可与 PROCESS 并发，必须轻量且线程安全。
 Chunker 与 query 的 Chunk 投影串行调用；文档级 grep 不调用 Chunker。
 Embedder 的 embed_documents 与 embed_query 可以并发，适配器必须支持并发调用。
 
-SQLite v1 catalog 自动升级。缺失/旧 schema/中断的索引从 SQLite 处理快照恢复；不需要重新 OCR。
+SQLite v1/v2 catalog 自动升级至 v3（任务结果、文件引用、checkpoint 和缓存）。缺失/旧 schema/中断的索引从 SQLite 处理快照恢复；不需要重新 OCR。
 重新打开已有 collection 会显式 load。chunker/embedding 配置变化显示 mismatch，需显式 reindex。
 
 reindex 不重新执行 Processor；它重建 collection 并重做 Chunk/embedding，仍允许 grep。
@@ -167,5 +171,5 @@ reindex 不重新执行 Processor；它重建 collection 并重做 Chunk/embeddi
 未提交事务不 ACK；事务已提交但 ACK 丢失可重放回执。产物成功而完成状态未提交时按持久状态恢复，
 稳定主键避免索引重放增加重复 rows。任意外部回调不承诺 exactly-once。
 
-当前目标输入与产物保留用于恢复；无引用文件在 open 时回收。在线 GC、备份/历史版本、
+当前目标输入与产物保留用于恢复；无引用文件由低频维护或 collect_garbage 分批回收。备份/历史版本、
 多进程共享写入、应用侧 daemon/ACL 不在本次接口中。

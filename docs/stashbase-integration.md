@@ -1,7 +1,9 @@
 # StashBase 对接 MFS
 
-本次完成 MFS 侧能力；StashBase checkout 未修改，下面是应用接入的具体映射。
+StashBase checkout 未修改，下面描述现有 MFS 接口的应用映射。
 已有 daemon 使用的是另一套 MFS 接口，不能只升级依赖而继续调用原来的 `hybrid_search`。
+MFS 已补齐完整 Preparation 生命周期；修复验收见 [清单](backlog.md)，
+ProcessingContext、操作等待、内容复用和 GC 见 [生命周期补齐](lifecycle-extensions.md)。
 
 ## 实例与文件身份
 
@@ -29,8 +31,11 @@ MFS 当前 SyncPolicy 是实例级；应用若要按 Library 设置不同 ignore
 ```python
 class ApplicationProcessor:
     # id/version/options 和支持的媒体类型按既有适配器声明。
-    def process(self, staged_path, media_type):
-        text, locations = existing_conversion(staged_path, media_type)
+    workload = "heavy"
+    concurrency = 1
+
+    def process(self, staged_path, media_type, context):
+        text, locations = existing_conversion(staged_path, media_type, context)
         return ProcessedDocument(text=text, source_map=locations)
 ```
 
@@ -40,7 +45,9 @@ SourceMap 应保留页码、行号、时间范围等来源；结构化 source �
 
 Processor 只执行转换，不写另一套“完成/失败/已索引”状态。改变算法时修改版本或 options，
 用户强制重新生成调用 `reprocess(DocumentId(...))`。MFS 负责源 hash 去重，失败 embedding 不重做已成功 OCR。
-API 凭据、模型选择、外部进程与网络超时仍由适配器负责。
+API 凭据、模型选择、命令参数和网络超时仍由适配器负责；本地命令经 context.run_process 执行。
+转换器在 context.work_dir 生成文件，用 checkpoint 保存恢复边界，并通过 ProcessedDocument.artifacts
+发布 Markdown bundle、时间轴等附属产物。应用通过 open_artifact 读取，无需维护隐藏文件命名协议。
 
 Embedder 提供 `embedding_space`、`dimension`、`embed_documents(texts)` 和 `embed_query(text)`。
 查询调用与后台文档调用允许并发；适配器应使用可并发客户端或各自的客户端，避免把两者锁在同一个长请求后面。
@@ -78,15 +85,19 @@ MFS 不要求这些函数改为 async。
 ## 状态与调用顺序
 
 1. watcher/用户写入后调用 sync 或 upsert；ACK 只表示已接收。
-2. UI 读取 list_document_statuses，展示 PROCESS/EMBED/发布阶段、错误和已完成批次。
+2. UI 分页读取 list_document_statuses(namespace, path=...)，展示阶段、进度、error_detail、源 hash 和版本关系。
+   listFiles 可使用这些轻量元数据；scope_status 做范围统计，index_configuration 返回有效索引配置。
    stage=drop、doc_id 为空的是 namespace 清理任务，不作为普通文档展示；失败同样可 retry。
 3. 文本搜索用 query(TextMatch)，即使 dense 失败仍能用新文本。
 4. 交互式索引搜索通常用 eventual；确实要求本次索引追上时用 strong + timeout。
 5. 可重试失败调用 retry；强制重新 OCR 调用 reprocess；取消调用 cancel。
-6. daemon 退出时 close。被取消的外部函数可能仍在运行，executing 用来展示实际退出进度。
+6. 用 set_active_scopes 传入打开的 Folder；daemon 退出时关闭产物句柄并 close。
+   用户取消跨自动 sync 保留；executing 用来展示实际执行是否仍在退出。
 
 strong 是整个实例的 ready，任何 Library 的失败都会让 strong 等待；不按搜索范围或通道另算。
 删除/移出授权范围时应用应立即缩小可搜索 scope；异步删除 ACK 不表示旧 Milvus rows 已经消失。
+需要确认本次清理完成时用 wait(receipt)，不受其他 Library 的失败拖累。
+相同内容移动/复制仍走普通 sync，推理缓存由 MFS 负责；身份、SQLite 和 Milvus 元数据更新保留。
 
 ## 应用迁移验收
 

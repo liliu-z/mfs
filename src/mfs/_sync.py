@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from ._platform import validate_windows_relative, windows_files
 from ._validation import suffix_for, validate_external_path
 from .errors import (
     InvalidPath,
@@ -19,6 +20,11 @@ from .errors import (
 )
 from .types import DocumentId, SyncFailure, SyncReport, SyncSkipped
 
+files = windows_files() if os.name == "nt" else os
+NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+
 if TYPE_CHECKING:
     from ._core import MFS
 
@@ -29,7 +35,7 @@ def _same(left: os.stat_result, right: os.stat_result) -> bool:
 
 def _case_sensitive(root: Path, descriptor: int) -> bool:
     # Observe actual filesystem lookup, rather than lowercasing paths on every POSIX volume.
-    with os.scandir(descriptor) as iterator:
+    with files.scandir(descriptor) as iterator:
         names = [e.name for e in iterator]
     for name in names:
         swapped = name.swapcase()
@@ -37,8 +43,8 @@ def _case_sensitive(root: Path, descriptor: int) -> bool:
             continue
         try:
             return not _same(
-                os.stat(name, dir_fd=descriptor, follow_symlinks=False),
-                os.stat(swapped, dir_fd=descriptor, follow_symlinks=False),
+                files.stat(name, dir_fd=descriptor, follow_symlinks=False),
+                files.stat(swapped, dir_fd=descriptor, follow_symlinks=False),
             )
         except FileNotFoundError:
             return True
@@ -58,12 +64,12 @@ def _open_relative(root_fd: int, relative: str) -> tuple[int, str]:
             return current, "."
         parts = relative.split("/")
         for index, name in enumerate(parts):
-            with os.scandir(current) as iterator:
+            with files.scandir(current) as iterator:
                 entries = list(iterator)
             chosen = next((e.name for e in entries if e.name == name), None)
             if chosen is None:
                 try:
-                    requested_stat = os.stat(name, dir_fd=current, follow_symlinks=False)
+                    requested_stat = files.stat(name, dir_fd=current, follow_symlinks=False)
                     chosen = next(
                         (
                             e.name
@@ -76,10 +82,10 @@ def _open_relative(root_fd: int, relative: str) -> tuple[int, str]:
                     raise FileNotFoundError("/".join([*actual, *parts[index:]])) from None
             if chosen is None:
                 raise FileNotFoundError("/".join([*actual, *parts[index:]]))
-            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            flags = os.O_RDONLY | NOFOLLOW | NONBLOCK
             if index < len(parts) - 1:
-                flags |= os.O_DIRECTORY
-            following = os.open(chosen, flags, dir_fd=current)
+                flags |= DIRECTORY
+            following = files.open(chosen, flags, dir_fd=current)
             os.close(current)
             current = following
             actual.append(chosen)
@@ -93,6 +99,8 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
     if verify not in ("stat", "content"):
         raise InvalidPath("verify must be stat or content")
     requested = validate_external_path(path, allow_root=True)
+    if os.name == "nt":
+        validate_windows_relative(requested)
     info = mfs._required_namespace(namespace)
     if info.kind != "external" or info.root is None:
         raise WrongNamespaceKind("sync requires an external namespace")
@@ -117,6 +125,18 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
         skipped[(relative, reason)] = SyncSkipped(relative, cast(Any, reason))
 
     def result() -> SyncReport:
+        operation_id = uuid.uuid4().hex
+        with mfs._condition, mfs._catalog.transaction():
+            identities = changed | removed | {DocumentId(namespace, p) for p in seen}
+            identities.update(
+                i
+                for i, job in mfs._targets.items()
+                if i.namespace == namespace
+                and job["state"] != "succeeded"
+                and mfs._under(i.doc_id, requested)
+            )
+            revisions = [str(mfs._targets[i]["revision"]) for i in identities if i in mfs._targets]
+            mfs._catalog.add_wait_operation(operation_id, revisions, complete)
         return SyncReport(
             namespace,
             report_path,
@@ -126,13 +146,14 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
             tuple(failures[k] for k in sorted(failures)),
             tuple(skipped[k] for k in sorted(skipped)),
             not mfs._pending and mfs._state == "ready",
+            operation_id,
         )
 
     try:
         root = info.root.resolve(strict=True)
         if root == mfs._path or root in mfs._path.parents or mfs._path in root.parents:
             raise RootOverlap("external root and mfs_path overlap")
-        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        root_fd = files.open(root, os.O_RDONLY | DIRECTORY | NOFOLLOW)
         root_identity = os.fstat(root_fd)
         case_sensitive = _case_sensitive(root, root_fd)
 
@@ -175,6 +196,9 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
                 requested = "."  # A new root target changes membership for the whole namespace.
 
         def file(descriptor: int, relative: str, *, exact: bool) -> None:
+            if os.name == "nt" and not files.path(descriptor).is_relative_to(root):
+                fail(relative, SourceChanged("opened file moved outside the root"))
+                return
             seen.add(relative)
             protected.add(relative)
             identity = DocumentId(namespace, relative)
@@ -211,6 +235,10 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
                     return
             staged = None
             try:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                mfs._select_processor(
+                    relative, root / relative, None, None, head=os.read(descriptor, 64 * 1024)
+                )
                 staged = mfs._stage_descriptor(descriptor)
                 if not root_stable():
                     raise SourceChanged("root changed during observation")
@@ -253,7 +281,9 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
 
         def walk(descriptor: int, relative_dir: str) -> None:
             try:
-                with os.scandir(descriptor) as iterator:
+                if os.name == "nt" and not files.path(descriptor).is_relative_to(root):
+                    raise SourceChanged("opened directory moved outside the root")
+                with files.scandir(descriptor) as iterator:
                     entries = sorted(iterator, key=lambda e: e.name.encode())
                 for entry in entries:
                     relative = (
@@ -265,7 +295,10 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
                         continue
                     try:
                         metadata = entry.stat(follow_symlinks=False)
-                        if stat.S_ISLNK(metadata.st_mode):
+                        if (
+                            stat.S_ISLNK(metadata.st_mode)
+                            or getattr(metadata, "st_file_attributes", 0) & 0x400
+                        ):
                             link(relative)
                             continue
                         if not stat.S_ISREG(metadata.st_mode) and not stat.S_ISDIR(
@@ -274,9 +307,9 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
                             nonmembers.add(relative)
                             skip(relative, "special_file")
                             continue
-                        child = os.open(
+                        child = files.open(
                             entry.name,
-                            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                            os.O_RDONLY | NOFOLLOW | NONBLOCK,
                             dir_fd=descriptor,
                         )
                         try:
@@ -341,7 +374,10 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
             replacement_child = any(
                 key(relative) != key(prefix) and under(relative, prefix) for prefix in protected
             )
-            if (excluded or (absent and not replacement_child)) and (
+            spelling_changed = (
+                not case_sensitive and key(relative) in seen_keys and relative not in seen
+            )
+            if (spelling_changed or excluded or (absent and not replacement_child)) and (
                 mfs._remove(identity).outcome == "removed"
             ):
                 removed.add(identity)

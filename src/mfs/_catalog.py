@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
@@ -21,14 +22,27 @@ class Catalog:
         self._connections_lock = threading.Lock()
         self.migrated = False
         version = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
-        if version > 2:
+        if version > 3:
             raise SchemaVersionUnsupported(f"catalog schema version {version} is unsupported")
-        if not initialize and version not in (1, 2):
+        if not initialize and version not in (1, 2, 3):
             raise CorruptState("catalog schema is missing or unrecognized")
-        if initialize or version == 1:
+        if initialize or version < 3:
             self._initialize()
             self.migrated = version == 1
-        expected = {"namespaces", "documents", "targets", "operations"}
+        expected = {
+            "namespaces",
+            "documents",
+            "targets",
+            "operations",
+            "runs",
+            "wait_operations",
+            "artifacts",
+            "artifact_refs",
+            "cache",
+            "cancel_gates",
+            "prepared",
+            "run_dependencies",
+        }
         actual = {
             r[0]
             for r in self.connection.execute(
@@ -36,7 +50,7 @@ class Catalog:
             )
         }
         if actual != expected:
-            raise CorruptState("catalog schema does not match version 2")
+            raise CorruptState("catalog schema does not match version 3")
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -78,7 +92,39 @@ class Catalog:
                 key TEXT PRIMARY KEY, request_hash TEXT NOT NULL,
                 value TEXT NOT NULL CHECK(json_valid(value))
             );
-            PRAGMA user_version = 2;
+            CREATE TABLE IF NOT EXISTS runs (
+                revision TEXT PRIMARY KEY, state TEXT NOT NULL, error TEXT,
+                error_code TEXT, retryable INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS wait_operations (
+                operation_id TEXT PRIMARY KEY, targets TEXT NOT NULL, complete INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS artifacts (
+                path TEXT PRIMARY KEY, state TEXT NOT NULL DEFAULT 'live',
+                unreferenced_at REAL, size INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS artifacts_gc ON artifacts(state,unreferenced_at);
+            CREATE TABLE IF NOT EXISTS artifact_refs (
+                owner TEXT NOT NULL, namespace TEXT NOT NULL, doc_id TEXT NOT NULL,
+                path TEXT NOT NULL, PRIMARY KEY(owner,namespace,doc_id,path)
+            );
+            CREATE INDEX IF NOT EXISTS refs_path ON artifact_refs(path);
+            CREATE TABLE IF NOT EXISTS cache (
+                key TEXT PRIMARY KEY, path TEXT NOT NULL, digest TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cancel_gates (
+                namespace TEXT NOT NULL, doc_id TEXT NOT NULL, PRIMARY KEY(namespace,doc_id)
+            );
+            CREATE TABLE IF NOT EXISTS prepared (revision TEXT PRIMARY KEY, path TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS run_dependencies (
+                parent TEXT NOT NULL, child TEXT NOT NULL, PRIMARY KEY(parent,child)
+            );
+            INSERT OR IGNORE INTO wait_operations(operation_id,targets,complete)
+                SELECT json_extract(value,'$.operation_id'),
+                       CASE WHEN json_extract(value,'$.revision') IS NULL THEN '[]'
+                            ELSE json_array(json_extract(value,'$.revision')) END, 1
+                FROM operations WHERE json_extract(value,'$.operation_id') IS NOT NULL;
+            PRAGMA user_version = 3;
             COMMIT;
         """)
 
@@ -127,9 +173,13 @@ class Catalog:
         ]
 
     def delete_namespace(self, namespace: str) -> None:
+        for doc, _ in self.list_namespace_documents(namespace):
+            self.set_references("document", namespace, doc, set())
+        self.connection.execute("DELETE FROM cancel_gates WHERE namespace=?", (namespace,))
         self.connection.execute("DELETE FROM namespaces WHERE namespace=?", (namespace,))
 
     def put_document(self, namespace: str, doc_id: str, value: dict[str, Any]) -> None:
+        self.set_references("document", namespace, doc_id, self.references(value))
         self.connection.execute(
             "INSERT INTO documents VALUES(?,?,?) ON CONFLICT(namespace,doc_id) "
             "DO UPDATE SET value=excluded.value",
@@ -137,6 +187,7 @@ class Catalog:
         )
 
     def delete_document(self, namespace: str, doc_id: str) -> None:
+        self.set_references("document", namespace, doc_id, set())
         self.connection.execute(
             "DELETE FROM documents WHERE namespace=? AND doc_id=?", (namespace, doc_id)
         )
@@ -186,6 +237,29 @@ class Catalog:
         return int(self.connection.execute("SELECT count(*) FROM namespaces").fetchone()[0])
 
     def put_target(self, namespace: str, doc_id: str, value: dict[str, Any]) -> None:
+        previous = self.get_target(namespace, doc_id)
+        if previous and previous["revision"] != value["revision"]:
+            self.connection.execute(
+                "UPDATE runs SET state='superseded' WHERE revision=? AND state!='succeeded'",
+                (previous["revision"],),
+            )
+        self.connection.execute(
+            "INSERT INTO runs VALUES(?,?,?,?,?) ON CONFLICT(revision) DO UPDATE SET "
+            "state=excluded.state,error=excluded.error,error_code=excluded.error_code,"
+            "retryable=excluded.retryable WHERE runs.state!='succeeded'",
+            (
+                value["revision"],
+                value["state"],
+                value.get("error"),
+                value.get("error_code"),
+                int(value.get("retryable", False)),
+            ),
+        )
+        self.set_references("target", namespace, doc_id, self.references(value))
+        if previous and previous["revision"] != value["revision"]:
+            self.clear_prepared(str(previous["revision"]))
+        if value["stage"] != "process":
+            self.clear_prepared(str(value["revision"]))
         self.connection.execute(
             "INSERT INTO targets VALUES(?,?,?,?) ON CONFLICT(namespace,doc_id) "
             "DO UPDATE SET revision=excluded.revision,value=excluded.value",
@@ -209,6 +283,13 @@ class Catalog:
         return [(n, d, self.decode(v)) for n, d, v in rows]
 
     def delete_targets(self, namespace: str) -> None:
+        for _, doc, job in self.list_targets(namespace):
+            self.connection.execute(
+                "UPDATE runs SET state='superseded' WHERE revision=? AND state!='succeeded'",
+                (job["revision"],),
+            )
+            self.set_references("target", namespace, doc, set())
+            self.clear_prepared(str(job["revision"]))
         self.connection.execute("DELETE FROM targets WHERE namespace=?", (namespace,))
 
     def get_operation(self, key: str) -> tuple[str, dict[str, Any]] | None:
@@ -221,6 +302,82 @@ class Catalog:
         self.connection.execute(
             "INSERT INTO operations VALUES(?,?,?)", (key, request_hash, compact_json(value))
         )
+
+    def clear_prepared(self, revision: str) -> None:
+        self.set_references("prepared", "", revision, set())
+        self.connection.execute("DELETE FROM prepared WHERE revision=?", (revision,))
+
+    def add_wait_operation(
+        self, operation_id: str, revisions: list[str], complete: bool = True
+    ) -> None:
+        self.connection.execute(
+            "INSERT INTO wait_operations VALUES(?,?,?)",
+            (operation_id, compact_json(revisions), int(complete)),
+        )
+
+    def set_cancelled(self, namespace: str, doc_id: str, cancelled: bool) -> None:
+        if cancelled:
+            self.connection.execute(
+                "INSERT OR IGNORE INTO cancel_gates VALUES(?,?)", (namespace, doc_id)
+            )
+        else:
+            self.connection.execute(
+                "DELETE FROM cancel_gates WHERE namespace=? AND doc_id=?", (namespace, doc_id)
+            )
+
+    def cancelled(self, namespace: str, doc_id: str) -> bool:
+        return (
+            self.connection.execute(
+                "SELECT 1 FROM cancel_gates WHERE namespace=? AND doc_id=?", (namespace, doc_id)
+            ).fetchone()
+            is not None
+        )
+
+    @staticmethod
+    def references(value: dict[str, Any]) -> set[str]:
+        paths = {value.get(k) for k in ("input", "snapshot", "chunks")}
+        paths.update(value.get("vectors", []))
+        paths.add(value.get("source", {}).get("object"))
+        paths.update(value.get("artifacts", {}).values())
+        paths.update(value.get("published_artifacts", {}).values())
+        paths.update(value.get("checkpoint", {}).get("files", {}).values())
+        return {p for p in paths if isinstance(p, str)}
+
+    def register_artifact(self, path: str, size: int = 0) -> None:
+        self.connection.execute(
+            "INSERT OR IGNORE INTO artifacts(path,unreferenced_at,size) VALUES(?,?,?)",
+            (path, time.time(), size),
+        )
+
+    def set_references(self, owner: str, namespace: str, doc_id: str, paths: set[str]) -> None:
+        params = (owner, namespace, doc_id)
+        previous = {
+            str(r[0])
+            for r in self.connection.execute(
+                "SELECT path FROM artifact_refs WHERE owner=? AND namespace=? AND doc_id=?", params
+            )
+        }
+        for path in paths - previous:
+            self.register_artifact(path)
+            row = self.connection.execute(
+                "SELECT state FROM artifacts WHERE path=?", (path,)
+            ).fetchone()
+            if row[0] != "live":
+                raise CorruptState("cannot reference an artifact claimed for deletion")
+            self.connection.execute("INSERT INTO artifact_refs VALUES(?,?,?,?)", (*params, path))
+            self.connection.execute(
+                "UPDATE artifacts SET unreferenced_at=NULL WHERE path=?", (path,)
+            )
+        for path in previous - paths:
+            self.connection.execute(
+                "DELETE FROM artifact_refs WHERE owner=? AND namespace=? AND doc_id=? AND path=?",
+                (*params, path),
+            )
+            self.connection.execute(
+                "UPDATE artifacts SET unreferenced_at=? WHERE path=? "
+                "AND NOT EXISTS(SELECT 1 FROM artifact_refs WHERE path=?)",
+                (time.time(), path, path),
+            )
 
     @staticmethod
     def decode(encoded: str) -> dict[str, Any]:

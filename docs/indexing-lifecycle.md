@@ -1,3 +1,5 @@
+> ProcessingContext、调度池、回执等待和在线 GC 的当前接口见 [生命周期补齐](lifecycle-extensions.md)。
+
 # MFS 文档生命周期与检索一致性设计
 
 > 2026-09-09，已落实到 MFS 的生命周期设计。
@@ -37,7 +39,8 @@ Snapshot 仍表示处理后的文本与来源定位，不是 Milvus 备份能力
 
 实例在内存维护未完成目标集合与 `ready`。有尚未完成的处理、索引、删除或恢复工作时 ready 为 false。
 该集合从 SQLite 重建；内存变量不是持久任务存储，也不能以“线程队列空了”代替全部完成。
-失败和取消的工作不自动算完成；显式 retry/remove 或接收新版本才改变其后续状态或目标。
+失败和取消不自动算完成；retry/remove 或新版本可以改变目标。用户取消门跨新 bytes 保留，
+只有 retry/reprocess 显式解除，见 [生命周期补齐](lifecycle-extensions.md)。
 
 ## 4. 接收与 grep 可用时刻
 
@@ -132,12 +135,12 @@ eventual 不承诺新鲜度、完整索引或同版本快照，不要求返回�
 Python 3.13 支持在同一进程内使用 `threading.Thread`，多个线程共享内存。
 这里采用普通后台线程，不要求调用者或现有函数改成 async/await。
 
-- 一个准备 worker 执行 PROCESS 并提交 SQLite 文本；一个索引 worker 执行 CHUNK/EMBED/Milvus 写入。
-  这样 dense 卡住不会阻止后续文档进入 grep；初版每类一个 worker，不建立复杂并行 scheduler。
+- 默认 2 个 light 和 1 个 heavy 准备 worker 执行 PROCESS；一个索引 worker 执行 CHUNK/EMBED/Milvus 写入。
+  Processor 声明并发上限；active scope、显式 reprocess 与等待时间共同决定排队优先级。
 - 任务状态持久记录在 SQLite，线程队列/Condition 只负责唤醒。失败退避时可以处理其他可执行任务。
 - 同一个索引 worker 顺序执行所有 Milvus mutation，无需另起一个补齐 writer 或 publisher。
 - grep/search 在调用者线程执行，与后台索引并发；不持有跨越搜索或 embedding 的 MFS 读写锁。
-- SQLite 连接按线程使用，事务写入做必要的串行协调。PROCESS 串行；CHUNK 与 query 的 Chunk 投影串行。
+- SQLite 连接按线程使用，事务写入做必要的串行协调。PROCESS 按 Adapter 并发上限执行；CHUNK 与 query 的 Chunk 投影串行。
   Embedder 的文档调用与查询调用允许并发，注入实现必须支持这一点；sniff 也需可与 PROCESS 并发。
 - CPU 密集处理是否能利用多核取决于实现；GIL 不妨碍线程等待网络/文件 I/O。
   对有独立进程要求的 Processor 使用其受管理进程入口，不把所有 native 函数都假定为线程安全。
@@ -252,14 +255,14 @@ Processor/Chunker/Embedder 的算法保持外部注入，执行状态及成功�
 - `timeout` 约束 ready 等待，不是回调或 Milvus RPC 的总时间限制；超时不取消后台任务。
 - 可识别的临时错误最多自动重试 4 次；未知错误保留 failed，缺能力保留 blocked。
   `retry` 从当前失败阶段续跑，`reprocess` 建立新版本重新调用 Processor。
-- `cancel` 记录取消并阻止后续提交；已进入回调的线程继续到函数返回，`executing` 表示仍有执行。
-  应用负责让长函数有网络超时或可管理的子进程，`close` 会等待正在执行的函数退出。
-- 没有全局 pause/resume、任务优先级或多 worker 调度。初版两条固定 worker 已覆盖当前要求。
-- 当前版本保留目标输入与阶段产物用于重试、reprocess/reindex；失去引用的产物在下次 open 时回收。
-  连续运行期间不会与查询竞争删除原文件，在线 GC 作为后续优化。
+- `cancel` 持久保存取消门并通知 ProcessingContext；`executing` 表示实际执行尚未退出。
+  context.run_process 管理子进程树，任意 Python 回调仍需协作检查取消。close 等待实际退出。
+- 不增加全局 pause/resume；PreparationPolicy 与 active scopes 控制有界准备调度。
+- 当前版本保留目标输入与阶段产物用于重试、reprocess/reindex；失去引用的产物由低频维护或显式 collect_garbage 回收。
+  连续运行时由低频 GC 维护；强引用和读取租约保护查询、checkpoint 和产物句柄。
 - `query(select="chunk")` 从 SQLite 文本调用 Chunker，文档级 grep 不调用 Chunker。
 - 未配置 dense 的实例支持 BM25-only；已配置 dense 的实例暂时缺 Embedder 时不能只更新 sparse。
-- SQLite schema v1 自动升级；旧索引或缺失索引从 SQLite 快照重建。配置变化显式 `reindex()`。
+- SQLite schema v1/v2 自动升级至 v3；旧索引或缺失索引从 SQLite 快照重建。配置变化显式 `reindex()`。
   Snapshot 是文本与 SourceMap 的标识，没有 SQLite/Milvus 跨库快照或备份承诺。
 
 ## 13. 验证与对接

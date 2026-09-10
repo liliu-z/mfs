@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from .processing import ProcessingContext
 
 from ._json import JSONValue
 
@@ -98,6 +101,7 @@ class DropReport:
     namespace: str
     dropped: bool
     index_ready: bool
+    operation_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +127,7 @@ class SyncReport:
     failed: tuple[SyncFailure, ...]
     skipped: tuple[SyncSkipped, ...]
     index_ready: bool
+    operation_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +156,13 @@ class DocumentStatus:
     completed_batches: int = 0
     total_batches: int = 0
     executing: bool = False
+    content_hash: str | None = None
+    media_type: str | None = None
+    source_size: int | None = None
+    source_mtime_ns: int | None = None
+    error_detail: TaskError | None = None
+    progress: Progress | None = None
+    artifacts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +176,7 @@ class ReindexReport:
 class ProcessedDocument:
     text: str
     source_map: SourceMap
+    artifacts: Mapping[str, Path] = field(default_factory=lambda: dict[str, Path]())
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +189,54 @@ class ChunkRange:
 class SyncPolicy:
     exclude_globs: tuple[str, ...] = ()
     max_file_bytes: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TaskError:
+    code: str
+    message: str
+    retryable: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Progress:
+    completed: float
+    total: float | None = None
+    unit: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PreparationPolicy:
+    light_workers: int = 2
+    heavy_workers: int = 1
+    aging_seconds: float = 60.0
+
+
+@dataclass(frozen=True, slots=True)
+class GCPolicy:
+    enabled: bool = True
+    interval: float = 3600.0
+    idle_seconds: float = 30.0
+    grace_seconds: float = 3600.0
+    batch_files: int = 32
+    batch_seconds: float = 0.05
+    cycle_files: int = 256
+    cycle_seconds: float = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class GCReport:
+    deleted: int = 0
+    skipped: int = 0
+    busy: bool = False
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ScopeStatus:
+    total: int
+    states: Mapping[str, int]
+    stages: Mapping[str, int]
 
 
 class Filter:
@@ -291,7 +352,7 @@ class SearchResult[T]:
 
 
 @runtime_checkable
-class Processor(Protocol):
+class LegacyProcessor(Protocol):
     id: str
     version: str
     options: JSONValue
@@ -301,6 +362,24 @@ class Processor(Protocol):
     def sniff(self, head: bytes) -> str | None: ...
 
     def process(self, staged_path: Path, media_type: str) -> ProcessedDocument: ...
+
+
+@runtime_checkable
+class ContextProcessor(Protocol):
+    id: str
+    version: str
+    options: JSONValue
+    media_types: tuple[str, ...]
+    suffix_media_types: Mapping[str, str]
+
+    def sniff(self, head: bytes) -> str | None: ...
+
+    def process(
+        self, staged_path: Path, media_type: str, context: ProcessingContext
+    ) -> ProcessedDocument: ...
+
+
+type Processor = LegacyProcessor | ContextProcessor
 
 
 @runtime_checkable

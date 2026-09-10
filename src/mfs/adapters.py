@@ -12,6 +12,10 @@ from .types import ChunkRange, ProcessedDocument, SourceMap, SourceSpan
 
 
 class Utf8TextProcessor:
+    cache_scope = "content"
+    concurrency = 2
+    workload = "light"
+
     def __init__(self) -> None:
         self.id: str = "utf8-text"
         self.version: str = "1"
@@ -47,6 +51,9 @@ class Utf8TextProcessor:
 
 
 class PdfProcessor:
+    cache_scope = "content"
+    workload = "heavy"
+
     def __init__(self) -> None:
         self.id: str = "pdf"
         self.version: str = "1+pymupdf4llm-1.28.2"

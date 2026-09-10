@@ -1,7 +1,39 @@
 # MFS 修复与验收记录
 
-2026-09-09。MFS 侧实现已完成。当前契约见 [design.md](design.md)，
-StashBase 应用迁移的映射与边界见 [stashbase-integration.md](stashbase-integration.md)。
+2026-09-10 更新。下方保留已有验收记录，并记录本轮修复和后续应用工作。
+当前已实现契约见 [design.md](design.md)，StashBase 应用迁移的映射与边界见
+[stashbase-integration.md](stashbase-integration.md)；已有验收不表示应用接入缺口已全部补齐。
+
+## 本轮修复（2026-09-10）
+
+用户已确认本轮整体实现，下列项目已纳入修复并落地：
+
+- [x] **FIX-005：大小写重命名。** 不敏感卷上，实际拼写变化会清理旧 SQLite / Milvus 身份；
+  保留敏感卷的独立路径。覆盖重命名后的内容修改与查询结果。
+- [x] **FIX-006：格式资格预检查。** sync 先用后缀和最多 64 KiB 头部判型；不支持的文件不完整 staging。
+  正式接收仍做稳定读取、源身份复核和判型。
+- [x] **FIX-007：回执 index_ready。** 新回执统一使用实例 ready，幂等重放保留历史回执。
+- [x] **PLATFORM-001：Windows 实现和 CI。** 原生句柄固定身份、重解析点防护、二进制读取、
+  设备/alternate-stream 路径防护、实例锁、持久化适配和受管理 Job Object；CI 加入 windows-2025。
+  锁定依赖已包含 Windows wheels，Milvus Lite 3.2.1 manifest 已使用 os.replace。
+  本机无法执行 Windows 原生测试，原生验收留给 Windows CI，不把 macOS 结果记为 Windows 已通过。
+- [x] **API-001：轻量元数据与结构化状态。** content_hash、源大小/mtime、源/文本/索引版本、
+  progress、error_detail、附属产物名称；支持 namespace/path 分页（最多 1000）与 scope_status，
+  index_configuration 返回实际索引配置，状态读取不加载完整原文或向量。
+- [x] **LIFE-003：Preparation 完整生命周期。** ProcessingContext 的取消、进度、持久 checkpoint、
+  受管理命令；原子附属产物发布与带租约读取；有界 light/heavy worker、Adapter 并发上限、
+  active scope / reprocess 优先级和 aging、checkpoint 让出；用户取消跨新 bytes 和重开保留。
+- [x] **LIFE-004：按回执等待。** Mutation/Drop/Sync 的 operation_id 与目标持久化，
+  wait(receipt) 只等自己的目标及目录替换清理；超时可重用，失败及时报告，旧目标被覆盖返回 Superseded。
+  删除优先且可在索引配置 mismatch 时执行；已有单 writer 约束保持。
+- [x] **CACHE-001：内部内容复用。** PROCESS/CHUNK/EMBED 成功产物缓存、checksum 与失效回退；
+  跨路径推理复用但保留独立身份。路径无关必须由具体 Adapter 声明；reprocess 绕过 PROCESS 缓存。
+- [x] **STORE-001：低频在线 GC。** 实例维护线程或宿主 collect_garbage；强引用、读取租约、
+  删除认领、宽限期、逐项 orphan inventory 和软预算；主链路不做 sweep，失败不更改任务状态。
+  取消/失败 checkpoint 和稳定输入保留，open 完成引用恢复后才允许维护。
+
+实现契约见 [生命周期补齐](lifecycle-extensions.md)。不增加 query cancellation 或 pause/resume。
+StashBase 的应用状态和 daemon API 迁移仍位于下方“后续应用工作”，本轮不修改另一个 checkout。
 
 ## 已完成
 
@@ -23,7 +55,7 @@ StashBase 应用迁移的映射与边界见 [stashbase-integration.md](stashbase
   跨 Chunk 匹配与 SourceLocation；空 Catalog 也验证非法正则，point query 使用主键筛选。
 - [x] **LIFE-001：持久任务与阶段恢复。** SQLite 目标/状态、稳定输入、成功 OCR/embedding 批次产物、
   幂等回执、retry/reprocess/cancel、轻量状态查询及 executing；BM25/dense 同表完整发布。
-- [x] **LIFE-002：两个后台线程与全局 ready。** 准备/索引分开，单 Milvus writer；
+- [x] **LIFE-002：准备/索引分离与全局 ready。** 准备/索引分开，单 Milvus writer；
   strong 用 Condition 等 ready，eventual 直接搜；无搜索读写锁或两路同快照要求。
 - [x] **Python 3.13。** 依赖锁、Ruff/Pyright 和 macOS/Linux CI 配置对齐。
 
@@ -42,9 +74,12 @@ StashBase 应用迁移的映射与边界见 [stashbase-integration.md](stashbase
 
 对应测试：`test_sync_regressions.py`、`test_search_filters.py`、`test_lifecycle.py`、
 `test_recovery.py`、`test_publication.py` 与 `test_backend_conformance.py`。
-本地验证：macOS / Python 3.13.12，46 个测试通过（85 秒）；Ruff、格式检查、Pyright、
-`uv lock --check --offline` 和 `git diff --check` 全部通过。7 条警告来自 PDF 依赖的 SWIG 弃用提示。
-Linux 分支由 CI 配置覆盖，本轮未在 Linux 主机执行。
+历史基线：macOS / Python 3.13.12，46 个测试通过。本轮新增验收见 test_extensions.py、
+test_windows.py；包含 checkpoint 真正跨进程恢复、回执跨重开、取消门、同内容复用、GC 租约和删除认领。
+本轮完整验证：macOS / Python 3.13，65 passed、3 skipped（Windows 原生用例），109.64 秒；
+7 条警告来自 PDF 依赖的 SWIG 弃用提示。随后补做 GC 链接清理的针对性测试通过，外部文件保持完整。
+Ruff、格式检查、Pyright（当前平台及 Windows 分支）、直接与开发依赖的精确版本核验、
+git diff --check 全部通过。Windows/Linux 原生运行由 CI 矩阵覆盖，本轮未在这两个平台执行。
 
 ## 后续应用工作
 
@@ -52,5 +87,5 @@ Linux 分支由 CI 配置覆盖，本轮未在 Linux 主机执行。
   移除 Node/daemon 重复的 Preparation/indexing 状态与调度。MFS repo 的改动不自动迁移另一个 checkout。
 - [ ] 运行 StashBase 实际 retrieval eval 和代表性 corpus，测 grep/搜索延迟、索引吞吐及失败恢复成本。
 
-后续可按实际需求增加在线 GC、namespace 独立 SyncPolicy、任务优先级或多 worker。
-当前产物在下次 open 时 GC，SyncPolicy 为实例级；取消不强杀任意 Python/native 回调。
+SyncPolicy 仍为实例级；namespace 独立策略可按应用需要评估。任意 Python 回调需要协作取消，
+context.run_process 管理的子进程可由 MFS 清理。

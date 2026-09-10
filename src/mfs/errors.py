@@ -130,3 +130,26 @@ class RetryableError(MFSError):
     """An injected adapter may raise this to request automatic bounded retries."""
 
     code = "RetryableError"
+
+
+class OperationFailed(MFSError):
+    code = "OperationFailed"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        revision: str | None = None,
+        state: str = "failed",
+        error_code: str | None = None,
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.revision = revision
+        self.state = state
+        self.error_code = error_code
+        self.retryable = retryable
+
+
+class Superseded(OperationFailed):
+    code = "Superseded"

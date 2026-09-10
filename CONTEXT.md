@@ -34,3 +34,15 @@ _Avoid_: Indexed、Ready。
 
 **Eventual（最终一致搜索）**：不等待实例 Ready，直接查询当前索引；允许旧结果、缺失结果及并发更新的中间态。
 _Avoid_: 用 final 表示终止状态或已全部完成。
+
+
+**Processing Attempt（准备执行）**：一个 revision 的一次执行，拥有独立 work_dir 和取消信号；
+checkpoint 可让下一次执行从持久边界恢复。attempt token 阻止旧执行提交。
+
+**Operation Receipt（操作回执）**：持久 operation_id 与有限目标集合；wait 只等待该操作，
+不等同于整个实例 Ready。成功结果在后续覆盖后仍有效。
+
+**Artifact（附属产物）**：随文本快照发布的不可变文件，经 open_artifact 读取；读取租约保护其生命周期。
+
+**User Cancellation Gate（用户取消门）**：跨自动源更新保留的取消意图，retry/reprocess 显式解除。
+内部 supersede/drop/close 的执行停止不创建此门。

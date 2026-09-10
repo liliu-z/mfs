@@ -34,9 +34,22 @@ finally:
 External files use `create_namespace("files", "external", root)` and
 `sync("files", verify="content")`. Sync reports accepted changes; task status
 reports processing/indexing failures. `retry`, `reprocess`, `cancel` and
-`wait_ready` manage the lifecycle. Callbacks remain ordinary injected Python
+`wait(receipt)` and `wait_ready` manage the lifecycle. Callbacks remain ordinary injected Python
 functions; concurrent query/document embedding calls must be supported by the adapter.
 
+New processors can accept `process(path, media_type, context)`. `ProcessingContext`
+provides durable checkpoints, progress, cancellation and managed subprocesses;
+`ProcessedDocument.artifacts` publishes named files alongside text. Existing
+processors with two arguments remain supported. Preparation uses bounded light/heavy
+worker pools; the index has one writer.
+
+Content-compatible processing and embedding results are reused internally.
+Low-frequency GC runs in an instance-owned maintenance thread. Set
+`gc_policy=GCPolicy(enabled=False)` to schedule `collect_garbage()` in the host.
+Use `document_status`, paginated `list_document_statuses`, `scope_status`, and
+`index_configuration` for metadata and diagnostics.
+
+- [Processing, operation waits, artifacts and GC](docs/lifecycle-extensions.md)
 - [Current API and semantics](docs/design.md)
 - [Lifecycle and consistency](docs/indexing-lifecycle.md)
 - [StashBase integration mapping](docs/stashbase-integration.md)
@@ -44,3 +57,5 @@ functions; concurrent query/document embedding calls must be supported by the ad
 
 Development: `uv sync --locked --dev`, then `uv run pytest -q`,
 `uv run ruff check src tests`, `uv run ruff format --check src tests`, and `uv run pyright`.
+
+CI covers Python 3.13 on Linux, macOS and Windows, including the real Milvus Lite backend.
