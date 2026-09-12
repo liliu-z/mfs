@@ -62,41 +62,35 @@ class GateEmbedder:
 
 def wait_state(mfs: MFS, identity: DocumentId, state: str) -> None:
     with mfs._condition:
-        assert mfs._condition.wait_for(lambda: mfs._targets[identity]["state"] == state, 10), (
-            mfs.document_status(identity)
-        )
+        assert mfs._condition.wait_for(
+            lambda: mfs._tasks.targets[identity]["state"] == state, 10
+        ), mfs.document_status(identity)
 
 
-def test_dense_wait_does_not_block_grep_admission_or_eventual_search(tmp_path: Path) -> None:
+def test_dense_wait_keeps_admission_and_current_grep_responsive(tmp_path: Path) -> None:
     embedder = GateEmbedder()
-    mfs = MFS.open(tmp_path / "state", processors=[Utf8TextProcessor()], embedder=embedder)
+    mfs = MFS.open(tmp_path / "state")
     try:
-        mfs.create_namespace("n", "internal")
-        mfs.upsert("n", "a.txt", b"old content")
-        mfs.wait_ready(10)
+        mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()], embedder=embedder)
+        mfs.wait(mfs.upsert("n", "a.txt", b"old content"), 10)
         embedder.entered.clear()
         embedder.release.clear()
         receipt = mfs.upsert("n", "a.txt", b"new content")
-        assert not receipt.index_ready
         assert embedder.entered.wait(5)
-        mfs.upsert("n", "b.txt", b"second document")
-        with mfs._condition:
-            assert mfs._condition.wait_for(
-                lambda: mfs._targets[DocumentId("n", "b.txt")]["stage"] != "process", 5
-            )
-        assert len(mfs.query([TextMatch("new|second", regex=True)]).items) == 2
+        second = mfs.upsert("n", "b.txt", b"second document")
+        second_status = mfs.document_status(second.id)
+        assert second_status is not None and second_status.stage == "process"
+        assert len(mfs.grep([TextMatch("new")]).items) == 1
         with pytest.raises(WaitTimeout):
             mfs.search("new", mode="bm25", timeout=0)
-        # Eventual vector/hybrid must not wait for the document embedding call either.
         with ThreadPoolExecutor() as pool:
             future = pool.submit(mfs.search, "old", mode="hybrid", consistency="eventual")
-            try:
-                assert future.result(3).items[0].value.text == "old content"
-            finally:
-                embedder.release.set()
-        mfs.wait_ready(10)
-        assert not mfs.search("old", mode="bm25").items
-        assert mfs.status().ready
+            assert not future.result(3).items
+        embedder.release.set()
+        mfs.wait(receipt, 10)
+        mfs.wait(second, 10)
+        assert len(mfs.grep([TextMatch("new|second", regex=True)]).items) == 2
+        assert not mfs.search("old", mode="bm25", timeout=10).items
     finally:
         embedder.release.set()
         mfs.close()
@@ -105,10 +99,14 @@ def test_dense_wait_does_not_block_grep_admission_or_eventual_search(tmp_path: P
 def test_late_revision_does_not_clear_new_pending_and_cancel_can_retry(tmp_path: Path) -> None:
     embedder = GateEmbedder()
     embedder.release.clear()
-    mfs = MFS.open(tmp_path / "state", processors=[Utf8TextProcessor()], embedder=embedder)
+    mfs = MFS.open(tmp_path / "state")
+    for registered in mfs.list_namespaces():
+        mfs.open_namespace(
+            registered.namespace, processors=[Utf8TextProcessor()], embedder=embedder
+        )
     identity = DocumentId("n", "a.txt")
     try:
-        mfs.create_namespace("n", "internal")
+        mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()], embedder=embedder)
         old = mfs.upsert("n", "a.txt", b"old")
         assert embedder.entered.wait(5)
         new = mfs.upsert("n", "a.txt", b"new")
@@ -132,10 +130,12 @@ def test_cancelled_inflight_attempt_cannot_complete_after_retry(tmp_path: Path) 
     processor = CountingProcessor()
     embedder = GateEmbedder()
     embedder.release.clear()
-    mfs = MFS.open(tmp_path / "state", processors=[processor], embedder=embedder)
+    mfs = MFS.open(tmp_path / "state")
+    for registered in mfs.list_namespaces():
+        mfs.open_namespace(registered.namespace, processors=[processor], embedder=embedder)
     identity = DocumentId("n", "a.txt")
     try:
-        mfs.create_namespace("n", "internal")
+        mfs.create_namespace("n", "internal", processors=[processor], embedder=embedder)
         mfs.upsert("n", "a.txt", b"same revision")
         assert embedder.entered.wait(5)
         mfs.cancel(identity)
@@ -144,7 +144,7 @@ def test_cancelled_inflight_attempt_cannot_complete_after_retry(tmp_path: Path) 
         mfs.wait_ready(10)
         assert processor.calls == 1
         assert len(embedder.calls) == 2  # The cancelled attempt must not advance the retry.
-        assert mfs._index.count_document(identity) == 1
+        assert mfs._namespace_index("n").count_document(identity) == 1
     finally:
         embedder.release.set()
         mfs.close()
@@ -161,46 +161,61 @@ class ByteChunker:
         return [ChunkRange(i, i + 1) for i in range(len(text.encode()))]
 
 
-def test_completed_embedding_batches_survive_reopen_without_processor(tmp_path: Path) -> None:
+def test_completed_embedding_batches_survive_reopen_without_reprocessing(tmp_path: Path) -> None:
+    class LineChunker(ByteChunker):
+        id = "test-lines"
+
+        def chunk(self, text: str, source_map: SourceMap) -> Sequence[ChunkRange]:
+            result: list[ChunkRange] = []
+            start = 0
+            for line in text.splitlines(keepends=True):
+                end = start + len(line.encode())
+                result.append(ChunkRange(start, end))
+                start = end
+            return result
+
     class BatchEmbedder(GateEmbedder):
         def embed_documents(self, texts: Sequence[str]) -> Sequence[Sequence[float]]:
-            if len(texts) < 128:
-                self.fail = True
+            self.fail = len(texts) < 128
             return super().embed_documents(texts)
 
     path = tmp_path / "state"
     processor = CountingProcessor()
-    failing = BatchEmbedder()
-    mfs = MFS.open(path, processors=[processor], chunker=ByteChunker(), embedder=failing)
+    mfs = MFS.open(path)
     identity = DocumentId("n", "a.txt")
     try:
-        mfs.create_namespace("n", "internal")
-        mfs.upsert("n", "a.txt", b"x" * 130)
+        mfs.create_namespace(
+            "n", "internal", processors=[processor], chunker=LineChunker(), embedder=BatchEmbedder()
+        )
+        mfs.upsert("n", "a.txt", "".join(f"line {i:03d}\n" for i in range(130)).encode())
         wait_state(mfs, identity, "failed")
         status = mfs.document_status(identity)
         assert status is not None and status.completed_batches == 1 and status.total_batches == 2
-        assert not mfs.search("x", mode="bm25", consistency="eventual").items
+        assert not mfs.search("line", mode="bm25", consistency="eventual").items
     finally:
         mfs.close()
     succeeding = GateEmbedder()
-    reopened = MFS.open(path, chunker=ByteChunker(), embedder=succeeding)
+    mfs = MFS.open(path)
     try:
-        reopened.retry(identity)
-        reopened.wait_ready(10)
+        mfs.open_namespace("n", processors=[processor], chunker=LineChunker(), embedder=succeeding)
+        mfs.retry(identity)
+        mfs.wait_ready(10)
         assert processor.calls == 1
         assert [len(batch) for batch in succeeding.calls] == [2]
-        assert reopened._index.count_document(identity) == 130
+        assert mfs._namespace_index("n").count_document(identity) == 130
     finally:
-        reopened.close()
+        mfs.close()
 
 
 def test_processing_commit_failure_reuses_completed_artifact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     processor = CountingProcessor()
-    mfs = MFS.open(tmp_path / "state", processors=[processor])
+    mfs = MFS.open(tmp_path / "state")
+    for registered in mfs.list_namespaces():
+        mfs.open_namespace(registered.namespace, processors=[processor])
     try:
-        mfs.create_namespace("n", "internal")
+        mfs.create_namespace("n", "internal", processors=[processor])
         original = mfs._catalog.put_document
         attempts = 0
 
@@ -215,22 +230,26 @@ def test_processing_commit_failure_reuses_completed_artifact(
         mfs.upsert("n", "a.txt", b"durable OCR output")
         mfs.wait_ready(10)
         assert processor.calls == 1 and attempts == 2
-        assert mfs.query(select="doc").items[0].value.text == "durable OCR output"
+        assert mfs.grep(select="doc").items[0].value.text == "durable OCR output"
     finally:
         mfs.close()
 
 
 def test_idempotency_receipt_replays_after_later_update_and_reopen(tmp_path: Path) -> None:
     path = tmp_path / "state"
-    mfs = MFS.open(path, processors=[Utf8TextProcessor()])
+    mfs = MFS.open(path)
+    for registered in mfs.list_namespaces():
+        mfs.open_namespace(registered.namespace, processors=[Utf8TextProcessor()])
     try:
-        mfs.create_namespace("n", "internal")
+        mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()])
         original = mfs.upsert("n", "a.txt", b"first", idempotency_key="request-1")
         later = mfs.upsert("n", "a.txt", b"second")
         mfs.wait_ready(10)
     finally:
         mfs.close()
-    reopened = MFS.open(path, processors=[Utf8TextProcessor()])
+    reopened = MFS.open(path)
+    for registered in reopened.list_namespaces():
+        reopened.open_namespace(registered.namespace, processors=[Utf8TextProcessor()])
     try:
         assert reopened.upsert("n", "a.txt", b"first", idempotency_key="request-1") == original
         status = reopened.document_status(DocumentId("n", "a.txt"))
@@ -238,7 +257,7 @@ def test_idempotency_receipt_replays_after_later_update_and_reopen(tmp_path: Pat
         with pytest.raises(IdempotencyConflict):
             reopened.upsert("n", "a.txt", b"different", idempotency_key="request-1")
         assert (
-            reopened.query([ByDocumentId(DocumentId("n", "a.txt"))], select="doc")
+            reopened.grep([ByDocumentId(DocumentId("n", "a.txt"))], select="doc")
             .items[0]
             .value.text
             == "second"
@@ -250,9 +269,13 @@ def test_idempotency_receipt_replays_after_later_update_and_reopen(tmp_path: Pat
 def test_close_wakes_strong_waiter_and_joins_workers(tmp_path: Path) -> None:
     embedder = GateEmbedder()
     embedder.fail = True
-    mfs = MFS.open(tmp_path / "state", processors=[Utf8TextProcessor()], embedder=embedder)
+    mfs = MFS.open(tmp_path / "state")
+    for registered in mfs.list_namespaces():
+        mfs.open_namespace(
+            registered.namespace, processors=[Utf8TextProcessor()], embedder=embedder
+        )
     try:
-        mfs.create_namespace("n", "internal")
+        mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()], embedder=embedder)
         mfs.upsert("n", "a.txt", b"text")
         wait_state(mfs, DocumentId("n", "a.txt"), "failed")
         entered = threading.Event()

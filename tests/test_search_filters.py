@@ -55,11 +55,19 @@ class SourceProcessor(Utf8TextProcessor):
 def test_ranked_affixes_and_source_types_push_down_before_topk_with_no_sqlite(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    mfs = MFS.open(tmp_path / "state", processors=[SourceProcessor()], embedder=GateEmbedder())
+    mfs = MFS.open(tmp_path / "state")
+    for registered in mfs.list_namespaces():
+        mfs.open_namespace(
+            registered.namespace, processors=[SourceProcessor()], embedder=GateEmbedder()
+        )
     special = '目录/rare"\\%_Résumé.PDF'
     try:
-        mfs.create_namespace("n", "internal")
-        mfs.create_namespace("other", "internal")
+        mfs.create_namespace(
+            "n", "internal", processors=[SourceProcessor()], embedder=GateEmbedder()
+        )
+        mfs.create_namespace(
+            "other", "internal", processors=[SourceProcessor()], embedder=GateEmbedder()
+        )
         for i in range(6):
             mfs.upsert("n", f"loud-{i}.txt", b"needle needle needle")
         mfs.upsert("n", special, b"needle rare source")
@@ -68,7 +76,7 @@ def test_ranked_affixes_and_source_types_push_down_before_topk_with_no_sqlite(
         statements: list[str] = []
         mfs._catalog.connection.set_trace_callback(statements.append)
         # Force a candidate budget of one at the actual backend for a rare type.
-        original = mfs._index.search
+        original = mfs._namespace_index("n").search
 
         def one_candidate(
             query: str | Sequence[float],
@@ -80,7 +88,7 @@ def test_ranked_affixes_and_source_types_push_down_before_topk_with_no_sqlite(
         ) -> tuple[list[SearchHit], bool]:
             return original(query, mode=mode, documents=documents, limit=1, expressions=expressions)
 
-        monkeypatch.setattr(mfs._index, "search", one_candidate)
+        monkeypatch.setattr(mfs._namespace_index("n"), "search", one_candidate)
         groups: list[list[Filter]] = [
             [ByNamespace("n"), ByExtension("pdf")],
             [ByNamespace("n"), ByMediaType("application/pdf")],
@@ -115,9 +123,11 @@ def test_under_path_excludes_prefix_siblings_and_sql_point_lookup_uses_primary_k
     (root / "scope-extra").mkdir()
     (root / "scope/a.txt").write_text("needle")
     (root / "scope-extra/a.txt").write_text("needle needle")
-    mfs = MFS.open(tmp_path / "state", processors=[Utf8TextProcessor()])
+    mfs = MFS.open(tmp_path / "state")
+    for registered in mfs.list_namespaces():
+        mfs.open_namespace(registered.namespace, processors=[Utf8TextProcessor()])
     try:
-        mfs.create_namespace("n", "external", root)
+        mfs.create_namespace("n", "external", root, processors=[Utf8TextProcessor()])
         mfs.sync("n")
         assert (
             mfs.search("needle", [UnderPath("n", "scope")], mode="bm25", limit=1)
@@ -127,7 +137,7 @@ def test_under_path_excludes_prefix_siblings_and_sql_point_lookup_uses_primary_k
         )
         scopes = AnyOf([UnderPath("n", "scope"), UnderPath("n", "scope-extra")])
         assert len(mfs.search("needle", [scopes], mode="bm25").items) == 2
-        assert len(mfs.query([scopes]).items) == 2
+        assert len(mfs.grep([scopes]).items) == 2
         # Additional filters always intersect the union; they cannot expand authorized scope.
         assert len(mfs.search("needle", [scopes, UnderPath("n", "scope")], mode="bm25").items) == 1
         identity = DocumentId("n", "scope/a.txt")
@@ -137,7 +147,7 @@ def test_under_path_excludes_prefix_siblings_and_sql_point_lookup_uses_primary_k
             compiled.params,
         ).fetchall()
         assert any("SEARCH documents USING INDEX" in str(row[3]) for row in plan)
-        assert mfs.query([ByDocumentId(identity)]).items[0].value == identity
+        assert mfs.grep([ByDocumentId(identity)]).items[0].value == identity
         # Multiple ID filters intersect rather than expanding a Cartesian product of batches.
         ids = [DocumentId("n", f"missing-{i}.txt") for i in range(1200)]
         assert (
@@ -158,25 +168,31 @@ def test_under_path_excludes_prefix_siblings_and_sql_point_lookup_uses_primary_k
 def test_grep_unicode_word_smart_case_cross_chunk_and_empty_regex_validation(
     tmp_path: Path,
 ) -> None:
-    mfs = MFS.open(tmp_path / "state", processors=[Utf8TextProcessor()], chunker=ByteChunker())
+    mfs = MFS.open(tmp_path / "state")
+    for registered in mfs.list_namespaces():
+        mfs.open_namespace(
+            registered.namespace, processors=[Utf8TextProcessor()], chunker=ByteChunker()
+        )
     try:
         with pytest.raises(InvalidPattern):
-            mfs.query([TextMatch("[", regex=True)])
-        mfs.create_namespace("n", "internal")
+            mfs.grep([TextMatch("[", regex=True)])
+        mfs.create_namespace(
+            "n", "internal", processors=[Utf8TextProcessor()], chunker=ByteChunker()
+        )
         # A failing Chunker must not prevent document-level grep of Unicode text.
         mfs.upsert("n", "a.txt", "café caféine CAFÉ _café café2\n中文 中文字\ncross\nline".encode())
         with mfs._condition:
             assert mfs._condition.wait_for(
-                lambda: mfs._targets[DocumentId("n", "a.txt")]["stage"] != "process", 5
+                lambda: mfs._tasks.targets[DocumentId("n", "a.txt")]["stage"] != "process", 5
             )
-        matches = mfs.query([TextMatch("café", smart_case=True, whole_word=True)]).items[0].matches
+        matches = mfs.grep([TextMatch("café", smart_case=True, whole_word=True)]).items[0].matches
         assert len(matches) == 2
         assert (
-            len(mfs.query([TextMatch("CAFÉ", smart_case=True, whole_word=True)]).items[0].matches)
+            len(mfs.grep([TextMatch("CAFÉ", smart_case=True, whole_word=True)]).items[0].matches)
             == 1
         )
-        assert len(mfs.query([TextMatch("中文", whole_word=True)]).items[0].matches) == 1
-        assert mfs.query([TextMatch("cross\nline")]).items
-        assert mfs.query([TextMatch("cross\\s+line", regex=True)], limit=1).items
+        assert len(mfs.grep([TextMatch("中文", whole_word=True)]).items[0].matches) == 1
+        assert mfs.grep([TextMatch("cross\nline")]).items
+        assert mfs.grep([TextMatch("cross\\s+line", regex=True)], limit=1).items
     finally:
         mfs.close()

@@ -159,7 +159,7 @@ def compile_filters(
             clauses.append(field + " in " + literal_list(values))
         elif isinstance(item, TextMatch):
             if search:
-                raise InvalidFilter("TextMatch belongs to query/grep, not ranked search")
+                raise InvalidFilter("TextMatch belongs to grep; search accepts structural filters")
             text.append(item)
         else:
             raise InvalidFilter(f"unsupported Filter type: {type(item).__name__}")

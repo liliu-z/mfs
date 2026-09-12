@@ -157,6 +157,12 @@ def validate_processed(value: ProcessedDocument) -> ProcessedDocument:
     except (AttributeError, UnicodeEncodeError) as error:
         raise ProcessingFailed("Processor returned text that is not valid UTF-8") from error
     validate_source_map(value.source_map, len(encoded))
+    if value.text_path is not None:
+        try:
+            if value.text_path.read_text(encoding="utf-8-sig") != value.text:
+                raise ProcessingFailed("text_path must contain the returned text")
+        except (OSError, UnicodeError) as error:
+            raise ProcessingFailed(f"text_path is not readable UTF-8: {error}") from error
     return value
 
 

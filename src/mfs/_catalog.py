@@ -6,7 +6,9 @@ import time
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
+
+import blake3
 
 from ._json import compact_json, load_json
 from .errors import CorruptState, SchemaVersionUnsupported, StorageFailed
@@ -22,11 +24,11 @@ class Catalog:
         self._connections_lock = threading.Lock()
         self.migrated = False
         version = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
-        if version > 3:
+        if version > 5:
             raise SchemaVersionUnsupported(f"catalog schema version {version} is unsupported")
-        if not initialize and version not in (1, 2, 3):
+        if not initialize and version not in (1, 2, 3, 4, 5):
             raise CorruptState("catalog schema is missing or unrecognized")
-        if initialize or version < 3:
+        if initialize or version < 5:
             self._initialize()
             self.migrated = version == 1
         expected = {
@@ -36,6 +38,7 @@ class Catalog:
             "operations",
             "runs",
             "wait_operations",
+            "wait_target_sets",
             "artifacts",
             "artifact_refs",
             "cache",
@@ -50,7 +53,7 @@ class Catalog:
             )
         }
         if actual != expected:
-            raise CorruptState("catalog schema does not match version 3")
+            raise CorruptState("catalog schema does not match version 5")
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -99,6 +102,9 @@ class Catalog:
             CREATE TABLE IF NOT EXISTS wait_operations (
                 operation_id TEXT PRIMARY KEY, targets TEXT NOT NULL, complete INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS wait_target_sets (
+                id TEXT PRIMARY KEY, revisions TEXT NOT NULL CHECK(json_valid(revisions))
+            );
             CREATE TABLE IF NOT EXISTS artifacts (
                 path TEXT PRIMARY KEY, state TEXT NOT NULL DEFAULT 'live',
                 unreferenced_at REAL, size INTEGER NOT NULL DEFAULT 0
@@ -124,7 +130,7 @@ class Catalog:
                        CASE WHEN json_extract(value,'$.revision') IS NULL THEN '[]'
                             ELSE json_array(json_extract(value,'$.revision')) END, 1
                 FROM operations WHERE json_extract(value,'$.operation_id') IS NOT NULL;
-            PRAGMA user_version = 3;
+            PRAGMA user_version = 5;
             COMMIT;
         """)
 
@@ -221,6 +227,21 @@ class Catalog:
     def list_documents(self) -> list[tuple[str, str, dict[str, Any]]]:
         return self.select_documents()
 
+    def iter_documents(
+        self, where: str = "1", params: Sequence[Any] = ()
+    ) -> Generator[tuple[str, str, dict[str, Any]]]:
+        cursor = self.connection.execute(
+            "SELECT namespace,doc_id,value FROM documents WHERE "
+            + where
+            + " ORDER BY namespace,doc_id",
+            params,
+        )
+        try:
+            for namespace, doc_id, value in cursor:
+                yield namespace, doc_id, self.decode(value)
+        finally:
+            cursor.close()
+
     def list_namespace_documents(self, namespace: str) -> list[tuple[str, dict[str, Any]]]:
         return [(d, v) for _, d, v in self.select_documents("namespace=?", (namespace,))]
 
@@ -310,10 +331,61 @@ class Catalog:
     def add_wait_operation(
         self, operation_id: str, revisions: list[str], complete: bool = True
     ) -> None:
+        encoded = compact_json(sorted(set(revisions)))
+        key = blake3.blake3(encoded.encode()).hexdigest()
         self.connection.execute(
-            "INSERT INTO wait_operations VALUES(?,?,?)",
-            (operation_id, compact_json(revisions), int(complete)),
+            "INSERT OR IGNORE INTO wait_target_sets VALUES(?,?)", (key, encoded)
         )
+        self.connection.execute(
+            "INSERT INTO wait_operations VALUES(?,?,?)", (operation_id, key, int(complete))
+        )
+
+    def wait_targets(self, encoded: str) -> list[str]:
+        if encoded.startswith("["):  # Receipts issued before catalog schema 5.
+            return cast(list[str], load_json(encoded))
+        row = self.connection.execute(
+            "SELECT revisions FROM wait_target_sets WHERE id=?", (encoded,)
+        ).fetchone()
+        if row is None:
+            raise CorruptState("operation target set is missing")
+        return cast(list[str], load_json(row[0]))
+
+    @staticmethod
+    def _scope(namespace: str | None, path: str) -> tuple[str, list[str]]:
+        clauses = ["namespace != ''"]
+        parameters: list[str] = []
+        if namespace is not None:
+            clauses.append("namespace=?")
+            parameters.append(namespace)
+        if path != ".":
+            clauses.append("(doc_id=? OR substr(doc_id,1,length(?)+1)=?||'/')")
+            parameters.extend([path, path, path])
+        return " AND ".join(clauses), parameters
+
+    def status_ids(
+        self, namespace: str | None, path: str, limit: int, offset: int
+    ) -> list[tuple[str, str]]:
+        where, parameters = self._scope(namespace, path)
+        return self.connection.execute(
+            f"SELECT namespace,doc_id FROM targets WHERE {where} "
+            "ORDER BY namespace,doc_id LIMIT ? OFFSET ?",
+            [*parameters, limit, offset],
+        ).fetchall()
+
+    def status_counts(
+        self, namespace: str | None, path: str
+    ) -> tuple[dict[str, int], dict[str, int]]:
+        where, parameters = self._scope(namespace, path)
+        states: dict[str, int] = {}
+        stages: dict[str, int] = {}
+        for state, stage, count in self.connection.execute(
+            "SELECT json_extract(value,'$.state'),json_extract(value,'$.stage'),count(*) "
+            f"FROM targets WHERE {where} GROUP BY 1,2",
+            parameters,
+        ):
+            states[state] = states.get(state, 0) + count
+            stages[stage] = stages.get(stage, 0) + count
+        return states, stages
 
     def set_cancelled(self, namespace: str, doc_id: str, cancelled: bool) -> None:
         if cancelled:
@@ -335,7 +407,13 @@ class Catalog:
 
     @staticmethod
     def references(value: dict[str, Any]) -> set[str]:
-        paths = {value.get(k) for k in ("input", "snapshot", "chunks")}
+        paths = {value.get(k) for k in ("snapshot", "chunks")}
+        if not value.get("borrowed_input"):
+            paths.add(value.get("input"))
+        for key in ("text_ref", "grep_ref"):
+            reference = value.get(key)
+            if reference and reference.get("owned"):
+                paths.add(reference["path"])
         paths.update(value.get("vectors", []))
         paths.add(value.get("source", {}).get("object"))
         paths.update(value.get("artifacts", {}).values())

@@ -5,7 +5,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 
 
-class Lifecycle:
+class CallGate:
     def __init__(self) -> None:
         self._condition = threading.Condition()
         self._closing = False

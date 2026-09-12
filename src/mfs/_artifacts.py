@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator, Mapping
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, BinaryIO, cast
 
 import blake3
@@ -55,6 +55,40 @@ class ArtifactStore:
         self._inventory: Iterator[Path] | None = None
         self.last_report = GCReport()
 
+    def directory(self, incarnation: str, area: str) -> Path:
+        if (
+            area not in ("originals", "derived", "work")
+            or len(incarnation) != 32
+            or any(c not in "0123456789abcdef" for c in incarnation)
+        ):
+            raise CorruptState("invalid namespace storage identity")
+        path = self.mfs._path
+        for part in ("namespaces", incarnation, area):
+            path = path / part
+            if path.is_symlink():
+                raise CorruptState("namespace storage cannot traverse symlinks")
+            path.mkdir(exist_ok=True)
+        return path
+
+    def path(self, relative: str, *, leaf_symlink: bool = False) -> Path:
+        parts = PurePosixPath(relative).parts
+        if not parts or PurePosixPath(relative).is_absolute() or ".." in parts or "\\" in relative:
+            raise CorruptState("invalid managed file reference")
+        legacy = parts[0] in ("objects", "artifacts", "work", "staging") and len(parts) >= 2
+        namespaced = (
+            len(parts) >= 4
+            and parts[0] == "namespaces"
+            and parts[2] in ("originals", "derived", "work")
+        )
+        if not legacy and not namespaced:
+            raise CorruptState("reference is outside managed file directories")
+        path = self.mfs._path
+        for index, part in enumerate(parts):
+            path = path / part
+            if path.is_symlink() and not (leaf_symlink and index == len(parts) - 1):
+                raise CorruptState("managed file reference traverses a symlink")
+        return path
+
     @staticmethod
     def key(kind: str, value: Any) -> str:
         return kind + ":" + blake3.blake3(canonical_json(value)).hexdigest()
@@ -69,9 +103,7 @@ class ArtifactStore:
         if row is None:
             return None
         try:
-            path = self.mfs._path / str(row[0])
-            if path.parent != self.mfs._path / "artifacts" or path.is_symlink():
-                raise CorruptState("invalid cache artifact path")
+            path = self.path(str(row[0]))
             data = path.read_bytes()
             if blake3.blake3(data).hexdigest() != row[1]:
                 raise CorruptState("cached artifact checksum mismatch")
@@ -116,7 +148,9 @@ class ArtifactStore:
                 raise InvalidQuery("artifact paths cannot traverse links or '..'")
             if not candidate.is_file():
                 raise InvalidQuery("artifact must be a regular file")
-            path = "artifacts/" + uuid.uuid4().hex + ".bin"
+            area = work_dir.relative_to(self.mfs._path).parts
+            directory = self.directory(area[1], "derived")
+            path = (directory / (uuid.uuid4().hex + ".bin")).relative_to(self.mfs._path).as_posix()
             with self.mfs._catalog.transaction():
                 self.mfs._catalog.register_artifact(path)
             destination = self.mfs._path / path
@@ -141,6 +175,13 @@ class ArtifactStore:
 
         for directory in ("objects", "artifacts", "staging", "work"):
             yield from walk(self.mfs._path / directory)
+        for namespace in (self.mfs._path / "namespaces").iterdir():
+            if namespace.is_symlink() or not namespace.is_dir():
+                continue
+            for area in ("originals", "derived", "work"):
+                directory = namespace / area
+                if directory.is_dir() and not directory.is_symlink():
+                    yield from walk(directory)
 
     def collect(self) -> GCReport:
         mfs, policy = self.mfs, self.policy
@@ -159,7 +200,7 @@ class ArtifactStore:
                     if (
                         mfs._stopping
                         or mfs._artifact_readers
-                        or mfs._executing
+                        or mfs._tasks.executing
                         or time.monotonic() - mfs._last_activity < policy.idle_seconds
                     ):
                         return GCReport(deleted, skipped, busy=True)
@@ -207,11 +248,7 @@ class ArtifactStore:
                         catalog.register_artifact(found.relative_to(mfs._path).as_posix())
                     continue
                 path = str(row[0])
-                target = mfs._path / path
-                if target.parent not in [
-                    mfs._path / d for d in ("objects", "artifacts", "staging", "work")
-                ] and not any((mfs._path / d) in target.parents for d in ("staging", "work")):
-                    raise CorruptState("GC artifact escaped managed directories")
+                target = self.path(path, leaf_symlink=True)
                 try:
                     if target.is_dir() and not target.is_symlink():
                         target.rmdir()  # Non-empty directories wait for their bounded inventory.

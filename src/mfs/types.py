@@ -24,6 +24,7 @@ type SyncSkipReason = Literal[
 ]
 type Select = Literal["doc_id", "chunk", "doc"]
 type SearchMode = Literal["bm25", "vector", "hybrid"]
+type IndexingMode = Literal["off", "bm25", "hybrid"]
 type Vector = Sequence[float]
 
 
@@ -177,6 +178,8 @@ class ProcessedDocument:
     text: str
     source_map: SourceMap
     artifacts: Mapping[str, Path] = field(default_factory=lambda: dict[str, Path]())
+    text_path: Path | None = None
+    grep_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +195,27 @@ class SyncPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class IgnoreRule:
+    rule_id: str
+    pattern: str
+    action: Literal["include", "exclude"] = "exclude"
+
+
+@dataclass(frozen=True, slots=True)
+class RuleSet:
+    revision: str
+    rules: tuple[IgnoreRule, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class GrepBudget:
+    max_documents: int = 10000
+    max_bytes: int = 64 * 1024 * 1024
+    max_file_bytes: int = 8 * 1024 * 1024
+    max_matches: int = 10000
+
+
+@dataclass(frozen=True, slots=True)
 class TaskError:
     code: str
     message: str
@@ -203,13 +227,6 @@ class Progress:
     completed: float
     total: float | None = None
     unit: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class PreparationPolicy:
-    light_workers: int = 2
-    heavy_workers: int = 1
-    aging_seconds: float = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,7 +344,7 @@ class ByMediaType(Filter):
 
 
 @dataclass(frozen=True, slots=True)
-class QueryItem[T]:
+class GrepItem[T]:
     value: T
     matches: tuple[Match, ...]
 
@@ -340,8 +357,8 @@ class SearchItem[T]:
 
 
 @dataclass(frozen=True, slots=True)
-class QueryResult[T]:
-    items: tuple[QueryItem[T], ...]
+class GrepResult[T]:
+    items: tuple[GrepItem[T], ...]
     truncated: bool
 
 

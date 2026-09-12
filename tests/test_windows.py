@@ -38,19 +38,23 @@ def test_windows_native_sync_lock_reopen_and_case_rename(tmp_path: Path) -> None
     root, state = tmp_path / "root", tmp_path / "state"
     root.mkdir()
     (root / "Note.txt").write_bytes(b"needle\r\n")
-    mfs = MFS.open(state, processors=[Utf8TextProcessor()])
+    mfs = MFS.open(state)
+    for registered in mfs.list_namespaces():
+        mfs.open_namespace(registered.namespace, processors=[Utf8TextProcessor()])
     try:
-        mfs.create_namespace("n", "external", root)
+        mfs.create_namespace("n", "external", root, processors=[Utf8TextProcessor()])
         mfs.wait(mfs.sync("n"), 15)
         with pytest.raises(InstanceLocked):
-            MFS.open(state, processors=[Utf8TextProcessor()])
+            MFS.open(state)
         (root / "Note.txt").rename(root / "note.txt")
         mfs.wait(mfs.sync("n"), 15)
-        assert [i.value.doc_id for i in mfs.query().items] == ["note.txt"]
-        assert mfs.query(select="doc").items[0].value.text == "needle\r\n"
+        assert [i.value.doc_id for i in mfs.grep().items] == ["note.txt"]
+        assert mfs.grep(select="doc").items[0].value.text == "needle\r\n"
     finally:
         mfs.close()
-    mfs = MFS.open(state, processors=[Utf8TextProcessor()])
+    mfs = MFS.open(state)
+    for registered in mfs.list_namespaces():
+        mfs.open_namespace(registered.namespace, processors=[Utf8TextProcessor()])
     try:
         assert mfs.search("needle", mode="bm25").items
         (root / "note.txt").unlink()

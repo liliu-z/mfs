@@ -1,112 +1,65 @@
-# StashBase 对接 MFS
+# StashBase 对接
 
-StashBase checkout 未修改，下面描述现有 MFS 接口的应用映射。
-已有 daemon 使用的是另一套 MFS 接口，不能只升级依赖而继续调用原来的 `hybrid_search`。
-MFS 已补齐完整 Preparation 生命周期；修复验收见 [清单](backlog.md)，
-ProcessingContext、操作等待、内容复用和 GC 见 [生命周期补齐](lifecycle-extensions.md)。
+MFS 合同统一见 [设计](design.md)，完成情况见 [backlog](backlog.md)。StashBase checkout 本轮未修改；这里记录接入方式，不能视为应用已迁移。
 
-## 实例与文件身份
+## 实例与源身份
 
-在 Python daemon 的生命周期中打开一个 MFS instance。每个 Library root 对应一个 external namespace，
-使用稳定的 Library ID 作为 namespace；Folder 是该 namespace 下的 UnderPath，不额外创建 collection。
-新增/删除/移动源文件仍由应用操作文件系统，然后调用 sync。watcher 只触发 sync，不再自行索引。
+Python daemon 生命周期内打开一个 MFS 实例。为每个不重叠的物理源根分配稳定 namespace ID；嵌套 Folder 映射为同 namespace 的 UnderPath。源文件增删改由应用操作，再通过 sync 让 MFS 观察。
 
-```python
-mfs.create_namespace(library_id, "external", library_root)
-report = mfs.sync(library_id)                    # 日常 stat 快速扫描
-report = mfs.sync(library_id, verify="content")  # 手动完整校验
-```
+External 只记录原件指针，拒绝 upsert/remove；应用已有派生文件也可以借用指针。直接 Markdown/TXT 的 grep 读取外部文件，PDF 等需要当前提取文字。不能假定所有文件都生成一份新的 Markdown。
 
-同一实例的 SyncPolicy 应来自应用共享的 ignore 规则，包括隐藏派生目录/文件；不要同时把派生 Markdown
-作为独立文档同步。源 `paper.pdf` 的处理结果可以是 Markdown，但身份始终是 `paper.pdf`，
-源后缀过滤与点击跳转无需再从 `.paper.pdf.md` 猜回原文。
+当前应用通过启动、打开/切换目录、窗口 focus、Agent turn end、手动 Sync 和 MCP reindex 等事件扫描，没有 filesystem watcher。接入时保留这些事件。
 
-MFS 当前 SyncPolicy 是实例级；应用若要按 Library 设置不同 ignore，需要在接入时统一为共同策略，
-或后续增加 namespace policy。不能在 Node 忽略一份、MFS 仍扫描另一份。
+## 保留与移交的职责
 
-## Processor 与 embedding
+| StashBase 保留 | MFS 承担 |
+| --- | --- |
+| 源文件操作、输入选择、产品可见性 | 文件观察、处理/索引任务、版本失效和恢复 |
+| 播放转码、增强 PDF/HTML/OCR/转录实现 | Processor 调用、切片、向量复用、BM25/dense 写入 |
+| 是否开始大批次索引的用户决策 | namespace 的 off/bm25/hybrid 与 paused |
+| 自行判断 MFS 文字是否可用，必要时 grep fallback | grep、read、search、已有逐文档状态和回执 |
+| sibling/派生文件关系和旧规则导入 | namespace 有序规则及统一准入/读取资格 |
 
-现有 OCR/PDF/HTML/DOCX/音频算法由应用包装成 Processor：
+搜原视频时，播放副本通过规则排除，Processor 提供原视频的转录文字。搜生成视频时，应用负责生成输入随原源更新/删除，再 sync。MFS 不自动推断两个独立文件的业务关系。
 
-```python
-class ApplicationProcessor:
-    # id/version/options 和支持的媒体类型按既有适配器声明。
-    workload = "heavy"
-    concurrency = 1
+## Processor 适配
 
-    def process(self, staged_path, media_type, context):
-        text, locations = existing_conversion(staged_path, media_type, context)
-        return ProcessedDocument(text=text, source_map=locations)
-```
+旧 mfs-cli 自身已有一般文本读取及基础 PDF/DOCX converter；StashBase 实际 daemon 路径通常接收应用转换文字，然后调用旧 Chunker、Embedder 和 store，并非每次运行旧 converter。
 
-`staged_path` 是 MFS 已保存的稳定输入；格式判断使用 media_type，不依赖 staging 文件名后缀。
-SourceMap 应保留页码、行号、时间范围等来源；结构化 source 可保存已有 heading 信息。
-源身份来自 MFS DocumentId，定位描述来自该次处理文本。
+新 MFS 保留 UTF-8/PDF，并提供基础 DOCX；应用已有增强实现经 Adapter 接入，同格式只选择一个实现。Adapter 可以返回源文字引用、应用已有派生文字引用，或新提取文字与 SourceMap。
 
-Processor 只执行转换，不写另一套“完成/失败/已索引”状态。改变算法时修改版本或 options，
-用户强制重新生成调用 `reprocess(DocumentId(...))`。MFS 负责源 hash 去重，失败 embedding 不重做已成功 OCR。
-API 凭据、模型选择、命令参数和网络超时仍由适配器负责；本地命令经 context.run_process 执行。
-转换器在 context.work_dir 生成文件，用 checkpoint 保存恢复边界，并通过 ProcessedDocument.artifacts
-发布 Markdown bundle、时间轴等附属产物。应用通过 open_artifact 读取，无需维护隐藏文件命名协议。
+HTML 可以保留原 HTML grep、提取后索引。SourceMap 描述提取文字的来源，不把旧索引映射用于后来已经改变的外部文件。播放附属文件不会自动加入搜索。
 
-Embedder 提供 `embedding_space`、`dimension`、`embed_documents(texts)` 和 `embed_query(text)`。
-查询调用与后台文档调用允许并发；适配器应使用可并发客户端或各自的客户端，避免把两者锁在同一个长请求后面。
-MFS 不要求这些函数改为 async。
+外部 Processor/Chunker/Embedder 对象由应用按 namespace 创建并传入，MFS 保存兼容清单，重开时核对。StashBase 当前全局模型配置可以由应用显式传给多个 namespace，不要求 MFS 提供全局继承。
 
-## 检索映射
+## 搜索映射
 
-| StashBase 参数/行为 | MFS 调用 |
-|---|---|
-| Library scope | ByNamespace(library_id) |
-| Folder scope | UnderPath(library_id, relative_folder) |
-| path_prefix | 先规范化为该 Library 下路径，再用 UnderPath 或 PathPrefix |
-| extensions / types | ByExtension(exts)；业务类别先展开为扩展名集合 |
-| 精确文件集合 | ByDocumentId(完整 ID 集合) |
-| 文件名/路径前后缀 | NamePrefix/NameSuffix/PathPrefix/PathSuffix |
-| caseStrict=true | TextMatch(pattern, case_sensitive=True) |
-| caseStrict=false | TextMatch(pattern, smart_case=True) |
-| wholeWord | TextMatch(..., whole_word=True) |
-| 语义搜索 | search(mode="vector" 或 "hybrid", select="doc_id" 或 "chunk") |
-| 原始全文 | query([ByDocumentId(id)], select="doc") |
+| 应用意图 | MFS 入口 |
+| --- | --- |
+| 精确文字、正则、名称/路径匹配 | grep |
+| 查看已知文档 | read |
+| 原 semantic/hybrid 意图 | search(mode="hybrid") |
+| 只按词频排序 | search(mode="bm25") |
+| 纯向量排序 | search(mode="vector") |
 
-外部权限范围始终与用户筛选相交。一个 filter 内的多个值为 OR，多个 filter 为 AND。
-多个 Folder 范围使用 `AnyOf([UnderPath(...), UnderPath(...)])`；每路 Milvus 内执行 OR，
-再与其他顶层过滤取交集。不要把多个 UnderPath 并排作为顶层过滤，那会是 AND。
-全 Library OR 也可直接用 ByNamespace。
+旧 public keyword 使用磁盘/派生文字 grep，并不是 BM25；旧 public semantic 通常是 dense + BM25 的 hybrid。新 MFS 与旧 daemon 的切片和候选量不完全相同，不能因使用 Milvus Lite 就宣称排名一致。
 
-原 daemon `op_search` 对扩展名做最多 200 条候选的 over-fetch 后过滤。
-改用 ByExtension 后，Milvus 的每一路都在 top-k 前过滤，稀有 PDF 不会先被其他类型挤掉。
-输入值 `%`、`_`、引号、反斜杠和 Unicode 保持字面意义，不拼接原始 Milvus 表达式。
+新实现每 namespace 独立 collection，筛选在后端 top-k 前应用；跨 namespace 使用排名合并。旧 daemon 的扩展名过滤、hybrid 候选数和旧 Chunker 窗口需要通过实际检索效果评估迁移。
 
-结果自带 Chunk 文本、snapshot_id 与 SourceLocation。UI 截取 snippet 或显示页码时不查询 SQLite。
-若需要全文，在搜索完成后显式 query；返回的当前全文与较旧搜索 snapshot_id 可能不同，应用应保留这种区别。
-检索不会读取 live 文件；点击打开源文件后的定位新鲜度仍由应用负责。
+## 规则与状态
 
-## 状态与调用顺序
+旧 Python Scanner 会读取各根的 .gitignore/.mfsignore，其他应用搜索入口的解释并不统一。应用显式导入旧规则，并将 sibling、附件目录等特殊关系转成稳定规则；不能未经转换把旧简化 fnmatch 当成新规则语义。
 
-1. watcher/用户写入后调用 sync 或 upsert；ACK 只表示已接收。
-2. UI 分页读取 list_document_statuses(namespace, path=...)，展示阶段、进度、error_detail、源 hash 和版本关系。
-   listFiles 可使用这些轻量元数据；scope_status 做范围统计，index_configuration 返回有效索引配置。
-   stage=drop、doc_id 为空的是 namespace 清理任务，不作为普通文档展示；失败同样可 retry。
-3. 文本搜索用 query(TextMatch)，即使 dense 失败仍能用新文本。
-4. 交互式索引搜索通常用 eventual；确实要求本次索引追上时用 strong + timeout。
-5. 可重试失败调用 retry；强制重新 OCR 调用 reprocess；取消调用 cancel。
-6. 用 set_active_scopes 传入打开的 Folder；daemon 退出时关闭产物句柄并 close。
-   用户取消跨自动 sync 保留；executing 用来展示实际执行是否仍在退出。
+同一有效规则用于 MFS 和应用 fallback。sync(path) 只是本次观察范围，不是永久白名单。应用选择只搜原件或派生件时，应登记相应规则。
 
-strong 是整个实例的 ready，任何 Library 的失败都会让 strong 等待；不按搜索范围或通道另算。
-删除/移出授权范围时应用应立即缩小可搜索 scope；异步删除 ACK 不表示旧 Milvus rows 已经消失。
-需要确认本次清理完成时用 wait(receipt)，不受其他 Library 的失败拖累。
-相同内容移动/复制仍走普通 sync，推理缓存由 MFS 负责；身份、SQLite 和 Milvus 元数据更新保留。
+用 document_status 的 revision/text_revision/indexed_revision、stage/state 和 wait(receipt) 判断具体操作。整体 status.ready 不等于某个 PDF 的文字可用；grep 命中也不等于向量已完成。不新增 ready 系统。
 
-## 应用迁移验收
+## 应用验收
 
-MFS 测试已覆盖联合发布、grep 独立、重试/崩溃恢复、源身份与前置过滤、symlink/ignore。
-下面仍需要在 StashBase 应用迁移时执行：
+- 替换旧 daemon 调用，绑定实际 Adapter，移除已交给 MFS 的重复处理/索引调度。
+- 保留播放转换、源操作、产品决策及 fallback。
+- 验证多 Folder 范围、规则和原件点击跳转。
+- 验证真实 OCR/转录/embedding 的线程调用、取消及失败恢复。
+- 用代表性 corpus 运行 retrieval eval，并测量首次索引吞吐和检索延迟。
 
-- 删除 Node/daemon 中重复的 Preparation/indexing 调度与完成状态，以 MFS 状态为准。
-- 包装真实 OCR/转录/embedding 客户端，检查线程调用、凭据、超时与取消退出。
-- 对照 Library/Folder/Chat/MCP 授权范围与多 Folder OR 的实际调用。
-- 在现有 corpus 上运行 retrieval eval，测量 grep 延迟、首次索引吞吐和失败恢复成本。
-
-这部分需要改 StashBase 应用代码；当前 MFS 工作区的单元/集成测试不替代其端到端评估。
+MFS 单元/集成测试不能替代这些应用验收。

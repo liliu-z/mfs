@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from mfs import MFS, CapabilityUnavailable, IndexUnavailable, Utf8TextProcessor, WaitTimeout
+from mfs import MFS, CapabilityUnavailable, Utf8TextProcessor, WaitTimeout
 
 
 class TinyEmbedder:
@@ -25,46 +25,68 @@ class TinyEmbedder:
 
 
 def test_dense_and_hybrid_then_open_without_embedder(tmp_path: Path) -> None:
-    state = tmp_path / "state"
-    mfs = MFS.open(state, processors=[Utf8TextProcessor()], embedder=TinyEmbedder())
-    mfs.create_namespace("n", "internal")
-    mfs.upsert("n", "cat.txt", b"cat cat")
-    mfs.upsert("n", "dog.txt", b"dog dog")
-    assert mfs.search("cat", mode="vector").items[0].value.document_id.doc_id == "cat.txt"
-    assert mfs.search("dog", mode="hybrid").items[0].value.document_id.doc_id == "dog.txt"
-    mfs.close()
+    from mfs import InvalidConfiguration
 
-    without = MFS.open(state, processors=[Utf8TextProcessor()])
+    state = tmp_path / "state"
+    mfs = MFS.open(state)
     try:
-        status = without.status()
-        assert status.dense_enabled and not status.dense_available
-        assert without.search("cat", mode="bm25").items
+        mfs.create_namespace(
+            "n", "internal", processors=[Utf8TextProcessor()], embedder=TinyEmbedder()
+        )
+        mfs.upsert("n", "cat.txt", b"cat cat")
+        mfs.upsert("n", "dog.txt", b"dog dog")
+        assert (
+            mfs.search("cat", mode="vector", timeout=10).items[0].value.document_id.doc_id
+            == "cat.txt"
+        )
+        assert (
+            mfs.search("dog", mode="hybrid", timeout=10).items[0].value.document_id.doc_id
+            == "dog.txt"
+        )
+    finally:
+        mfs.close()
+    without = MFS.open(state)
+    try:
+        assert without.status().dense_enabled and not without.status().dense_available
+        assert without.search("cat", mode="bm25", timeout=10).items
+        with pytest.raises(InvalidConfiguration):
+            without.open_namespace("n", processors=[Utf8TextProcessor()])
         with pytest.raises(CapabilityUnavailable):
-            without.search("cat", mode="vector")
-        assert without.upsert("n", "cat.txt", b"cat cat").outcome == "unchanged"
-        assert not without.upsert("n", "cat.txt", b"changed cat").index_ready
+            without.search("cat", mode="vector", timeout=10)
+        receipt = without.upsert("n", "cat.txt", b"changed cat")
         with pytest.raises(WaitTimeout):
-            without.wait_ready(0.5)
-        assert without.query(select="doc").items[0].value.text == "changed cat"
+            without.wait(receipt, 0.1)
+        assert not without.search("cat", mode="bm25", consistency="eventual").items
+        without.open_namespace("n", processors=[Utf8TextProcessor()], embedder=TinyEmbedder())
+        without.wait(receipt, 10)
+        assert without.grep(select="doc").items[0].value.text == "changed cat"
     finally:
         without.close()
 
 
 def test_reindex_upgrades_bm25_index_to_dense(tmp_path: Path) -> None:
-    state = tmp_path / "state"
-    bm25 = MFS.open(state, processors=[Utf8TextProcessor()])
-    bm25.create_namespace("n", "internal")
-    bm25.upsert("n", "cat.txt", b"cat")
-    bm25.wait_ready(10)
-    bm25.close()
+    from mfs import NamespaceCompatibilityError
 
-    upgrading = MFS.open(state, processors=[Utf8TextProcessor()], embedder=TinyEmbedder())
+    state = tmp_path / "state"
+    mfs = MFS.open(state)
     try:
-        assert upgrading.status().index_state == "mismatch"
-        with pytest.raises(IndexUnavailable):
-            upgrading.search("cat", mode="bm25")
-        report = upgrading.reindex()
-        assert report.dense_enabled
-        assert upgrading.search("cat", mode="vector").items
+        mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()])
+        mfs.wait(mfs.upsert("n", "cat.txt", b"cat"), 10)
     finally:
-        upgrading.close()
+        mfs.close()
+    mfs = MFS.open(state)
+    try:
+        with pytest.raises(NamespaceCompatibilityError):
+            mfs.open_namespace("n", processors=[Utf8TextProcessor()], embedder=TinyEmbedder())
+        assert mfs.search("cat", mode="bm25", timeout=10).items
+        report = mfs.reindex(
+            "n",
+            timeout=10,
+            processors=[Utf8TextProcessor()],
+            embedder=TinyEmbedder(),
+            indexing="hybrid",
+        )
+        assert report.dense_enabled
+        assert mfs.search("cat", mode="vector", timeout=10).items
+    finally:
+        mfs.close()

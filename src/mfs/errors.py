@@ -34,6 +34,14 @@ class NamespaceConflict(MFSError):
     code = "NamespaceConflict"
 
 
+class NamespaceCompatibilityError(MFSError):
+    code = "NamespaceCompatibilityError"
+
+
+class RuleConflict(MFSError):
+    code = "RuleConflict"
+
+
 class WrongNamespaceKind(MFSError):
     code = "WrongNamespaceKind"
 
@@ -52,6 +60,10 @@ class RootOverlap(MFSError):
 
 class SourceUnavailable(MFSError):
     code = "SourceUnavailable"
+
+
+class SourceExcluded(MFSError):
+    code = "SourceExcluded"
 
 
 class SourceChanged(MFSError):
@@ -108,6 +120,10 @@ class InstanceLocked(MFSError):
 
 class SchemaVersionUnsupported(MFSError):
     code = "SchemaVersionUnsupported"
+
+
+class MigrationRequired(MFSError):
+    code = "MigrationRequired"
 
 
 class CorruptState(MFSError):

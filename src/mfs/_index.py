@@ -21,6 +21,7 @@ OUTPUT_FIELDS = [
     "doc_id",
     "ordinal",
     "text",
+    "text_hash",
     "text_start",
     "text_end",
     "snapshot_id",
@@ -47,6 +48,7 @@ class IndexRow(TypedDict):
     source_location: NotRequired[dict[str, Any]]
     media_type: NotRequired[str]
     incarnation: NotRequired[str]
+    text_hash: NotRequired[str]
 
 
 class SearchHit(TypedDict):
@@ -85,12 +87,30 @@ def index_config(chunker: dict[str, object], dense: dict[str, object] | None) ->
 class ChunkIndex:
     def __init__(self, path: Path) -> None:
         self._path = str(path)
+        self.collection_name = COLLECTION
+        self._owns_client = True
         try:
             self.client: Any = MilvusClient(uri=str(path))
         except Exception as error:
             raise IndexFailed(f"failed to open Milvus Lite: {error}") from error
 
+    def collection(self, name: str) -> ChunkIndex:
+        handle = object.__new__(ChunkIndex)
+        handle._path = self._path
+        handle.client = self.client
+        handle.collection_name = name
+        handle._owns_client = False
+        return handle
+
+    def drop(self) -> None:
+        try:
+            self.client.drop_collection(self.collection_name)
+        except Exception as error:
+            raise IndexFailed(f"failed to drop collection: {error}") from error
+
     def close(self) -> None:
+        if not self._owns_client:
+            return
         try:
             self.client.close()
         except Exception as error:
@@ -101,15 +121,15 @@ class ChunkIndex:
 
     def load(self) -> None:
         try:
-            self.client.load_collection(COLLECTION)
+            self.client.load_collection(self.collection_name)
         except Exception as error:
             raise IndexFailed(f"failed to load chunk collection: {error}") from error
 
     def has_valid_collection(self, *, dense_dimension: int | None) -> bool:
         try:
-            if not self.client.has_collection(COLLECTION):
+            if not self.client.has_collection(self.collection_name):
                 return False
-            description = self.client.describe_collection(COLLECTION)
+            description = self.client.describe_collection(self.collection_name)
             fields = {f["name"]: f for f in description["fields"]}
             expected = set(OUTPUT_FIELDS) | {"id", "sparse_vector"}
             if dense_dimension is not None:
@@ -159,10 +179,10 @@ class ChunkIndex:
             }
             if dense_dimension is not None:
                 expected_indexes["dense_vector"] = ("AUTOINDEX", "COSINE")
-            if set(self.client.list_indexes(COLLECTION)) != set(expected_indexes):
+            if set(self.client.list_indexes(self.collection_name)) != set(expected_indexes):
                 return False
             for name, expected_index in expected_indexes.items():
-                actual = self.client.describe_index(COLLECTION, name)
+                actual = self.client.describe_index(self.collection_name, name)
                 if (actual.get("index_type"), actual.get("metric_type")) != expected_index:
                     return False
             return True
@@ -171,8 +191,8 @@ class ChunkIndex:
 
     def recreate(self, *, dense_dimension: int | None) -> None:
         try:
-            if self.client.has_collection(COLLECTION):
-                self.client.drop_collection(COLLECTION)
+            if self.client.has_collection(self.collection_name):
+                self.client.drop_collection(self.collection_name)
             schema = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=False)
             schema.add_field(
                 field_name="id", datatype=DataType.VARCHAR, max_length=64, is_primary=True
@@ -181,6 +201,7 @@ class ChunkIndex:
             schema.add_field(field_name="doc_id", datatype=DataType.VARCHAR, max_length=2048)
             for name, length in (
                 ("snapshot_id", 64),
+                ("text_hash", 64),
                 ("incarnation", 64),
                 ("media_type", 255),
                 ("source_path", 2048),
@@ -238,9 +259,9 @@ class ChunkIndex:
                 field_name="doc_id", index_name="doc_id_scalar", index_type="INVERTED"
             )
             self.client.create_collection(
-                collection_name=COLLECTION, schema=schema, index_params=indexes
+                collection_name=self.collection_name, schema=schema, index_params=indexes
             )
-            self.client.load_collection(COLLECTION)
+            self.client.load_collection(self.collection_name)
         except Exception as error:
             raise IndexFailed(f"failed to create chunk collection: {error}") from error
 
@@ -256,7 +277,7 @@ class ChunkIndex:
                 f"or ordinal >= {len(rows)})"
             )
             try:
-                self.client.delete(COLLECTION, filter=expression)
+                self.client.delete(self.collection_name, filter=expression)
             except Exception as error:
                 raise IndexFailed(f"failed to retire previous chunks: {error}") from error
         else:
@@ -284,6 +305,7 @@ class ChunkIndex:
                 "doc_id": doc,
                 "ordinal": row["ordinal"],
                 "text": row["text"],
+                "text_hash": row.get("text_hash", blake3.blake3(row["text"].encode()).hexdigest()),
                 "text_start": row["text_start"],
                 "text_end": row["text_end"],
                 "snapshot_id": snapshot,
@@ -301,7 +323,7 @@ class ChunkIndex:
             data.append(item)
         try:
             for start in range(0, len(data), 1000):
-                self.client.upsert(COLLECTION, data[start : start + 1000])
+                self.client.upsert(self.collection_name, data[start : start + 1000])
         except Exception as error:
             raise IndexFailed(f"failed to upsert chunks: {error}") from error
 
@@ -313,23 +335,50 @@ class ChunkIndex:
         if incarnation is not None:
             expression += f" and incarnation == {_literal(incarnation)}"
         try:
-            self.client.delete(COLLECTION, filter=expression)
+            self.client.delete(self.collection_name, filter=expression)
         except Exception as error:
             raise IndexFailed(f"failed to delete document chunks: {error}") from error
+
+    def vector_candidates(self, hashes: Sequence[str]) -> list[dict[str, Any]]:
+        if not hashes:
+            return []
+        try:
+            return self.client.query(
+                self.collection_name,
+                filter="text_hash in " + json.dumps(list(hashes)),
+                output_fields=["namespace", "doc_id", "snapshot_id", "text_hash", "dense_vector"],
+                limit=16384,
+            )
+        except Exception as error:
+            raise IndexFailed(f"failed to read reusable vectors: {error}") from error
+
+    def publish(self, document_id: DocumentId, snapshot: str, incarnation: str, count: int) -> None:
+        expression = (
+            f"({_documents_expression([document_id])}) and "
+            f"(snapshot_id != {_literal(snapshot)} or incarnation != {_literal(incarnation)} "
+            f"or ordinal >= {count})"
+        )
+        try:
+            self.client.delete(self.collection_name, filter=expression)
+        except Exception as error:
+            raise IndexFailed(f"failed to retire previous chunks: {error}") from error
+        self.flush()
+        if self.count_document(document_id) != count:
+            raise IndexFailed("publication is missing chunk rows")
 
     def delete_namespace(self, namespace: str, *, incarnation: str | None = None) -> None:
         try:
             expression = f"namespace == {_literal(namespace)}"
             if incarnation is not None:
                 expression += f" and incarnation == {_literal(incarnation)}"
-            self.client.delete(COLLECTION, filter=expression)
+            self.client.delete(self.collection_name, filter=expression)
             self.flush()
         except Exception as error:
             raise IndexFailed(f"failed to delete namespace chunks: {error}") from error
 
     def flush(self) -> None:
         try:
-            self.client.flush(COLLECTION)
+            self.client.flush(self.collection_name)
         except Exception as error:
             raise IndexFailed(f"failed to flush chunks: {error}") from error
 
@@ -339,7 +388,9 @@ class ChunkIndex:
             f"doc_id == {_literal(document_id.doc_id)}"
         )
         try:
-            rows = self.client.query(COLLECTION, filter=expression, output_fields=["count(*)"])
+            rows = self.client.query(
+                self.collection_name, filter=expression, output_fields=["count(*)"]
+            )
             return int(rows[0]["count(*)"]) if rows else 0
         except Exception as error:
             raise IndexFailed(f"failed to count document chunks: {error}") from error
@@ -348,7 +399,7 @@ class ChunkIndex:
         result: list[dict[str, object]] = []
         try:
             iterator = self.client.query_iterator(
-                collection_name=COLLECTION,
+                collection_name=self.collection_name,
                 batch_size=1000,
                 filter='id != ""',
                 output_fields=OUTPUT_FIELDS,
@@ -393,7 +444,7 @@ class ChunkIndex:
         for expression in compiled:
             try:
                 raw = self.client.search(
-                    collection_name=COLLECTION,
+                    collection_name=self.collection_name,
                     data=[text_or_vector],
                     anns_field="sparse_vector" if mode == "bm25" else "dense_vector",
                     filter=expression,

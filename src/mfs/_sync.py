@@ -104,6 +104,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
     info = mfs._required_namespace(namespace)
     if info.kind != "external" or info.root is None:
         raise WrongNamespaceKind("sync requires an external namespace")
+    mfs._require_modern_namespace(namespace)
     report_path = requested
     changed: set[DocumentId] = set()
     removed: set[DocumentId] = set()
@@ -125,17 +126,22 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
         skipped[(relative, reason)] = SyncSkipped(relative, cast(Any, reason))
 
     def result() -> SyncReport:
+        removed.difference_update(changed)
         operation_id = uuid.uuid4().hex
         with mfs._condition, mfs._catalog.transaction():
             identities = changed | removed | {DocumentId(namespace, p) for p in seen}
             identities.update(
                 i
-                for i, job in mfs._targets.items()
+                for i, job in mfs._tasks.targets.items()
                 if i.namespace == namespace
                 and job["state"] != "succeeded"
                 and mfs._under(i.doc_id, requested)
             )
-            revisions = [str(mfs._targets[i]["revision"]) for i in identities if i in mfs._targets]
+            revisions = [
+                str(mfs._tasks.targets[i]["revision"])
+                for i in identities
+                if i in mfs._tasks.targets
+            ]
             mfs._catalog.add_wait_operation(operation_id, revisions, complete)
         return SyncReport(
             namespace,
@@ -145,7 +151,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
             tuple(sorted(removed)),
             tuple(failures[k] for k in sorted(failures)),
             tuple(skipped[k] for k in sorted(skipped)),
-            not mfs._pending and mfs._state == "ready",
+            not mfs._tasks.pending and mfs._state == "ready",
             operation_id,
         )
 
@@ -175,24 +181,31 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
                 return False
 
         with mfs._condition:
-            ns = dict(mfs._namespaces[namespace])
+            ns = dict(mfs._tasks.namespaces[namespace])
             if ns.get("root_actual") != str(root):
+                for other, record in mfs._tasks.namespaces.items():
+                    if other != namespace and record["kind"] == "external":
+                        other_root = Path(record["root"]).resolve()
+                        if (
+                            root == other_root
+                            or root in other_root.parents
+                            or other_root in root.parents
+                        ):
+                            raise RootOverlap(f"root now overlaps namespace {other!r}")
                 ns.update(root_actual=str(root), binding=uuid.uuid4().hex)
                 updates: list[tuple[DocumentId, dict[str, Any]]] = []
                 with mfs._catalog.transaction():
                     mfs._catalog.put_namespace(namespace, ns)
-                    for identity, previous in mfs._targets.items():
+                    for identity, previous in mfs._tasks.targets.items():
                         if identity.namespace == namespace and previous["kind"] == "upsert":
-                            target = dict(
-                                previous,
-                                state="cancelled",
-                                error="root binding changed; awaiting reconciliation",
-                            )
+                            target = dict(mfs._delete_job(), incarnation=previous["incarnation"])
+                            mfs._catalog.delete_document(namespace, identity.doc_id)
                             mfs._catalog.put_target(namespace, identity.doc_id, target)
                             updates.append((identity, target))
-                mfs._namespaces[namespace] = ns
+                mfs._tasks.namespaces[namespace] = ns
                 for identity, target in updates:
-                    mfs._remember(identity, target)
+                    removed.add(identity)
+                    mfs._tasks.remember(identity, target)
                 requested = "."  # A new root target changes membership for the whole namespace.
 
         def file(descriptor: int, relative: str, *, exact: bool) -> None:
@@ -203,16 +216,16 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
             protected.add(relative)
             identity = DocumentId(namespace, relative)
             metadata = os.fstat(descriptor)
-            if mfs._excluded(relative):
+            if mfs._excluded(namespace, relative):
                 nonmembers.add(relative)
                 skip(relative, "excluded")
                 return
-            maximum = mfs._sync_policy.max_file_bytes
+            maximum = ns.get("max_file_bytes")
             if maximum is not None and metadata.st_size > maximum:
                 nonmembers.add(relative)
                 skip(relative, "too_large")
                 return
-            previous = mfs._targets.get(identity)
+            previous = mfs._tasks.targets.get(identity)
             if (
                 previous
                 and previous["kind"] == "upsert"
@@ -223,23 +236,30 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
                 source = previous.get("source", {})
                 suffix = suffix_for(relative)
                 processor = next(
-                    (p for p in mfs._processors if suffix in mfs._processor_suffixes[id(p)]), None
+                    (p for p in ns["manifest"]["processors"] if suffix in p["suffix_media_types"]),
+                    None,
                 )
                 if (
                     processor is not None
                     and previous.get("binding") == ns["binding"]
                     and source.get("size") == metadata.st_size
                     and source.get("mtime_ns") == metadata.st_mtime_ns
-                    and previous.get("processor") == mfs._processor_descriptions[id(processor)]
+                    and previous.get("processor")
+                    == {k: processor[k] for k in ("id", "version", "options")}
                 ):
                     return
             staged = None
             try:
                 os.lseek(descriptor, 0, os.SEEK_SET)
                 mfs._select_processor(
-                    relative, root / relative, None, None, head=os.read(descriptor, 64 * 1024)
+                    namespace,
+                    relative,
+                    root / relative,
+                    None,
+                    None,
+                    head=os.read(descriptor, 64 * 1024),
                 )
-                staged = mfs._stage_descriptor(descriptor)
+                staged = mfs._stage_descriptor(descriptor, root / relative)
                 if not root_stable():
                     raise SourceChanged("root changed during observation")
                 # Reopen the canonical relative identity without following parent symlinks.
@@ -253,6 +273,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
                 if report.outcome != "unchanged":
                     changed.add(identity)
             except UnsupportedMediaType:
+                nonmembers.add(relative)
                 skip(relative, "unsupported_media_type")
             except Exception as error:
                 fail(relative, error)
@@ -265,7 +286,11 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
             try:
                 real = (root / relative).resolve(strict=True)
                 canonical = real.relative_to(root).as_posix()
-                if not real.is_file() or mfs._excluded(relative) or mfs._excluded(canonical):
+                if (
+                    not real.is_file()
+                    or mfs._excluded(namespace, relative)
+                    or mfs._excluded(namespace, canonical)
+                ):
                     skip(relative, "symlink")
                     return
                 if canonical in seen:
@@ -279,6 +304,13 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
             except (OSError, ValueError, RuntimeError):
                 skip(relative, "symlink")
 
+        may_reinclude = any(rule["action"] == "include" for rule in ns["rules"])
+
+        def prune(relative: str, directory: bool) -> bool:
+            return (not directory or not may_reinclude) and mfs._excluded(
+                namespace, relative, directory=directory
+            )
+
         def walk(descriptor: int, relative_dir: str) -> None:
             try:
                 if os.name == "nt" and not files.path(descriptor).is_relative_to(root):
@@ -289,12 +321,12 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
                     relative = (
                         entry.name if relative_dir == "." else relative_dir + "/" + entry.name
                     )
-                    if mfs._excluded(relative):
-                        nonmembers.add(relative)
-                        skip(relative, "excluded")
-                        continue
                     try:
                         metadata = entry.stat(follow_symlinks=False)
+                        if prune(relative, stat.S_ISDIR(metadata.st_mode)):
+                            nonmembers.add(relative)
+                            skip(relative, "excluded")
+                            continue
                         if (
                             stat.S_ISLNK(metadata.st_mode)
                             or getattr(metadata, "st_file_attributes", 0) & 0x400
@@ -331,7 +363,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
         try:
             # A final file alias is permitted; parent directory aliases are not traversed.
             candidate = root / requested
-            if requested != "." and mfs._excluded(requested):
+            if requested != "." and prune(requested, candidate.is_dir()):
                 nonmembers.add(requested)
                 skip(requested, "excluded")
             elif requested != "." and candidate.is_symlink():
@@ -340,7 +372,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
                 descriptor, actual_requested = _open_relative(root_fd, requested)
                 try:
                     metadata = os.fstat(descriptor)
-                    if requested != "." and mfs._excluded(actual_requested):
+                    if requested != "." and prune(actual_requested, stat.S_ISDIR(metadata.st_mode)):
                         nonmembers.add(actual_requested)
                         skip(actual_requested, "excluded")
                     elif stat.S_ISDIR(metadata.st_mode):
@@ -361,7 +393,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
         with mfs._condition:
             existing = [
                 i
-                for i, j in mfs._targets.items()
+                for i, j in mfs._tasks.targets.items()
                 if i.namespace == namespace and j["kind"] == "upsert"
             ]
         seen_keys = {key(s) for s in seen}
@@ -377,7 +409,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
             spelling_changed = (
                 not case_sensitive and key(relative) in seen_keys and relative not in seen
             )
-            if (spelling_changed or excluded or (absent and not replacement_child)) and (
+            if (spelling_changed or excluded or absent or replacement_child) and (
                 mfs._remove(identity).outcome == "removed"
             ):
                 removed.add(identity)

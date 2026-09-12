@@ -1,40 +1,40 @@
 # pyright: reportPrivateUsage=false
 from __future__ import annotations
 
-from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from mfs import MFS, DocumentId, IndexFailed, StorageFailed, Utf8TextProcessor, WaitTimeout
-from mfs._index import IndexRow
 
 
-def test_failed_publication_keeps_new_grep_text_and_old_index(
+def test_failed_publication_keeps_new_grep_text_and_revokes_old_index(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    mfs = MFS.open(tmp_path / "state", processors=[Utf8TextProcessor()])
+    mfs = MFS.open(tmp_path / "state")
+    for registered in mfs.list_namespaces():
+        mfs.open_namespace(registered.namespace, processors=[Utf8TextProcessor()])
     try:
-        mfs.create_namespace("n", "internal")
+        mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()])
         mfs.upsert("n", "a.txt", b"old snapshot")
         mfs.wait_ready(10)
-        original = mfs._index.replace
+        original = mfs._namespace_index("n").publish
 
-        def fail(identity: DocumentId, rows: Sequence[IndexRow]) -> None:
+        def fail(identity: DocumentId, snapshot: str, incarnation: str, count: int) -> None:
             raise IndexFailed("injected publication failure")
 
-        monkeypatch.setattr(mfs._index, "replace", fail)
+        monkeypatch.setattr(mfs._namespace_index("n"), "publish", fail)
         mfs.upsert("n", "a.txt", b"new snapshot")
         with mfs._condition:
             assert mfs._condition.wait_for(
-                lambda: mfs._targets[DocumentId("n", "a.txt")]["state"] == "failed", 5
+                lambda: mfs._tasks.targets[DocumentId("n", "a.txt")]["state"] == "failed", 5
             )
-        assert mfs.query(select="doc").items[0].value.text == "new snapshot"
-        assert mfs.search("old", mode="bm25", consistency="eventual").items
+        assert mfs.grep(select="doc").items[0].value.text == "new snapshot"
+        assert not mfs.search("old", mode="bm25", consistency="eventual").items
         with pytest.raises(WaitTimeout):
             mfs.search("new", mode="bm25", timeout=0)
-        monkeypatch.setattr(mfs._index, "replace", original)
+        monkeypatch.setattr(mfs._namespace_index("n"), "publish", original)
         mfs.retry(DocumentId("n", "a.txt"))
         mfs.wait_ready(10)
         assert mfs.search("new", mode="bm25").items
@@ -46,9 +46,11 @@ def test_failed_publication_keeps_new_grep_text_and_old_index(
 def test_milvus_success_before_completion_commit_replays_same_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    mfs = MFS.open(tmp_path / "state", processors=[Utf8TextProcessor()])
+    mfs = MFS.open(tmp_path / "state")
+    for registered in mfs.list_namespaces():
+        mfs.open_namespace(registered.namespace, processors=[Utf8TextProcessor()])
     try:
-        mfs.create_namespace("n", "internal")
+        mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()])
         original = mfs._catalog.put_target
         failed = False
 
@@ -63,7 +65,7 @@ def test_milvus_success_before_completion_commit_replays_same_rows(
         mfs.upsert("n", "a.txt", b"committed text")
         mfs.wait_ready(10)
         assert failed
-        assert mfs._index.count_document(DocumentId("n", "a.txt")) == 1
+        assert mfs._namespace_index("n").count_document(DocumentId("n", "a.txt")) == 1
         assert len(mfs.search("committed", mode="bm25").items) == 1
     finally:
         mfs.close()
@@ -73,28 +75,29 @@ def test_failed_stage_survives_reopen_without_reprocessing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "state"
-    mfs = MFS.open(path, processors=[Utf8TextProcessor()])
-    mfs.create_namespace("n", "internal")
+    mfs = MFS.open(path)
+    for registered in mfs.list_namespaces():
+        mfs.open_namespace(registered.namespace, processors=[Utf8TextProcessor()])
+    mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()])
 
-    def fail(identity: DocumentId, rows: Sequence[IndexRow]) -> None:
+    def fail(identity: DocumentId, snapshot: str, incarnation: str, count: int) -> None:
         error = IndexFailed("injected publication failure")
         raise error from error  # Some backend errors contain self-referential cause chains.
 
-    monkeypatch.setattr(mfs._index, "replace", fail)
+    monkeypatch.setattr(mfs._namespace_index("n"), "publish", fail)
     mfs.upsert("n", "a.txt", b"persistent")
     with mfs._condition:
         assert mfs._condition.wait_for(
-            lambda: mfs._targets[DocumentId("n", "a.txt")]["state"] == "failed", 5
+            lambda: mfs._tasks.targets[DocumentId("n", "a.txt")]["state"] == "failed", 5
         )
-    snapshot = mfs.query(select="doc").items[0].value.snapshot_id
+    snapshot = mfs.grep(select="doc").items[0].value.snapshot_id
     mfs.close()
-    reopened = MFS.open(
-        path
-    )  # The already processed input needs no Processor to retry publication.
+    reopened = MFS.open(path)
     try:
+        reopened.open_namespace("n", processors=[Utf8TextProcessor()])
         reopened.retry(DocumentId("n", "a.txt"))
         reopened.wait_ready(10)
-        assert reopened.query(select="doc").items[0].value.snapshot_id == snapshot
+        assert reopened.grep(select="doc").items[0].value.snapshot_id == snapshot
         assert reopened.search("persistent", mode="bm25").items
     finally:
         reopened.close()

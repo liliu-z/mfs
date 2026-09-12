@@ -13,8 +13,6 @@ from .types import ChunkRange, ProcessedDocument, SourceMap, SourceSpan
 
 class Utf8TextProcessor:
     cache_scope = "content"
-    concurrency = 2
-    workload = "light"
 
     def __init__(self) -> None:
         self.id: str = "utf8-text"
@@ -47,12 +45,13 @@ class Utf8TextProcessor:
                 )
             )
             offset = end
-        return ProcessedDocument(text=text, source_map=SourceMap(version=1, spans=tuple(spans)))
+        return ProcessedDocument(
+            text=text, source_map=SourceMap(version=1, spans=tuple(spans)), text_path=staged_path
+        )
 
 
 class PdfProcessor:
     cache_scope = "content"
-    workload = "heavy"
 
     def __init__(self) -> None:
         self.id: str = "pdf"
@@ -125,6 +124,60 @@ class DefaultChunker:
             next_target = max(start + 1, end - 512)
             start = _boundary_at_or_after(boundaries, next_target)
         return tuple(ranges)
+
+
+class DocxProcessor:
+    """Basic DOCX paragraph/table text; applications can supply richer extraction."""
+
+    cache_scope = "content"
+
+    def __init__(self) -> None:
+        self.id: str = "docx"
+        self.version: str = "1"
+        self.options: JSONValue = {}
+        self.media_types: tuple[str, ...] = (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        self.suffix_media_types: Mapping[str, str] = MappingProxyType(
+            {".docx": self.media_types[0]}
+        )
+
+    def sniff(self, head: bytes) -> str | None:
+        del head
+        return None
+
+    def process(self, staged_path: Path, media_type: str) -> ProcessedDocument:
+        import xml.etree.ElementTree as ET
+        import zipfile
+
+        del media_type
+        with zipfile.ZipFile(staged_path) as archive:
+            root = ET.fromstring(archive.read("word/document.xml"))
+        word = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+        texts: list[str] = []
+        spans: list[SourceSpan] = []
+        offset = 0
+        for number, paragraph in enumerate(root.iter(word + "p"), 1):
+            text = (
+                "".join(
+                    node.text or ""
+                    if node.tag == word + "t"
+                    else "\t"
+                    if node.tag == word + "tab"
+                    else "\n"
+                    if node.tag in (word + "br", word + "cr")
+                    else ""
+                    for node in paragraph.iter()
+                )
+                + "\n"
+            )
+            end = offset + len(text.encode())
+            texts.append(text)
+            spans.append(
+                SourceSpan(offset, end, {"kind": "paragraphs", "start": number, "end": number})
+            )
+            offset = end
+        return ProcessedDocument("".join(texts), SourceMap(1, tuple(spans)))
 
 
 def _boundaries(text: str) -> tuple[int, ...]:
