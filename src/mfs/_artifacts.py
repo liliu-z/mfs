@@ -9,16 +9,16 @@ import time
 import uuid
 from collections.abc import Iterator, Mapping
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, BinaryIO, cast
+from typing import Any, BinaryIO, cast
 
 import blake3
 
-from ._json import canonical_json, load_json
-from .errors import CorruptState, InvalidQuery
+from ._catalog import Catalog
+from ._json import canonical_json, compact_json, load_json
+from ._lifecycle import Lifecycle
+from ._platform import fsync_directory
+from .errors import CorruptState, InvalidQuery, SourceUnavailable, StorageFailed
 from .types import GCPolicy, GCReport
-
-if TYPE_CHECKING:
-    from ._core import MFS
 
 
 class ArtifactHandle:
@@ -48,8 +48,10 @@ class ArtifactHandle:
 
 
 class ArtifactStore:
-    def __init__(self, mfs: MFS, policy: GCPolicy) -> None:
-        self.mfs = mfs
+    def __init__(
+        self, root: Path, catalog: Catalog, lifecycle: Lifecycle, policy: GCPolicy
+    ) -> None:
+        self.root, self.catalog, self.lifecycle = root, catalog, lifecycle
         self.policy = policy
         self._collect_lock = threading.Lock()
         self._inventory: Iterator[Path] | None = None
@@ -62,13 +64,34 @@ class ArtifactStore:
             or any(c not in "0123456789abcdef" for c in incarnation)
         ):
             raise CorruptState("invalid namespace storage identity")
-        path = self.mfs._path
+        path = self.root
         for part in ("namespaces", incarnation, area):
             path = path / part
             if path.is_symlink():
                 raise CorruptState("namespace storage cannot traverse symlinks")
             path.mkdir(exist_ok=True)
         return path
+
+    def read_text(self, record: dict[str, Any], *, grep: bool = False) -> str:
+        reference = record.get("grep_ref") if grep else None
+        reference = reference or record.get("text_ref")
+        if reference is None:
+            if "text" in record:  # Legacy catalog migration, removed after schema upgrade.
+                return str(record["text"])
+            raise CorruptState("document has no text reference")
+        path = self.path(reference["path"]) if reference["owned"] else Path(reference["path"])
+        try:
+            from ._text import read_text
+
+            return read_text(path, reference.get("encoding", "utf-8"))
+        except (OSError, UnicodeError) as error:
+            raise SourceUnavailable(f"search text is unavailable: {path}: {error}") from error
+
+    def accept_original(self, staged: Path, incarnation: str, revision: str) -> str:
+        destination = self.directory(incarnation, "originals") / revision
+        os.replace(staged, destination)
+        fsync_directory(destination.parent)
+        return destination.relative_to(self.root).as_posix()
 
     def path(self, relative: str, *, leaf_symlink: bool = False) -> Path:
         parts = PurePosixPath(relative).parts
@@ -82,7 +105,7 @@ class ArtifactStore:
         )
         if not legacy and not namespaced:
             raise CorruptState("reference is outside managed file directories")
-        path = self.mfs._path
+        path = self.root
         for index, part in enumerate(parts):
             path = path / part
             if path.is_symlink() and not (leaf_symlink and index == len(parts) - 1):
@@ -94,7 +117,7 @@ class ArtifactStore:
         return kind + ":" + blake3.blake3(canonical_json(value)).hexdigest()
 
     def cached(self, key: str) -> Any | None:
-        catalog = self.mfs._catalog
+        catalog = self.catalog
         row = catalog.connection.execute(
             "SELECT cache.path,cache.digest FROM cache JOIN artifacts USING(path) "
             "WHERE key=? AND state='live'",
@@ -114,8 +137,8 @@ class ArtifactStore:
             return None
 
     def cache(self, key: str, path: str) -> None:
-        catalog = self.mfs._catalog
-        digest = blake3.blake3((self.mfs._path / path).read_bytes()).hexdigest()
+        catalog = self.catalog
+        digest = blake3.blake3((self.root / path).read_bytes()).hexdigest()
         with catalog.transaction():
             catalog.connection.execute(
                 "INSERT INTO cache VALUES(?,?,?) ON CONFLICT(key) "
@@ -148,19 +171,19 @@ class ArtifactStore:
                 raise InvalidQuery("artifact paths cannot traverse links or '..'")
             if not candidate.is_file():
                 raise InvalidQuery("artifact must be a regular file")
-            area = work_dir.relative_to(self.mfs._path).parts
+            area = work_dir.relative_to(self.root).parts
             directory = self.directory(area[1], "derived")
-            path = (directory / (uuid.uuid4().hex + ".bin")).relative_to(self.mfs._path).as_posix()
-            with self.mfs._catalog.transaction():
-                self.mfs._catalog.register_artifact(path)
-            destination = self.mfs._path / path
+            path = (directory / (uuid.uuid4().hex + ".bin")).relative_to(self.root).as_posix()
+            with self.catalog.transaction():
+                self.catalog.register_artifact(path)
+            destination = self.root / path
             with candidate.open("rb") as source, destination.open("xb") as target:
                 shutil.copyfileobj(source, target, 1024 * 1024)
                 target.flush()
                 os.fsync(target.fileno())
             # Read-only is a contract as well as a useful guard against accidental edits.
             destination.chmod(0o444)
-            self.mfs._fsync_directory(destination.parent)
+            fsync_directory(destination.parent)
             result[name] = path
         return result
 
@@ -174,8 +197,8 @@ class ArtifactStore:
                     yield path
 
         for directory in ("objects", "artifacts", "staging", "work"):
-            yield from walk(self.mfs._path / directory)
-        for namespace in (self.mfs._path / "namespaces").iterdir():
+            yield from walk(self.root / directory)
+        for namespace in (self.root / "namespaces").iterdir():
             if namespace.is_symlink() or not namespace.is_dir():
                 continue
             for area in ("originals", "derived", "work"):
@@ -184,7 +207,7 @@ class ArtifactStore:
                     yield from walk(directory)
 
     def collect(self) -> GCReport:
-        mfs, policy = self.mfs, self.policy
+        lifecycle, policy = self.lifecycle, self.policy
         if not self._collect_lock.acquire(blocking=False):
             return GCReport(busy=True)
         deleted = skipped = 0
@@ -194,17 +217,17 @@ class ArtifactStore:
             for _ in range(policy.cycle_files):
                 if time.monotonic() - started >= policy.cycle_seconds:
                     break
-                if not mfs._condition.acquire(blocking=False):
+                if not lifecycle.condition.acquire(blocking=False):
                     return GCReport(deleted, skipped, busy=True)
                 try:
                     if (
-                        mfs._stopping
-                        or mfs._artifact_readers
-                        or mfs._tasks.executing
-                        or time.monotonic() - mfs._last_activity < policy.idle_seconds
+                        lifecycle.stopping
+                        or lifecycle.readers
+                        or lifecycle.executing
+                        or time.monotonic() - lifecycle.last_activity < policy.idle_seconds
                     ):
                         return GCReport(deleted, skipped, busy=True)
-                    catalog = mfs._catalog
+                    catalog = self.catalog
                     catalog.connection.execute("PRAGMA busy_timeout=0")
                     try:
                         with catalog.transaction():
@@ -233,7 +256,7 @@ class ArtifactStore:
                     finally:
                         catalog.connection.execute("PRAGMA busy_timeout=30000")
                 finally:
-                    mfs._condition.release()
+                    lifecycle.condition.release()
                 if not row:
                     # Inventory is incremental and never follows links. Discovery gets a
                     # fresh grace period, independent of timestamps on arbitrary old files.
@@ -245,7 +268,7 @@ class ArtifactStore:
                         self._inventory = None
                         break
                     with catalog.transaction():
-                        catalog.register_artifact(found.relative_to(mfs._path).as_posix())
+                        catalog.register_artifact(found.relative_to(self.root).as_posix())
                     continue
                 path = str(row[0])
                 target = self.path(path, leaf_symlink=True)
@@ -284,14 +307,47 @@ class ArtifactStore:
         return self.last_report
 
     def maintain(self) -> None:
-        mfs = self.mfs
-        with mfs._condition:
-            while not mfs._stopping:
-                mfs._condition.wait_for(lambda: mfs._stopping, self.policy.interval)
-                if mfs._stopping:
+        lifecycle = self.lifecycle
+        with lifecycle.condition:
+            while not lifecycle.stopping:
+                lifecycle.condition.wait_for(lambda: lifecycle.stopping, self.policy.interval)
+                if lifecycle.stopping:
                     return
-                mfs._condition.release()
+                lifecycle.condition.release()
                 try:
                     self.collect()
                 finally:
-                    mfs._condition.acquire()
+                    lifecycle.condition.acquire()
+
+    def write(self, name: str, value: Any, incarnation: str) -> str:
+        relative = (
+            (self.directory(incarnation, "derived") / (name + "-" + uuid.uuid4().hex + ".json"))
+            .relative_to(self.root)
+            .as_posix()
+        )
+        with self.catalog.transaction():
+            self.catalog.register_artifact(relative)
+        self.write_json(self.root / relative, value)
+        return relative
+
+    def write_json(self, path: Path, value: Any) -> None:
+        temporary = path.parent / ("." + uuid.uuid4().hex + ".tmp")
+        try:
+            with temporary.open("x", encoding="utf-8") as stream:
+                stream.write(compact_json(value))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            fsync_directory(path.parent)
+        except OSError as error:
+            raise StorageFailed(f"failed to persist {path.name}: {error}") from error
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+
+    def read(self, relative: str) -> Any:
+        path = self.path(relative)
+        try:
+            return load_json(path.read_text("utf-8"))
+        except (OSError, ValueError) as error:
+            raise CorruptState(f"cannot read artifact: {error}") from error

@@ -20,7 +20,6 @@ from mfs import (
     ProcessedDocument,
     ProcessingContext,
     SourceMap,
-    Superseded,
     Utf8TextProcessor,
     WaitTimeout,
 )
@@ -139,7 +138,7 @@ def test_cancel_gate_survives_new_source_and_reopen(tmp_path: Path) -> None:
         wait_state(mfs, identity, "cancelled", retired=True)
         new = mfs.upsert("n", "a.txt", b"changed")
         assert mfs.document_status(identity).state == "cancelled"  # type: ignore[union-attr]
-        with pytest.raises(Superseded):
+        with pytest.raises(OperationFailed, match="cancelled"):
             mfs.wait(old, 0)
     finally:
         mfs.close()
@@ -460,14 +459,14 @@ def test_sync_wait_includes_unchanged_pending_and_descendant_cleanup(
         (root / "folder.txt" / "child.txt").unlink()
         (root / "folder.txt").rmdir()
         (root / "folder.txt").write_text("replacement")
-        original = mfs._namespace_index("n").delete_document
+        original = mfs._runtime.index("n").delete_document
 
         def delayed(identity: DocumentId, *, incarnation: str | None = None) -> None:
             entered.set()
             assert release.wait(10)
             original(identity, incarnation=incarnation)
 
-        monkeypatch.setattr(mfs._namespace_index("n"), "delete_document", delayed)
+        monkeypatch.setattr(mfs._runtime.index("n"), "delete_document", delayed)
         receipt = mfs.sync("n")
         assert entered.wait(5)
         with pytest.raises(WaitTimeout):

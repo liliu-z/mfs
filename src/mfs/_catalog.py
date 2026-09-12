@@ -6,9 +6,7 @@ import time
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
-from typing import Any, cast
-
-import blake3
+from typing import Any
 
 from ._json import compact_json, load_json
 from .errors import CorruptState, SchemaVersionUnsupported, StorageFailed
@@ -24,11 +22,11 @@ class Catalog:
         self._connections_lock = threading.Lock()
         self.migrated = False
         version = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
-        if version > 5:
+        if version > 6:
             raise SchemaVersionUnsupported(f"catalog schema version {version} is unsupported")
-        if not initialize and version not in (1, 2, 3, 4, 5):
+        if not initialize and version not in (1, 2, 3, 4, 5, 6):
             raise CorruptState("catalog schema is missing or unrecognized")
-        if initialize or version < 5:
+        if initialize or version < 6:
             self._initialize()
             self.migrated = version == 1
         expected = {
@@ -36,15 +34,11 @@ class Catalog:
             "documents",
             "targets",
             "operations",
-            "runs",
-            "wait_operations",
-            "wait_target_sets",
             "artifacts",
             "artifact_refs",
             "cache",
             "cancel_gates",
             "prepared",
-            "run_dependencies",
         }
         actual = {
             r[0]
@@ -53,7 +47,7 @@ class Catalog:
             )
         }
         if actual != expected:
-            raise CorruptState("catalog schema does not match version 5")
+            raise CorruptState("catalog schema does not match version 6")
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -95,16 +89,6 @@ class Catalog:
                 key TEXT PRIMARY KEY, request_hash TEXT NOT NULL,
                 value TEXT NOT NULL CHECK(json_valid(value))
             );
-            CREATE TABLE IF NOT EXISTS runs (
-                revision TEXT PRIMARY KEY, state TEXT NOT NULL, error TEXT,
-                error_code TEXT, retryable INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS wait_operations (
-                operation_id TEXT PRIMARY KEY, targets TEXT NOT NULL, complete INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS wait_target_sets (
-                id TEXT PRIMARY KEY, revisions TEXT NOT NULL CHECK(json_valid(revisions))
-            );
             CREATE TABLE IF NOT EXISTS artifacts (
                 path TEXT PRIMARY KEY, state TEXT NOT NULL DEFAULT 'live',
                 unreferenced_at REAL, size INTEGER NOT NULL DEFAULT 0
@@ -122,15 +106,12 @@ class Catalog:
                 namespace TEXT NOT NULL, doc_id TEXT NOT NULL, PRIMARY KEY(namespace,doc_id)
             );
             CREATE TABLE IF NOT EXISTS prepared (revision TEXT PRIMARY KEY, path TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS run_dependencies (
-                parent TEXT NOT NULL, child TEXT NOT NULL, PRIMARY KEY(parent,child)
-            );
-            INSERT OR IGNORE INTO wait_operations(operation_id,targets,complete)
-                SELECT json_extract(value,'$.operation_id'),
-                       CASE WHEN json_extract(value,'$.revision') IS NULL THEN '[]'
-                            ELSE json_array(json_extract(value,'$.revision')) END, 1
-                FROM operations WHERE json_extract(value,'$.operation_id') IS NOT NULL;
-            PRAGMA user_version = 5;
+            DROP TABLE IF EXISTS run_dependencies;
+            DROP TABLE IF EXISTS wait_operations;
+            DROP TABLE IF EXISTS wait_target_sets;
+            DROP TABLE IF EXISTS runs;
+            UPDATE operations SET value=json_remove(value,'$.operation_id');
+            PRAGMA user_version = 6;
             COMMIT;
         """)
 
@@ -259,23 +240,6 @@ class Catalog:
 
     def put_target(self, namespace: str, doc_id: str, value: dict[str, Any]) -> None:
         previous = self.get_target(namespace, doc_id)
-        if previous and previous["revision"] != value["revision"]:
-            self.connection.execute(
-                "UPDATE runs SET state='superseded' WHERE revision=? AND state!='succeeded'",
-                (previous["revision"],),
-            )
-        self.connection.execute(
-            "INSERT INTO runs VALUES(?,?,?,?,?) ON CONFLICT(revision) DO UPDATE SET "
-            "state=excluded.state,error=excluded.error,error_code=excluded.error_code,"
-            "retryable=excluded.retryable WHERE runs.state!='succeeded'",
-            (
-                value["revision"],
-                value["state"],
-                value.get("error"),
-                value.get("error_code"),
-                int(value.get("retryable", False)),
-            ),
-        )
         self.set_references("target", namespace, doc_id, self.references(value))
         if previous and previous["revision"] != value["revision"]:
             self.clear_prepared(str(previous["revision"]))
@@ -291,7 +255,7 @@ class Catalog:
         row = self.connection.execute(
             "SELECT value FROM targets WHERE namespace=? AND doc_id=?", (namespace, doc_id)
         ).fetchone()
-        return self.decode(row[0]) if row else None
+        return self.decode_target(row[0], namespace, doc_id) if row else None
 
     def list_targets(self, namespace: str | None = None) -> list[tuple[str, str, dict[str, Any]]]:
         sql = "SELECT namespace,doc_id,value FROM targets"
@@ -301,14 +265,10 @@ class Catalog:
             + " ORDER BY namespace,doc_id",
             (namespace,) if namespace is not None else (),
         )
-        return [(n, d, self.decode(v)) for n, d, v in rows]
+        return [(n, d, self.decode_target(v, n, d)) for n, d, v in rows]
 
     def delete_targets(self, namespace: str) -> None:
         for _, doc, job in self.list_targets(namespace):
-            self.connection.execute(
-                "UPDATE runs SET state='superseded' WHERE revision=? AND state!='succeeded'",
-                (job["revision"],),
-            )
             self.set_references("target", namespace, doc, set())
             self.clear_prepared(str(job["revision"]))
         self.connection.execute("DELETE FROM targets WHERE namespace=?", (namespace,))
@@ -327,28 +287,6 @@ class Catalog:
     def clear_prepared(self, revision: str) -> None:
         self.set_references("prepared", "", revision, set())
         self.connection.execute("DELETE FROM prepared WHERE revision=?", (revision,))
-
-    def add_wait_operation(
-        self, operation_id: str, revisions: list[str], complete: bool = True
-    ) -> None:
-        encoded = compact_json(sorted(set(revisions)))
-        key = blake3.blake3(encoded.encode()).hexdigest()
-        self.connection.execute(
-            "INSERT OR IGNORE INTO wait_target_sets VALUES(?,?)", (key, encoded)
-        )
-        self.connection.execute(
-            "INSERT INTO wait_operations VALUES(?,?,?)", (operation_id, key, int(complete))
-        )
-
-    def wait_targets(self, encoded: str) -> list[str]:
-        if encoded.startswith("["):  # Receipts issued before catalog schema 5.
-            return cast(list[str], load_json(encoded))
-        row = self.connection.execute(
-            "SELECT revisions FROM wait_target_sets WHERE id=?", (encoded,)
-        ).fetchone()
-        if row is None:
-            raise CorruptState("operation target set is missing")
-        return cast(list[str], load_json(row[0]))
 
     @staticmethod
     def _scope(namespace: str | None, path: str) -> tuple[str, list[str]]:
@@ -456,6 +394,37 @@ class Catalog:
                 "AND NOT EXISTS(SELECT 1 FROM artifact_refs WHERE path=?)",
                 (time.time(), path, path),
             )
+
+    @classmethod
+    def decode_target(cls, encoded: str, namespace: str, doc_id: str) -> dict[str, Any]:
+        value = cls.decode(encoded)
+        kind, stage, state = value.get("kind"), value.get("stage"), value.get("state")
+        stages = {
+            "upsert": ("process", "chunk", "embed", "publish"),
+            "delete": ("delete",),
+            "drop": ("drop",),
+            "rebuild": ("rebuild",),
+        }
+        if (
+            not isinstance(kind, str)
+            or kind not in stages
+            or stage not in stages[kind]
+            or state
+            not in (
+                "pending",
+                "running",
+                "retry_wait",
+                "failed",
+                "blocked",
+                "cancelled",
+                "succeeded",
+            )
+            or not isinstance(value.get("revision"), str)
+            or not value["revision"]
+            or (bool(doc_id) != (kind in ("upsert", "delete")) and bool(namespace))
+        ):
+            raise CorruptState(f"invalid durable task for {namespace!r}/{doc_id!r}")
+        return value
 
     @staticmethod
     def decode(encoded: str) -> dict[str, Any]:

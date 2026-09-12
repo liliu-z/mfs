@@ -90,7 +90,7 @@ def test_namespaces_have_independent_models_and_reopen_binding(tmp_path: Path) -
             )
             mfs.wait(mfs.upsert(namespace, "same.txt", b"hello namespace"), 10)
         assert {i.value.document_id.namespace for i in mfs.search("hello").items} == {"a", "b"}
-        collections = mfs._index.client.list_collections()
+        collections = mfs._runtime.legacy_index.client.list_collections()
         assert len(collections) == 2
         dimensions: set[int] = set()
         for name in ("a", "b"):
@@ -149,7 +149,7 @@ def test_replacement_hides_old_results_while_processor_is_blocked(tmp_path: Path
         mfs.close()
 
 
-def test_overlap_rejected_and_grep_budget_is_visible(tmp_path: Path) -> None:
+def test_state_root_overlap_rejected_and_grep_budget_is_visible(tmp_path: Path) -> None:
     root = tmp_path / "source"
     (root / "nested").mkdir(parents=True)
     (root / "a.txt").write_text("token " * 100)
@@ -157,7 +157,7 @@ def test_overlap_rejected_and_grep_budget_is_visible(tmp_path: Path) -> None:
     try:
         mfs.create_namespace("a", "external", root, processors=[Utf8TextProcessor()])
         with pytest.raises(RootOverlap):
-            mfs.create_namespace("b", "external", root / "nested", processors=[Utf8TextProcessor()])
+            mfs.create_namespace("b", "external", tmp_path, processors=[Utf8TextProcessor()])
         mfs.wait(mfs.sync("a"), 10)
         result = mfs.grep([TextMatch("token")], budget=GrepBudget(max_matches=3))
         assert result.truncated and len(result.items[0].matches) == 3
@@ -213,6 +213,76 @@ def test_namespace_rules_include_children_and_update_atomically(tmp_path: Path) 
     mfs = MFS.open(tmp_path / "state")
     try:
         assert [r.rule_id for r in mfs.rules("n").rules] == ["keep"]
+    finally:
+        mfs.close()
+
+
+def test_nested_and_identical_external_roots_keep_independent_namespace_lifecycles(
+    tmp_path: Path,
+) -> None:
+    from mfs import IgnoreRule
+
+    root = tmp_path / "source"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    original = nested / "a.txt"
+    original.write_text("needle original")
+    (root / "top.txt").write_text("needle top")
+    mfs = MFS.open(tmp_path / "state")
+    try:
+        for name, path in (("child", nested), ("parent", root), ("same", nested)):
+            mfs.create_namespace(name, "external", path, processors=[Utf8TextProcessor()])
+            mfs.wait(mfs.sync(name), 10)
+        assert {i.value.document_id for i in mfs.search("needle", mode="bm25").items} == {
+            DocumentId("child", "a.txt"),
+            DocumentId("same", "a.txt"),
+            DocumentId("parent", "nested/a.txt"),
+            DocumentId("parent", "top.txt"),
+        }
+        mfs.configure_index("child", paused=True)
+        original.write_text("needle changed")
+        child_sync = mfs.sync("child", verify="content")
+        mfs.wait(mfs.sync("parent", verify="content"), 10)
+        assert not mfs.search("needle", [ByNamespace("child")], mode="bm25").items
+        assert mfs.search("changed", [ByNamespace("parent")], mode="bm25").items
+        assert mfs.search("original", [ByNamespace("same")], mode="bm25").items
+        rules = mfs.rules("parent")
+        mfs.update_rules(
+            "parent", expected_revision=rules.revision, add=[IgnoreRule("nested", "nested/")]
+        )
+        assert not mfs.search("changed", [ByNamespace("parent")], mode="bm25").items
+        assert mfs.search("original", [ByNamespace("same")], mode="bm25").items
+        mfs.configure_index("child", paused=False)
+        mfs.wait(child_sync, 10)
+        mfs.wait(mfs.drop_namespace("parent"), 10)
+        assert original.read_text() == "needle changed"
+        assert mfs.search("changed", [ByNamespace("child")], mode="bm25").items
+        assert mfs.search("original", [ByNamespace("same")], mode="bm25").items
+    finally:
+        mfs.close()
+
+
+def test_external_root_can_retarget_into_another_namespace_root(tmp_path: Path) -> None:
+    previous, current = tmp_path / "previous", tmp_path / "current"
+    previous.mkdir()
+    current.mkdir()
+    (previous / "a.txt").write_text("old needle")
+    (current / "a.txt").write_text("new needle")
+    alias = tmp_path / "alias"
+    alias.symlink_to(previous, target_is_directory=True)
+    mfs = MFS.open(tmp_path / "state")
+    try:
+        for name, root in (("alias", alias), ("current", current)):
+            mfs.create_namespace(name, "external", root, processors=[Utf8TextProcessor()])
+            mfs.wait(mfs.sync(name), 10)
+        alias.unlink()
+        alias.symlink_to(current, target_is_directory=True)
+        mfs.wait(mfs.sync("alias", verify="content"), 10)
+        assert not mfs.search("old", mode="bm25").items
+        assert {i.value.document_id.namespace for i in mfs.search("new", mode="bm25").items} == {
+            "alias",
+            "current",
+        }
     finally:
         mfs.close()
 

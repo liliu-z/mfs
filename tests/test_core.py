@@ -92,7 +92,7 @@ def test_bm25_order_filter_escaping_and_reopen(tmp_path: Path) -> None:
     mfs.upsert("n", "one.txt", b"hello world")
     mfs.upsert("n", odd_id, b"needle")
 
-    ranked = mfs.search("hello", mode="bm25", limit=10)
+    ranked = mfs.search("hello", mode="bm25", limit=10, consistency="strong")
     assert [item.value.document_id.doc_id for item in ranked.items] == ["many.txt", "one.txt"]
     assert ranked.items[0].score > ranked.items[1].score > 0
     filtered = mfs.search("needle", filters=[ByDocumentId(DocumentId("n", odd_id))], mode="bm25")

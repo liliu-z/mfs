@@ -67,6 +67,34 @@ def wait_state(mfs: MFS, identity: DocumentId, state: str) -> None:
         ), mfs.document_status(identity)
 
 
+def test_search_defaults_return_current_results_and_bound_explicit_strong_wait(
+    tmp_path: Path,
+) -> None:
+    mfs = MFS.open(tmp_path / "state")
+    try:
+        mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()])
+        mfs.wait(mfs.upsert("n", "ready.txt", b"needle already indexed"), 10)
+        mfs.configure_index("n", paused=True)
+        pending = mfs.upsert("n", "pending.txt", b"needle awaiting indexing")
+        with ThreadPoolExecutor() as pool:
+            try:
+                result = pool.submit(mfs.search, "needle", mode="bm25").result(3)
+                assert [item.value.document_id.doc_id for item in result.items] == ["ready.txt"]
+                waiting = pool.submit(mfs.search, "needle", mode="bm25", consistency="strong")
+                with pytest.raises(WaitTimeout):
+                    waiting.result(7)
+                status = mfs.document_status(pending.id)
+                assert status is not None and status.indexed_revision is None
+                mfs.configure_index("n", paused=False)
+                mfs.wait(pending, 10)
+                assert len(mfs.search("needle", mode="bm25", consistency="strong").items) == 2
+            finally:
+                # Also retire a waiter if a regression restores an unbounded default wait.
+                mfs.close()
+    finally:
+        mfs.close()
+
+
 def test_dense_wait_keeps_admission_and_current_grep_responsive(tmp_path: Path) -> None:
     embedder = GateEmbedder()
     mfs = MFS.open(tmp_path / "state")
@@ -82,7 +110,7 @@ def test_dense_wait_keeps_admission_and_current_grep_responsive(tmp_path: Path) 
         assert second_status is not None and second_status.stage == "process"
         assert len(mfs.grep([TextMatch("new")]).items) == 1
         with pytest.raises(WaitTimeout):
-            mfs.search("new", mode="bm25", timeout=0)
+            mfs.search("new", mode="bm25", consistency="strong", timeout=0.05)
         with ThreadPoolExecutor() as pool:
             future = pool.submit(mfs.search, "old", mode="hybrid", consistency="eventual")
             assert not future.result(3).items
@@ -144,7 +172,7 @@ def test_cancelled_inflight_attempt_cannot_complete_after_retry(tmp_path: Path) 
         mfs.wait_ready(10)
         assert processor.calls == 1
         assert len(embedder.calls) == 2  # The cancelled attempt must not advance the retry.
-        assert mfs._namespace_index("n").count_document(identity) == 1
+        assert mfs._runtime.index("n").count_document(identity) == 1
     finally:
         embedder.release.set()
         mfs.close()
@@ -202,7 +230,7 @@ def test_completed_embedding_batches_survive_reopen_without_reprocessing(tmp_pat
         mfs.wait_ready(10)
         assert processor.calls == 1
         assert [len(batch) for batch in succeeding.calls] == [2]
-        assert mfs._namespace_index("n").count_document(identity) == 130
+        assert mfs._runtime.index("n").count_document(identity) == 130
     finally:
         mfs.close()
 

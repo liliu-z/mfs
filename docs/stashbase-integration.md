@@ -4,7 +4,9 @@ MFS 合同统一见 [设计](design.md)，完成情况见 [backlog](backlog.md)�
 
 ## 实例与源身份
 
-Python daemon 生命周期内打开一个 MFS 实例。为每个不重叠的物理源根分配稳定 namespace ID；嵌套 Folder 映射为同 namespace 的 UnderPath。源文件增删改由应用操作，再通过 sync 让 MFS 观察。
+Python daemon 生命周期内打开一个 MFS 实例。每个 Library Folder 对应一个稳定 namespace ID，包括父子 Folder；例如 /work 对应 folder-A，/work/project 对应 folder-B。两个 namespace 独立配置、同步和删除，不合并根、不迁移另一 Folder 的身份。源文件增删改由应用操作，再通过 sync 让 MFS 观察。Folder 内临时选一个子目录才使用 UnderPath。
+
+同一原件可以分别登记为 (folder-A, project/a.md) 与 (folder-B, a.md)，各自处理和索引；只有 External root 与 MFS 状态目录的重叠会被拒绝。全 Library 检索是否合并这些命中属于应用结果呈现：现有 library-operations/index.ts 的 keyword 检索按 deepestOwnerIs 保留最深 Folder 的结果，可沿用同一产品规则。源变更后，应用扫描相应已登记 Folder；MFS 不自动把一个 namespace 的观察传播到另一个。
 
 External 只记录原件指针，拒绝 upsert/remove；应用已有派生文件也可以借用指针。直接 Markdown/TXT 的 grep 读取外部文件，PDF 等需要当前提取文字。不能假定所有文件都生成一份新的 Markdown。
 
@@ -17,7 +19,7 @@ External 只记录原件指针，拒绝 upsert/remove；应用已有派生文件
 | 源文件操作、输入选择、产品可见性 | 文件观察、处理/索引任务、版本失效和恢复 |
 | 播放转码、增强 PDF/HTML/OCR/转录实现 | Processor 调用、切片、向量复用、BM25/dense 写入 |
 | 是否开始大批次索引的用户决策 | namespace 的 off/bm25/hybrid 与 paused |
-| 自行判断 MFS 文字是否可用，必要时 grep fallback | grep、read、search、已有逐文档状态和回执 |
+| 自行判断 MFS 文字是否可用，必要时 grep fallback | grep、read、search、已有逐文档状态 |
 | sibling/派生文件关系和旧规则导入 | namespace 有序规则及统一准入/读取资格 |
 
 搜原视频时，播放副本通过规则排除，Processor 提供原视频的转录文字。搜生成视频时，应用负责生成输入随原源更新/删除，再 sync。MFS 不自动推断两个独立文件的业务关系。
@@ -31,6 +33,14 @@ External 只记录原件指针，拒绝 upsert/remove；应用已有派生文件
 HTML 可以保留原 HTML grep、提取后索引。SourceMap 描述提取文字的来源，不把旧索引映射用于后来已经改变的外部文件。播放附属文件不会自动加入搜索。
 
 外部 Processor/Chunker/Embedder 对象由应用按 namespace 创建并传入，MFS 保存兼容清单，重开时核对。StashBase 当前全局模型配置可以由应用显式传给多个 namespace，不要求 MFS 提供全局继承。
+
+以 Folder 中的 report.pdf 为例：MFS 的 sync 发现文件，worker 调用 StashBase 提供的 StashPdfProcessor.process(path, media_type, context)，这个方法执行 StashBase 的 PDF 提取并返回 ProcessedDocument；MFS 随后切片、embedding、发布。提取就在 process 里完成，没有调用完 Processor 以后再提取一次的步骤。
+
+Processor interface 与 ProcessingContext 已足够对接，item 9 不构成 MFS 待修复。StashBase 如何复用 Python 脚本或 Node 函数属于它自己的 Processor 实现；只有需要跨进程时才使用 context.run_process，不强制额外 helper。播放转码、Viewer 和应用调度的改接属于 INTEGRATION-001。
+
+Context 的取消、report_progress 和 checkpoint 都可选。应用 Processor 若按页/音频单元处理，可保存自己的中间文件，并从 resume_state/resume_files 继续；整体提取调用可以从头重跑。MFS 不自动拆 PDF/音频，也不要求先实现分段恢复才能接入。
+
+缺依赖/模型可报告不可用，临时失败映射到 RetryableError，损坏内容报告处理失败；取消不应吞成普通成功。实际云端模型、转换输出及 SourceMap 的验收要在 StashBase 迁移时完成。
 
 ## 搜索映射
 
@@ -52,7 +62,7 @@ HTML 可以保留原 HTML grep、提取后索引。SourceMap 描述提取文字�
 
 同一有效规则用于 MFS 和应用 fallback。sync(path) 只是本次观察范围，不是永久白名单。应用选择只搜原件或派生件时，应登记相应规则。
 
-用 document_status 的 revision/text_revision/indexed_revision、stage/state 和 wait(receipt) 判断具体操作。整体 status.ready 不等于某个 PDF 的文字可用；grep 命中也不等于向量已完成。不新增 ready 系统。
+用 document_status 的 revision/text_revision/indexed_revision、stage/state 恢复文件显示状态。整体 status.ready 不等于某个 PDF 的文字可用；grep 命中也不等于向量已完成。不新增 ready 系统。wait(DocumentId) 或 wait(namespace, path=...) 等待当前任务，模型重建也计入；wait(sync_report) 是相同范围的简写。无变化 sync 不创建历史记录，旧版本曾成功不能让当前重建提前通过。namespace_configuration 恢复 Folder 索引开关、暂停状态及 Adapter 清单，rules 读取独立规则。
 
 ## 应用验收
 
@@ -63,3 +73,31 @@ HTML 可以保留原 HTML grep、提取后索引。SourceMap 描述提取文字�
 - 用代表性 corpus 运行 retrieval eval，并测量首次索引吞吐和检索延迟。
 
 MFS 单元/集成测试不能替代这些应用验收。
+
+## 模型配置与重建
+
+必须区分 StashBase 的操作名称和 MFS 的方法名：server/library-operations/index.ts 中 MCP/Library reindex 调用 syncFolderNow，即重新观察目录、补处理变化及恢复转换，不会直接清空所有向量。接入新库时主要映射到 sync(namespace, verify="content")；对已有失败/blocked 目标需明确调用 retry/reprocess，单纯源内容未变的 sync 不自动重试失败转换。新 MFS 的 reindex 则是对已接收文档重建整个 namespace 索引，不负责发现尚未 sync 的文件。
+
+| 当前应用动作 | 新 MFS 的调用与能力 |
+| --- | --- |
+| 手动 Sync、MCP reindex、重扫外部变化 | sync；需要重试的已有失败转换使用 retry/reprocess |
+| 首次配置 embedding，给已接收文字补向量 | reindex(namespace, embedder=..., indexing="hybrid")；已支持 |
+| 显式更换模型/维度、重新计算整个 namespace 索引 | reindex(namespace, embedder=...)；已支持；库内有能力不等于应用已有任意模型选择器 |
+
+StashBase 当前允许切换 embedding 来源：OpenAI、OpenRouter、账户服务；所查配置中的前两者使用固定默认模型 text-embedding-3-small，并没有据此发现任意模型选择器。首次配置 embedding 会触发 backfill；同一模型换 API key 不应重新计算已有向量（shared/embedding.ts 已明确此区别）。
+
+MFS 已有 reindex(namespace, embedder=..., indexing="hybrid")，可以显式换模型/维度；open_namespace 的不匹配拒绝是防止重开时静默混用旧向量，不代表不允许更换。接入时按 embedding_space、dimension 和 Chunker 配置判断是否重建，不把凭据轮换或同空间的 API 路由切换算成新模型。全局设置改变时由 StashBase 为各 Folder 请求重建；文字提取仍有效，不重新 OCR/转录，索引重建期间可走 grep fallback。
+
+RECEIPT-002 已改为按当前目标等待，永久历史等待表已删除；源文字以前成功过，补向量尚未完成时 wait(sync(...)) 仍等待当前构建。StashBase daemon 尚未改接新库，其调用和结果映射仍为 INTEGRATION-001 的待实施工作。
+
+## 扫描开销与处理调度
+
+SYNC-002 已修复：首次或 content sync 列目录后，文件 hash 校验使用规范路径逐段安全 open 重查身份，不再每文件重新列完整父目录。保留 no-follow、inode、大小写和并发变化检查。stat 未变的后续 sync 仍走短路。
+
+长转录的调度差异见 [设计第 12 节](design.md#12-暂不实施的调度与搜索扩展)：StashBase 当前每 10 分钟音频单元写 checkpoint 后调用 yieldLane；MFS 的 Context 已有恢复能力，set_active_scopes 已提供待领取文件的优先级提示；本轮保持一个文件连续处理，checkpoint 不触发抢占。协作让出属于后续可选讨论。影响是新打开/新导入文件的处理和索引延迟，已发布文字的 grep、已有索引的 eventual 搜索不需要等整段录音处理完。
+
+## 过渡与查询等待
+
+若过渡期只借用 StashBase 已准备的文件，Adapter 必须先验证源 hash 与完成标记；先前因产物未准备而 blocked 的目标，在应用完成转换后显式 retry/reprocess。相同源 bytes 的重复 sync 沿用目标，不会自动解除 blocked。此通知只在保留应用准备流程的过渡方案中需要，不是 MFS 调度 Processor 完整执行时的额外必需队列。
+
+默认 search 为 eventual，不等后台索引补齐；所有 consistency 模式默认 timeout=5 秒，限制搜索调用方的总等待，过期返回 WaitTimeout。RPC 将应用传入的预算交给 MFS 并映射超时错误。已经进入外部服务的调用未必立即终止，MFS 在阶段边界检查期限并丢弃迟到结果。strong 当前按 namespace 等待；一个 Folder 一个 namespace 已隔离其他 Folder，同一 Folder 内子目录是否另需 strong 暂不实施。

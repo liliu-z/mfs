@@ -61,8 +61,9 @@ _Avoid_: 用 final 表示终止状态或已全部完成。
 **Processing Attempt（准备执行）**：一个 revision 的一次执行，拥有独立 work_dir 和取消信号；
 checkpoint 可让下一次执行从持久边界恢复。attempt token 阻止旧执行提交。
 
-**Operation Receipt（操作回执）**：持久 operation_id 与有限目标集合；wait 只等待该操作，
-不等同于整个实例 Ready。成功结果在后续覆盖后仍有效。
+**Mutation / Sync Report（接收/观察结果）**：本次调用是否接受变化、涉及哪些文件；不产生永久历史等待记录。wait(report) 按报告中的文件或 namespace/path 等待当前工作，后续新目标也计入。
+
+**Current Work Wait（当前工作等待）**：核对文件或范围内的当前目标及关联 namespace 控制任务，直到完成或报错；不查询历史成功。显式 idempotency_key 只去重写入请求，不用于历史就绪判断。
 
 **Artifact（附属产物）**：随文本快照发布的不可变文件，经 open_artifact 读取；读取租约保护其生命周期。
 

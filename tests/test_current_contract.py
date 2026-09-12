@@ -138,13 +138,26 @@ def test_scoped_search_and_receipts_work_without_other_namespace_binding(tmp_pat
     try:
         mfs.open_namespace("a", processors=[Utf8TextProcessor()])
         pending = mfs.upsert("b", "a.txt", b"new needle")
-        assert mfs.search("needle", filters=[ByNamespace("a")], mode="bm25", timeout=0).items
+        assert mfs.search(
+            "needle", filters=[ByNamespace("a")], mode="bm25", consistency="strong", timeout=5
+        ).items
         repeats = [mfs.upsert("b", "a.txt", b"new needle") for _ in range(3)]
-        keys = mfs._catalog.connection.execute(
-            "SELECT targets FROM wait_operations WHERE operation_id IN (?,?,?,?)",
-            [r.operation_id for r in [pending, *repeats]],
-        ).fetchall()
-        assert len({key for (key,) in keys}) == 1
+        assert all(r.revision == pending.revision for r in repeats)
+        assert (
+            mfs._catalog.connection.execute(
+                "SELECT count(*) FROM targets WHERE namespace='b' AND doc_id='a.txt'"
+            ).fetchone()[0]
+            == 1
+        )
+        tables = {
+            r[0]
+            for r in mfs._catalog.connection.execute(
+                "SELECT name FROM sqlite_schema WHERE type='table'"
+            )
+        }
+        assert not tables.intersection(
+            {"runs", "wait_operations", "wait_target_sets", "run_dependencies"}
+        )
         mfs.open_namespace("b", processors=[Utf8TextProcessor()])
         for receipt in [pending, *repeats]:
             mfs.wait(receipt, 10)
@@ -157,22 +170,22 @@ def test_scoped_search_and_receipts_work_without_other_namespace_binding(tmp_pat
 def test_grep_does_not_return_revoked_text_after_slow_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from mfs import _reader
+    from mfs._reader import Reader
 
     mfs = MFS.open(tmp_path / "state")
     entered, release = threading.Event(), threading.Event()
     try:
         mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()])
         mfs.wait(mfs.upsert("n", "a.txt", b"old needle"), 10)
-        original = _reader._read
+        original = Reader._read
 
-        def slow(owner: MFS, record: dict[str, Any], maximum: int) -> tuple[str, bool, int]:
+        def slow(owner: Reader, record: dict[str, Any], maximum: int) -> tuple[str, bool, int]:
             result = original(owner, record, maximum)
             entered.set()
             assert release.wait(5)
             return result
 
-        monkeypatch.setattr(_reader, "_read", slow)
+        monkeypatch.setattr(Reader, "_read", slow)
         with ThreadPoolExecutor() as pool:
             future = pool.submit(mfs.grep, [TextMatch("old")])
             try:
@@ -209,7 +222,7 @@ def test_cancelled_cleanup_retry_keeps_cancellation(
         with mfs._condition:
             receipt = mfs.upsert("n", "a.txt", b"new needle")
             mfs.cancel(receipt.id)
-            original = mfs._namespace_index("n").delete_document
+            original = mfs._runtime.index("n").delete_document
             calls = 0
 
             def temporary(identity: DocumentId, *, incarnation: str | None = None) -> None:
@@ -219,7 +232,7 @@ def test_cancelled_cleanup_retry_keeps_cancellation(
                     raise OSError("retry the physical cleanup")
                 original(identity, incarnation=incarnation)
 
-            monkeypatch.setattr(mfs._namespace_index("n"), "delete_document", temporary)
+            monkeypatch.setattr(mfs._runtime.index("n"), "delete_document", temporary)
             assert mfs._condition.wait_for(
                 lambda: calls == 2 and not mfs._tasks.targets[receipt.id].get("cleanup"), 10
             )

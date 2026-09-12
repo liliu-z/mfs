@@ -27,14 +27,8 @@ def migrate(
         raise InvalidConfiguration("namespace already uses the current storage format")
     if previous["kind"] == "external":
         root = Path(previous["root"]).resolve()
-        for name, other in mfs._tasks.namespaces.items():
-            if name == namespace or other["kind"] != "external":
-                continue
-            candidate = Path(other["root"]).resolve()
-            if candidate == root or candidate in root.parents or root in candidate.parents:
-                raise RootOverlap(
-                    f"drop overlapping namespace {name!r} before migrating; sources are preserved"
-                )
+        if root.is_relative_to(mfs._path) or mfs._path.is_relative_to(root):
+            raise RootOverlap("external root and mfs_path must not overlap")
     incarnation = uuid.uuid4().hex
     record = dict(
         previous,
@@ -105,34 +99,13 @@ def migrate(
         )
         updates.append((identity, job))
     control = dict(
-        mfs._delete_job("rebuild"),
+        mfs._tasks.delete_job("rebuild"),
         incarnation=incarnation,
         identity=asdict(DocumentId(namespace, "")),
         manifest=binding.manifest,
         legacy_cleanup=True,
     )
     with mfs._condition:
-        with mfs._catalog.transaction():
-            mfs._catalog.put_namespace(namespace, record)
-            for doc_id in documents:
-                mfs._catalog.delete_document(namespace, doc_id)
-            for old in old_targets.values():
-                if old.get("revision"):
-                    mfs._catalog.clear_prepared(old["revision"])
-            mfs._catalog.delete_targets(namespace)
-            for identity, job in updates:
-                mfs._catalog.put_target(namespace, identity.doc_id, job)
-            mfs._catalog.put_target(namespace, "", control)
-        mfs._tasks.namespaces[namespace] = record
-        mfs._bindings[namespace] = binding
-        mfs._tasks.targets = {
-            i: j for i, j in mfs._tasks.targets.items() if i.namespace != namespace
-        }
-        mfs._tasks.visible = {
-            i: v for i, v in mfs._tasks.visible.items() if i.namespace != namespace
-        }
-        mfs._tasks.refresh_pending()
-        for identity, job in updates:
-            mfs._tasks.remember(identity, job)
-        mfs._tasks.remember(DocumentId(namespace, ""), control)
+        mfs._tasks.migrate_namespace(namespace, record, updates, control)
+        mfs._runtime.bindings[namespace] = binding
     return mfs._namespace_info(namespace, record)

@@ -19,12 +19,12 @@ def test_failed_publication_keeps_new_grep_text_and_revokes_old_index(
         mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()])
         mfs.upsert("n", "a.txt", b"old snapshot")
         mfs.wait_ready(10)
-        original = mfs._namespace_index("n").publish
+        original = mfs._runtime.index("n").publish
 
         def fail(identity: DocumentId, snapshot: str, incarnation: str, count: int) -> None:
             raise IndexFailed("injected publication failure")
 
-        monkeypatch.setattr(mfs._namespace_index("n"), "publish", fail)
+        monkeypatch.setattr(mfs._runtime.index("n"), "publish", fail)
         mfs.upsert("n", "a.txt", b"new snapshot")
         with mfs._condition:
             assert mfs._condition.wait_for(
@@ -33,8 +33,8 @@ def test_failed_publication_keeps_new_grep_text_and_revokes_old_index(
         assert mfs.grep(select="doc").items[0].value.text == "new snapshot"
         assert not mfs.search("old", mode="bm25", consistency="eventual").items
         with pytest.raises(WaitTimeout):
-            mfs.search("new", mode="bm25", timeout=0)
-        monkeypatch.setattr(mfs._namespace_index("n"), "publish", original)
+            mfs.search("new", mode="bm25", consistency="strong", timeout=0.05)
+        monkeypatch.setattr(mfs._runtime.index("n"), "publish", original)
         mfs.retry(DocumentId("n", "a.txt"))
         mfs.wait_ready(10)
         assert mfs.search("new", mode="bm25").items
@@ -65,7 +65,7 @@ def test_milvus_success_before_completion_commit_replays_same_rows(
         mfs.upsert("n", "a.txt", b"committed text")
         mfs.wait_ready(10)
         assert failed
-        assert mfs._namespace_index("n").count_document(DocumentId("n", "a.txt")) == 1
+        assert mfs._runtime.index("n").count_document(DocumentId("n", "a.txt")) == 1
         assert len(mfs.search("committed", mode="bm25").items) == 1
     finally:
         mfs.close()
@@ -84,7 +84,7 @@ def test_failed_stage_survives_reopen_without_reprocessing(
         error = IndexFailed("injected publication failure")
         raise error from error  # Some backend errors contain self-referential cause chains.
 
-    monkeypatch.setattr(mfs._namespace_index("n"), "publish", fail)
+    monkeypatch.setattr(mfs._runtime.index("n"), "publish", fail)
     mfs.upsert("n", "a.txt", b"persistent")
     with mfs._condition:
         assert mfs._condition.wait_for(

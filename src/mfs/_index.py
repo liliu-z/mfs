@@ -12,6 +12,7 @@ import blake3
 from milvus_lite.server_manager import server_manager_instance
 from pymilvus import DataType, Function, FunctionType, MilvusClient
 
+from ._search_execution import SearchDeadline
 from .errors import IndexFailed
 from .types import DocumentId
 
@@ -424,6 +425,7 @@ class ChunkIndex:
         documents: Sequence[DocumentId] | None = None,
         limit: int,
         expressions: Sequence[str] | None = None,
+        deadline: SearchDeadline | None = None,
     ) -> tuple[list[SearchHit], bool]:
         batches: Iterable[Sequence[DocumentId] | None]
         if documents is None:
@@ -442,6 +444,7 @@ class ChunkIndex:
             )
         )
         for expression in compiled:
+            remaining = None if deadline is None else deadline.remaining()
             try:
                 raw = self.client.search(
                     collection_name=self.collection_name,
@@ -452,9 +455,14 @@ class ChunkIndex:
                     output_fields=OUTPUT_FIELDS,
                     search_params={"metric_type": "BM25" if mode == "bm25" else "COSINE"},
                     consistency_level="Strong",
+                    timeout=remaining,
                 )
             except Exception as error:
+                if deadline is not None:
+                    deadline.check()
                 raise IndexFailed(f"{mode} search failed: {error}") from error
+            if deadline is not None:
+                deadline.check()
             hits = raw[0] if raw else []
             if len(hits) == limit:
                 possibly_more = True

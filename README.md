@@ -15,8 +15,8 @@ try:
     else:
         mfs.open_namespace("notes", processors=[Utf8TextProcessor()])
 
-    receipt = mfs.upsert("notes", "hello.md", b"Hello, world!")
-    mfs.wait(receipt, timeout=30)
+    report = mfs.upsert("notes", "hello.md", b"Hello, world!")
+    mfs.wait(report.id, timeout=30)
     print(mfs.grep([ByNamespace("notes"), TextMatch("Hello")]).items)
     print(mfs.search("hello", filters=[ByNamespace("notes")], mode="bm25").items)
     print(mfs.read(DocumentId("notes", "hello.md")))
@@ -24,13 +24,13 @@ finally:
     mfs.close()
 ```
 
-External 用法：`create_namespace("files", "external", root, processors=[...])`，然后 `sync("files", verify="content")`。状态目录和 External root 不能重叠，不同 namespace 的真实 External root 也不能重叠。子目录使用 `UnderPath` 或 `sync(namespace, path)` 指定范围。
+External 用法：`create_namespace("files", "external", root, processors=[...])`，然后 `sync("files", verify="content")`。状态目录和 External root 不能重叠；不同 namespace 可以指向同一个或互相嵌套的 External root，各自维护规则、处理和索引。namespace 内的子目录使用 `UnderPath` 或 `sync(namespace, path)` 指定范围。
 
 `MFS.open` 不接收全局适配器。创建时默认使用 `DefaultChunker`；未提供 Embedder 默认 `bm25`，提供则默认 `hybrid`。重开 namespace 时传入相同声明的实现；库核对 Processor/Chunker 的 id、version、options 和路由，以及 Embedder 的 embedding_space、dimension。只有维度相同仍可能不兼容，不匹配立即报错。off/bm25 重开时可以省略不使用的 Embedder；若传入则仍核对声明。打开实例本身无需加载模型；已知后缀的 sync、删除、状态读取和已保存文字读取可以先使用。
 
 `grep` 提供文字、正则、名称和路径匹配，`GrepBudget` 限制读取量、文档数和匹配数，达到预算返回 `truncated`。已知文档使用 `read`；`grep(select="doc")` 返回预算内文字，不加载 Internal 二进制原件。排名搜索使用 `search(mode="bm25" | "vector" | "hybrid")`，默认 mode 为 hybrid；只有 BM25 的 namespace 应显式选 bm25。公开 `query` 已移除。
 
-写入返回持久回执，一个后台 worker 依次执行旧代清理、Processor、Chunker、embedding 和发布。每文件保留一个最新目标，重复变更可以合并；已失效旧文件立即退出读取和搜索，失败不回退旧结果。`wait(receipt)` 只等本次操作；`search(consistency="strong")` 等选中 namespace，`eventual` 立即读取当前有效索引。借用文件可在两次 sync 间改变，grep 读当前内容，索引保留上次成功处理的版本，直到下次 sync 撤销它。
+写入返回接收结果，一个后台 worker 依次执行旧代清理、Processor、Chunker、embedding 和发布。每文件保留一个最新目标，重复变更可以合并；已失效旧文件立即退出读取和搜索，失败不回退旧结果。`wait(DocumentId(...))` 等待文件当前任务，`wait(namespace, path="notes")` 等待范围当前任务；期间接受的新版本也要完成。传入写入/sync 返回值是相同文件/范围的简写，不等待历史版本。失败、blocked 或取消会抛 `OperationFailed`。`search` 默认 `consistency="eventual"`，查询当前有效索引。显式 `consistency="strong"` 等待选中 namespace。`timeout=5.0` 是搜索调用方的总等待预算，包含排队、一致性等待、查询 embedding 和后端检索；到期抛 `WaitTimeout`，`None` 不设期限，`0` 立即超时。执行阶段检查同一 deadline，Milvus 接收剩余时间；不响应取消的外部调用可能继续运行到返回，届时丢弃结果，不开始后续阶段。借用文件可在两次 sync 间改变，grep 读当前内容，索引保留上次成功处理的版本，直到下次 sync 撤销它。
 
 ```python
 from mfs import IgnoreRule
@@ -49,7 +49,11 @@ mfs.configure_index("files", indexing="off")  # 清除排名索引，保留处�
 
 Processor 可使用两参数 `process(path, media_type)`，或额外接收 `ProcessingContext` 来提交 checkpoint、进度及检查取消。`ProcessedDocument(text, source_map, text_path=...)` 引用已有文字文件；未提供文字路径则保存必要派生文字。应用可用 `grep_path` 指定原 HTML，同时返回内存提取文字供索引。`artifacts` 发布附属文件，通过 `open_artifact` 读取。库提供 UTF-8、PDF、基础 DOCX；OCR、转录和播放转换可由应用适配。
 
-`reprocess_namespace(namespace, processors=[...])` 显式更换 Processor 并重新处理；`reindex(namespace, chunker=..., embedder=..., timeout=...)` 显式重建索引。旧存储需要调用 `migrate_namespace(namespace, processors=[...], indexing="bm25" | "hybrid", ...)`，不会打开即自动换模型。失败可用 `document_status`、`list_document_statuses`、`scope_status` 和回执诊断，`retry` / `reprocess` 恢复。
+`reprocess_namespace(namespace, processors=[...])` 显式更换 Processor 并重新处理；`reindex(namespace, chunker=..., embedder=..., timeout=...)` 显式重建索引。旧存储需要调用 `migrate_namespace(namespace, processors=[...], indexing="bm25" | "hybrid", ...)`，不会打开即自动换模型。失败可用 `document_status`、`list_document_statuses`和 `scope_status` 诊断，`retry` / `reprocess` 恢复。
+
+`namespace_configuration(namespace)` 读取持久的索引模式、暂停状态、完整适配器清单、待生效清单与文件大小限制，无需先绑定模型；规则由 `rules(namespace)` 读取。
+
+本轮等待 API 变更：返回值移除 `operation_id`，`wait` 的字符串参数现在是 namespace。SQLite 自动升级到 schema 6，删除历史等待表，保留当前任务、删除标记和显式 `idempotency_key` 去重记录。旧 operation ID 不再是等待凭证；请改为文件身份或 namespace/path。重复 idempotency key 仍返回首次接收结果，不覆盖文件的新状态；随后 `wait(report)` 等待文件当前状态。
 
 独立 GC 线程回收无引用的受管理文件。可用 `GCPolicy(enabled=False)` 关闭自动 GC，由宿主调用 `collect_garbage()`。GC 不删除外部原件或借用的应用产物；已打开的产物句柄受保护。Adapter 应允许前台查询与后台调用重叠，或自行串行化。
 

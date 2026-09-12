@@ -14,7 +14,7 @@ type NamespaceKind = Literal["internal", "external"]
 type MutationOutcome = Literal["added", "updated", "unchanged", "removed", "not_found"]
 type IndexState = Literal["ready", "pending", "dirty", "mismatch"]
 type Consistency = Literal["strong", "eventual"]
-type TaskStage = Literal["process", "chunk", "embed", "publish", "delete", "drop"]
+type TaskStage = Literal["process", "chunk", "embed", "publish", "delete", "drop", "rebuild"]
 type TaskState = Literal[
     "pending", "running", "retry_wait", "failed", "blocked", "cancelled", "succeeded"
 ]
@@ -89,12 +89,23 @@ class NamespaceInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class NamespaceConfiguration:
+    namespace: str
+    kind: NamespaceKind
+    root: Path | None
+    indexing: IndexingMode
+    paused: bool
+    manifest: JSONValue
+    pending_manifest: JSONValue
+    max_file_bytes: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class MutationReport:
     id: DocumentId
     outcome: MutationOutcome
     index_ready: bool
     revision: str | None = None
-    operation_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,7 +113,6 @@ class DropReport:
     namespace: str
     dropped: bool
     index_ready: bool
-    operation_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +138,6 @@ class SyncReport:
     failed: tuple[SyncFailure, ...]
     skipped: tuple[SyncSkipped, ...]
     index_ready: bool
-    operation_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

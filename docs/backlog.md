@@ -10,7 +10,7 @@
 - [x] **IGNORE-001** namespace 有序规则、增删改/排序及版本冲突检查；扫描、读取和提交统一资格判断。
 - [x] **API-002** 移除 query 及公开 Query 类型，公开有界 grep 和明确 read，迁移示例/测试。
 - [x] **REF-001** 单后台处理 worker + GC；每文件最新目标；集中生命周期事务并拆分执行/读取职责；受管理文件按 namespace 组织。
-- [x] **ROOT-001** 拒绝重叠真实 External 根，保护源文件，显式处理存量重复登记。
+- [x] **ROOT-001** External root 不得与 MFS 状态目录重叠，保护源文件；原跨 namespace 禁止重叠的限制已由 ROOT-002 撤回。
 - [x] **PROCESS-001** 保留 UTF-8/PDF，补基础 DOCX；支持应用提供的已有文字引用和增强处理。
 - [x] **VERIFY-001** 行为回归、真实 Milvus 验证、重启/崩溃恢复、格式和类型检查。
 
@@ -31,4 +31,30 @@
 - [ ] **INTEGRATION-001** StashBase daemon 迁移及实际转换器适配；沿用应用的输入选择、播放转换与 grep fallback。
 - [ ] 在 StashBase 的代表性 corpus 上运行 retrieval eval 和端到端恢复验证。
 
-READY-001 不在本轮范围：保留已有状态和回执，由 StashBase 自行选择 fallback，不另建 ready 系统。
+READY-001 不在本轮范围：由 StashBase 使用已有状态选择 fallback，不另建 ready 系统；历史回执的简化归 RECEIPT-002。
+
+## 2026-09-12 审视后的修复
+
+- [x] **SEARCH-DEFAULT-001** search 默认 consistency="eventual"、timeout=5.0 秒；timeout 覆盖调用方的搜索总等待，阶段边界复用 deadline，后端接收剩余时间。慢 Adapter 期间也能超时返回，迟到执行保留容量/租约直到结束，不开始后续阶段。
+- [x] **ROOT-002** 允许不同 namespace 使用相同或嵌套 External root；创建、根重定向和迁移均保留独立配置，仅拒绝与 MFS 状态目录重叠。
+- [x] **TEXT-002** 统一 UTF-8 文字引用的换行读取和字节偏移语义，修复 CRLF TXT/Markdown 被内置 Processor 校验拒绝；覆盖 Internal/External、grep/read/search 与 SourceMap。
+- [x] **RECEIPT-002** 按文件当前状态恢复待办，移除每次 sync/upsert 的永久操作回执及其历史等待依赖。保留文件粒度的删除标记、更新中的旧索引清理责任、当前任务和必要恢复数据；更新覆盖同一文件目标，不拆成独立 delete/insert 事件。重建完成判断读取当前任务，避免历史成功误判。已完成 schema 6 迁移；wait 使用当前文件/范围，返回值移除 operation_id，显式 idempotency_key 去重保留。
+- [x] **SYNC-002** 去除首次/content sync 对每个文件重新枚举完整父目录的平方级开销；保留路径身份、大小写、符号链接和并发变动校验。已确认作为实现 bug 修复，不增加公开配置。
+- [x] **REF-002** 按 [设计第 11 节](design.md#11-内部重构与当前状态迁移ref-002--receipt-002) 重构 Lifecycle、Worker 和执行模块：有类型的执行许可/结果、集中生命周期事务、显式模块依赖、移除对整个 MFS 私有状态的穿透。
+- [x] **CONFIG-001** 补 namespace_configuration(namespace) 只读完整配置，包括 indexing、paused、Processor/Chunker/Embedder 清单和待生效配置；用于 StashBase 重启恢复 Folder 设置，不包含运行对象或凭据。
+
+item 9 已确认不缺 MFS interface：StashBase 提供的 Processor 自己完成提取，MFS 随后切片/索引；撤销 INTEGRATION-002，实际应用改接统一归 INTEGRATION-001。
+
+目录级 strong 和处理单元完成后按优先级调度仍为[讨论方案](design.md#12-暂不实施的调度与搜索扩展)。建议暂不做目录级 strong；单 worker 让出可在现有 set_active_scopes 基础上讨论，不等同于恢复 StashBase 原有 light/heavy 并行容量。ProcessingContext.checkpoint/resume 已存在，含义是保存 Processor 自己的中间状态/文件；它不代表 MFS 已实现音频分段或抢占调度。ROOT-002 已实现并验证，继续保留在本表的完成项中。
+
+旧 StashBase 对照：在其现有 Python 环境中调用真实 daemon upsert、旧 Chunker 和 Milvus，以本地确定性 Embedder 验证 CRLF TXT/Markdown 均成功写入。此结果证明旧写入路径没有新 text_path 校验错误，不代表穷尽旧库所有换行/定位行为；本次工作未修改 StashBase 文件。
+
+概念复核：直接调用当前 MFS 和真实 Milvus，以确定性 Embedder 跑通 BM25 → 2 维 model-a → 3 维 model-b，每次重建后 vector 搜索均返回文档。BM25 升级、Context 中间结果的重开恢复和进程终止恢复 3 个现有测试再次通过；此结果证明库内能力，不代表 StashBase daemon 已接入，也不验证真实云端模型效果。
+
+## 本次最终验收（2026-09-12）
+
+- 完整回归：**94 passed、3 skipped**；跳过 Windows 原生句柄测试，当前为 macOS。
+- 最后合并文字引用读取、校验旧 operation ID 和整理关闭路径后，CRLF/恢复/当前合同/搜索超时专项 **20 passed**。
+- `ruff check`、`ruff format --check`、strict `pyright`、`git diff --check` 通过。
+- 新增覆盖：CRLF+BOM 与 UTF-8 字节定位、80 文件目录枚举次数、未绑定时配置读取、当前重建等待、schema 5 历史表升级、更新/删除事务后进程终止及 idempotency 重放。
+- 已确认的 MFS 修复项全部完成；StashBase 应用迁移、目录级 strong 和协作抢占仍按上述范围处理。

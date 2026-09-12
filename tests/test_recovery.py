@@ -40,19 +40,19 @@ if boundary == "before_accept_commit":
 elif boundary == "after_accept_commit":
     mfs._tasks.remember = lambda *args: stop()  # Accepted on disk, before memory publication / ACK.
 elif boundary == "after_process_artifact":
-    original = mfs._write_artifact
+    original = mfs._artifacts.write
     def artifact(name, value, incarnation):
         result = original(name, value, incarnation)
         if name.endswith("-snapshot"):
             stop()
         return result
-    mfs._write_artifact = artifact
+    mfs._artifacts.write = artifact
 elif boundary == "after_publish":
-    original = mfs._namespace_index("n").publish
+    original = mfs._runtime.index("n").publish
     def publish(*args):
         original(*args)
         stop()
-    mfs._namespace_index("n").publish = publish
+    mfs._runtime.index("n").publish = publish
 mfs.upsert("n", "a.txt", b"durable needle", idempotency_key="request-1")
 mfs.wait_ready(10)
 raise AssertionError("crash boundary was not reached")
@@ -76,7 +76,7 @@ raise AssertionError("crash boundary was not reached")
         else:
             assert mfs.grep(select="doc").items[0].value.text == "durable needle"
             assert len(mfs.search("needle", mode="bm25").items) == 1
-            assert mfs._namespace_index("n").count_document(DocumentId("n", "a.txt")) == 1
+            assert mfs._runtime.index("n").count_document(DocumentId("n", "a.txt")) == 1
     finally:
         mfs.close()
 
@@ -121,7 +121,7 @@ def test_namespace_recreation_while_old_publication_runs_preserves_new_incarnati
     entered, release = threading.Event(), threading.Event()
     try:
         mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()])
-        original = mfs._namespace_index("n").publish
+        original = mfs._runtime.index("n").publish
         first = True
 
         def delayed(identity: DocumentId, snapshot: str, incarnation: str, count: int) -> None:
@@ -132,7 +132,7 @@ def test_namespace_recreation_while_old_publication_runs_preserves_new_incarnati
                 assert release.wait(10)
             original(identity, snapshot, incarnation, count)
 
-        monkeypatch.setattr(mfs._namespace_index("n"), "publish", delayed)
+        monkeypatch.setattr(mfs._runtime.index("n"), "publish", delayed)
         mfs.upsert("n", "old.txt", b"old content")
         assert entered.wait(5)
         mfs.drop_namespace("n")
@@ -159,16 +159,16 @@ def test_search_does_not_hold_publication_lock_after_strong_admission(
         mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()])
         mfs.upsert("n", "a.txt", b"old content")
         mfs.wait_ready(10)
-        original = mfs._wait_ready
+        original = mfs._view.wait_ready
 
         def admitted(timeout: float | None, namespaces: set[str] | None = None) -> None:
             original(timeout, namespaces)
             entered.set()
             assert release.wait(10)
 
-        monkeypatch.setattr(mfs, "_wait_ready", admitted)
+        monkeypatch.setattr(mfs._view, "wait_ready", admitted)
         with ThreadPoolExecutor() as pool:
-            future = pool.submit(mfs.search, "new", mode="bm25")
+            future = pool.submit(mfs.search, "new", mode="bm25", consistency="strong", timeout=10)
             try:
                 assert entered.wait(5)
                 mfs.upsert("n", "a.txt", b"new content")
@@ -193,14 +193,14 @@ def test_pending_delete_keeps_ready_false_and_revokes_old_hit(
         mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()])
         inserted = mfs.upsert("n", "a.txt", b"old content")
         mfs.wait_ready(10)
-        original = mfs._namespace_index("n").delete_document
+        original = mfs._runtime.index("n").delete_document
 
         def delayed(identity: DocumentId, *, incarnation: str | None = None) -> None:
             entered.set()
             assert release.wait(10)
             original(identity, incarnation=incarnation)
 
-        monkeypatch.setattr(mfs._namespace_index("n"), "delete_document", delayed)
+        monkeypatch.setattr(mfs._runtime.index("n"), "delete_document", delayed)
         removed = mfs.remove("n", "a.txt")
         assert entered.wait(5)
         status = mfs.document_status(inserted.id)
@@ -230,7 +230,7 @@ def test_v1_catalog_requires_explicit_migration_with_adapters(tmp_path: Path) ->
     try:
         mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()])
         mfs.wait(mfs.upsert("n", "a.txt", b"migrated needle"), 10)
-        mfs._namespace_index("n").drop()
+        mfs._runtime.index("n").drop()
     finally:
         mfs.close()
     # A v1 document held an owned original and inline processed text, without targets.
@@ -321,7 +321,7 @@ def test_namespace_cleanup_failure_is_visible_and_retryable(
         mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()])
         mfs.upsert("n", "a.txt", b"old needle")
         mfs.wait_ready(10)
-        old_index = mfs._namespace_index("n")
+        old_index = mfs._runtime.index("n")
         original = old_index.drop
 
         def failing() -> None:

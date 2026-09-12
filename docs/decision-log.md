@@ -14,6 +14,9 @@
 | grep/read 与排名 search 分开，移除 query | 精确文字/路径匹配与 BM25/向量的合同不同 |
 | 不新增 ready 系统 | 应用已有状态判断和 grep fallback，避免扩大 MFS 职责 |
 | 播放转换、输入选择和产品可见性由 StashBase 负责 | MFS 提供文件搜索库，不接管应用业务 |
-| 拒绝重叠 External 根 | 父目录和子目录可用同一 namespace 的范围表达，避免同文件登记两次 |
+| 允许不同 namespace 的 External 根相同或嵌套 | StashBase 各 Library Folder 独立登记和配置；只有 External root 与 MFS 状态目录的重叠需要拒绝 |
+| 当前文件任务替代永久操作历史 | StashBase 需要最新文件状态；无变化 sync 不应永久增加回执，删除责任由文件 tombstone 保存 |
+| Lifecycle 集中状态事务，执行模块返回类型化结果 | 清晰核验 revision/attempt，防止迟到工作覆盖新目标 |
+| search 默认 eventual，timeout 默认 5 秒并限制总等待 | 交互搜索读取当前有效结果，调用方可按预算退出；超时检查贯穿搜索阶段 |
 
 历史设计保留在版本控制中；已经撤回的 External 稳定副本、全局模型继承、多阶段线程池和 SQLite 全文方案不再作为当前设计。

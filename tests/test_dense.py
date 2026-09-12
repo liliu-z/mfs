@@ -36,7 +36,9 @@ def test_dense_and_hybrid_then_open_without_embedder(tmp_path: Path) -> None:
         mfs.upsert("n", "cat.txt", b"cat cat")
         mfs.upsert("n", "dog.txt", b"dog dog")
         assert (
-            mfs.search("cat", mode="vector", timeout=10).items[0].value.document_id.doc_id
+            mfs.search("cat", mode="vector", consistency="strong", timeout=10)
+            .items[0]
+            .value.document_id.doc_id
             == "cat.txt"
         )
         assert (

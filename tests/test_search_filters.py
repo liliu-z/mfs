@@ -33,6 +33,7 @@ from mfs import (
 )
 from mfs._filters import compile_filters
 from mfs._index import SearchHit
+from mfs._search_execution import SearchDeadline
 
 
 class SourceProcessor(Utf8TextProcessor):
@@ -76,7 +77,7 @@ def test_ranked_affixes_and_source_types_push_down_before_topk_with_no_sqlite(
         statements: list[str] = []
         mfs._catalog.connection.set_trace_callback(statements.append)
         # Force a candidate budget of one at the actual backend for a rare type.
-        original = mfs._namespace_index("n").search
+        original = mfs._runtime.index("n").search
 
         def one_candidate(
             query: str | Sequence[float],
@@ -85,10 +86,18 @@ def test_ranked_affixes_and_source_types_push_down_before_topk_with_no_sqlite(
             documents: Sequence[DocumentId] | None = None,
             limit: int,
             expressions: Sequence[str] | None = None,
+            deadline: SearchDeadline | None = None,
         ) -> tuple[list[SearchHit], bool]:
-            return original(query, mode=mode, documents=documents, limit=1, expressions=expressions)
+            return original(
+                query,
+                mode=mode,
+                documents=documents,
+                limit=1,
+                expressions=expressions,
+                deadline=deadline,
+            )
 
-        monkeypatch.setattr(mfs._namespace_index("n"), "search", one_candidate)
+        monkeypatch.setattr(mfs._runtime.index("n"), "search", one_candidate)
         groups: list[list[Filter]] = [
             [ByNamespace("n"), ByExtension("pdf")],
             [ByNamespace("n"), ByMediaType("application/pdf")],
@@ -128,7 +137,7 @@ def test_under_path_excludes_prefix_siblings_and_sql_point_lookup_uses_primary_k
         mfs.open_namespace(registered.namespace, processors=[Utf8TextProcessor()])
     try:
         mfs.create_namespace("n", "external", root, processors=[Utf8TextProcessor()])
-        mfs.sync("n")
+        mfs.wait(mfs.sync("n"), 10)
         assert (
             mfs.search("needle", [UnderPath("n", "scope")], mode="bm25", limit=1)
             .items[0]
