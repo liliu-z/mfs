@@ -5,6 +5,7 @@ import os
 import subprocess
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import MappingProxyType
@@ -28,6 +29,8 @@ class Cancellation:
     def __init__(self) -> None:
         self._event = threading.Event()
         self._reason: str | None = None
+        self._yield_requested = False
+        self._started_at = time.monotonic()
 
     @property
     def reason(self) -> str | None:
@@ -40,6 +43,8 @@ class Cancellation:
     def check(self) -> None:
         if self._event.is_set():
             raise _ProcessingStopped(self._reason)
+        if self._yield_requested:
+            raise _ProcessingYielded()
 
     def wait(self, timeout: float | None = None) -> bool:
         return self._event.wait(timeout)
@@ -109,8 +114,6 @@ class ProcessingContext:
         self.cancellation.check()
         if not argv or (timeout is not None and (not math.isfinite(timeout) or timeout < 0)):
             raise ValueError("argv must be non-empty and timeout finite and non-negative")
-        import time
-
         from ._platform import ProcessTree
 
         with (

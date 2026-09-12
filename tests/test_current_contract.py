@@ -14,7 +14,6 @@ import pytest
 
 from mfs import (
     MFS,
-    ByNamespace,
     DocumentId,
     DocxProcessor,
     GCPolicy,
@@ -43,7 +42,7 @@ def test_docx_extraction_uses_one_derived_text_and_paragraph_locations(tmp_path:
     try:
         mfs.create_namespace("n", "internal", processors=[DocxProcessor()])
         mfs.wait(mfs.upsert("n", "a.docx", source.getvalue()), 10)
-        hit = mfs.search("needle", mode="bm25").items[0].value
+        hit = mfs.search("n", "needle", mode="bm25").items[0].value
         assert hit.text == "文档 needle\ntable content\n"
         assert hit.source_location.sources[0]["kind"] == "paragraphs"
         assert len(list((tmp_path / "state/namespaces").glob("*/derived/*.md"))) == 1
@@ -79,9 +78,9 @@ def test_html_greps_source_and_indexes_transient_extraction_across_reopen(tmp_pa
             else:
                 mfs.open_namespace("n", processors=[HtmlProcessor()])
                 mfs.reindex("n", timeout=10)
-            assert mfs.grep([TextMatch("markup")]).items
-            assert not mfs.search("markup", mode="bm25").items
-            assert mfs.search("needle", mode="bm25").items[0].value.text == "visible needle"
+            assert mfs.grep("n", [TextMatch("markup")]).items
+            assert not mfs.search("n", "markup", mode="bm25").items
+            assert mfs.search("n", "needle", mode="bm25").items[0].value.text == "visible needle"
             for file in (state / "namespaces").rglob("*"):
                 if file.is_file():
                     assert b"visible needle" not in file.read_bytes()
@@ -107,13 +106,13 @@ def test_reprocess_transaction_rolls_back_and_keeps_owned_source_for_missing_rou
             with pytest.raises(StorageFailed):
                 mfs.reprocess_namespace("n", processors=[])
         mfs.open_namespace("n", processors=[Utf8TextProcessor()])
-        assert mfs.search("needle", mode="bm25").items
+        assert mfs.search("n", "needle", mode="bm25").items
         reports = mfs.reprocess_namespace("n", processors=[])
         assert isinstance(reports, tuple)
         with pytest.raises(OperationFailed):
             mfs.wait(reports[0], 10)
-        assert not mfs.grep().items
-        assert not mfs.search("needle", mode="bm25", consistency="eventual").items
+        assert not mfs.grep("n").items
+        assert not mfs.search("n", "needle", mode="bm25", consistency="eventual").items
         for _ in range(3):
             assert mfs.collect_garbage().error is None
         restored = mfs.reprocess_namespace("n", processors=[Utf8TextProcessor()])
@@ -138,9 +137,7 @@ def test_scoped_search_and_receipts_work_without_other_namespace_binding(tmp_pat
     try:
         mfs.open_namespace("a", processors=[Utf8TextProcessor()])
         pending = mfs.upsert("b", "a.txt", b"new needle")
-        assert mfs.search(
-            "needle", filters=[ByNamespace("a")], mode="bm25", consistency="strong", timeout=5
-        ).items
+        assert mfs.search("a", "needle", mode="bm25", consistency="strong", timeout=5).items
         repeats = [mfs.upsert("b", "a.txt", b"new needle") for _ in range(3)]
         assert all(r.revision == pending.revision for r in repeats)
         assert (
@@ -187,7 +184,7 @@ def test_grep_does_not_return_revoked_text_after_slow_read(
 
         monkeypatch.setattr(Reader, "_read", slow)
         with ThreadPoolExecutor() as pool:
-            future = pool.submit(mfs.grep, [TextMatch("old")])
+            future = pool.submit(mfs.grep, "n", [TextMatch("old")])
             try:
                 assert entered.wait(5)
                 mfs.remove("n", "a.txt")
@@ -205,7 +202,9 @@ def test_grep_whole_word_budget_skips_partial_words(tmp_path: Path) -> None:
     try:
         mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()])
         mfs.wait(mfs.upsert("n", "a.txt", b"needles needles needles needle"), 10)
-        result = mfs.grep([TextMatch("needle", whole_word=True)], budget=GrepBudget(max_matches=1))
+        result = mfs.grep(
+            "n", [TextMatch("needle", whole_word=True)], budget=GrepBudget(max_matches=1)
+        )
         assert len(result.items) == 1 and len(result.items[0].matches) == 1
     finally:
         mfs.close()
@@ -237,12 +236,12 @@ def test_cancelled_cleanup_retry_keeps_cancellation(
                 lambda: calls == 2 and not mfs._tasks.targets[receipt.id].get("cleanup"), 10
             )
             assert mfs._tasks.targets[receipt.id]["state"] == "cancelled"
-        assert not mfs.grep().items
-        assert not mfs.search("old", mode="bm25", consistency="eventual").items
+        assert not mfs.grep("n").items
+        assert not mfs.search("n", "old", mode="bm25", consistency="eventual").items
         mfs.retry(receipt.id)
         mfs.configure_index("n", paused=False)
         mfs.wait(receipt, 10)
-        assert mfs.search("new", mode="bm25").items
+        assert mfs.search("n", "new", mode="bm25").items
     finally:
         mfs.close()
 
@@ -264,6 +263,6 @@ def test_legacy_text_processor_reuses_external_input_without_copy(tmp_path: Path
         mfs.wait(mfs.sync("n"), 10)
         assert not list((state / "namespaces").glob("*/derived/*.md"))
         (root / "a.txt").write_text("changed live text")
-        assert mfs.grep([TextMatch("changed")]).items
+        assert mfs.grep("n", [TextMatch("changed")]).items
     finally:
         mfs.close()

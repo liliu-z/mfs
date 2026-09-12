@@ -16,6 +16,7 @@ from ._catalog import Catalog
 from ._documents import source_map_json
 from ._json import JSONValue, compact_json
 from ._lifecycle import Lifecycle
+from ._namespace import NamespaceBinding
 from ._platform import fsync_directory
 from ._runtime import NamespaceRuntime
 from ._validation import validate_processed
@@ -41,7 +42,7 @@ class Preparation:
         self.transient_text: tuple[str, str] | None = None
 
     def execute(self, permit: ExecutionPermit) -> Prepared:
-        _, record = self.prepare_snapshot(permit.payload)
+        _, record = self.prepare_snapshot(permit.payload, permit.binding)
         return Prepared(record)
 
     def release_text(self, revision: str) -> None:
@@ -114,8 +115,7 @@ class Preparation:
         def checkpoint(state: JSONValue, files: Any) -> bool:
             cancellation.check()
             saved = self.artifacts.copy_files(work_dir, files)
-            self.lifecycle.checkpoint(identity, job, state, saved)
-            return False
+            return self.lifecycle.checkpoint(identity, job, state, saved)
 
         context = ProcessingContext(
             identity,
@@ -198,7 +198,9 @@ class Preparation:
         self.artifacts.cache(key, artifact)
         return value
 
-    def prepare_snapshot(self, job: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    def prepare_snapshot(
+        self, job: dict[str, Any], binding: NamespaceBinding | None
+    ) -> tuple[str, dict[str, Any]]:
         saved = self.catalog.connection.execute(
             "SELECT path FROM prepared WHERE revision=?", (job["revision"],)
         ).fetchone()
@@ -211,7 +213,7 @@ class Preparation:
             if snapshot.get("revision") != job["revision"]:
                 raise CorruptState("processed artifact does not match target revision")
             return artifact, snapshot
-        processor = self.runtime.processor_for(job)
+        processor = self.runtime.processor_for(job, binding)
         if processor is None:
             raise CapabilityUnavailable("registered Processor does not match accepted input")
         prepared = self.prepare(DocumentId(**job["identity"]), job, processor)
@@ -233,12 +235,14 @@ class Preparation:
         self.lifecycle.save_prepared(DocumentId(**job["identity"]), job, artifact, record)
         return artifact, record
 
-    def read_text(self, record: dict[str, Any], *, grep: bool = False) -> str:
+    def read_text(
+        self, record: dict[str, Any], permit: ExecutionPermit, *, grep: bool = False
+    ) -> str:
         if record.get("transient") and not grep:
             if self.transient_text is None or self.transient_text[0] != record["revision"]:
                 identity = DocumentId(**record["identity"])
-                job = self.lifecycle.target_record(identity)
-                processor = self.runtime.processor_for(job)
+                job = permit.payload
+                processor = self.runtime.processor_for(job, permit.binding)
                 if processor is None:
                     raise CapabilityUnavailable("transient index text requires its Processor")
                 self.prepare(identity, job, processor)

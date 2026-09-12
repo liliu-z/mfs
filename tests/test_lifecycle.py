@@ -78,16 +78,16 @@ def test_search_defaults_return_current_results_and_bound_explicit_strong_wait(
         pending = mfs.upsert("n", "pending.txt", b"needle awaiting indexing")
         with ThreadPoolExecutor() as pool:
             try:
-                result = pool.submit(mfs.search, "needle", mode="bm25").result(3)
+                result = pool.submit(mfs.search, "n", "needle", mode="bm25").result(3)
                 assert [item.value.document_id.doc_id for item in result.items] == ["ready.txt"]
-                waiting = pool.submit(mfs.search, "needle", mode="bm25", consistency="strong")
+                waiting = pool.submit(mfs.search, "n", "needle", mode="bm25", consistency="strong")
                 with pytest.raises(WaitTimeout):
                     waiting.result(7)
                 status = mfs.document_status(pending.id)
                 assert status is not None and status.indexed_revision is None
                 mfs.configure_index("n", paused=False)
                 mfs.wait(pending, 10)
-                assert len(mfs.search("needle", mode="bm25", consistency="strong").items) == 2
+                assert len(mfs.search("n", "needle", mode="bm25", consistency="strong").items) == 2
             finally:
                 # Also retire a waiter if a regression restores an unbounded default wait.
                 mfs.close()
@@ -108,17 +108,17 @@ def test_dense_wait_keeps_admission_and_current_grep_responsive(tmp_path: Path) 
         second = mfs.upsert("n", "b.txt", b"second document")
         second_status = mfs.document_status(second.id)
         assert second_status is not None and second_status.stage == "process"
-        assert len(mfs.grep([TextMatch("new")]).items) == 1
+        assert len(mfs.grep("n", [TextMatch("new")]).items) == 1
         with pytest.raises(WaitTimeout):
-            mfs.search("new", mode="bm25", consistency="strong", timeout=0.05)
+            mfs.search("n", "new", mode="bm25", consistency="strong", timeout=0.05)
         with ThreadPoolExecutor() as pool:
-            future = pool.submit(mfs.search, "old", mode="hybrid", consistency="eventual")
+            future = pool.submit(mfs.search, "n", "old", mode="hybrid", consistency="eventual")
             assert not future.result(3).items
         embedder.release.set()
         mfs.wait(receipt, 10)
         mfs.wait(second, 10)
-        assert len(mfs.grep([TextMatch("new|second", regex=True)]).items) == 2
-        assert not mfs.search("old", mode="bm25", timeout=10).items
+        assert len(mfs.grep("n", [TextMatch("new|second", regex=True)]).items) == 2
+        assert not mfs.search("n", "old", mode="bm25", timeout=10).items
     finally:
         embedder.release.set()
         mfs.close()
@@ -147,8 +147,8 @@ def test_late_revision_does_not_clear_new_pending_and_cancel_can_retry(tmp_path:
         status = mfs.document_status(identity)
         assert status is not None
         assert status.revision == status.indexed_revision == status.text_revision == new.revision
-        assert mfs.search("new", mode="bm25").items
-        assert not mfs.search("old", mode="bm25").items
+        assert mfs.search("n", "new", mode="bm25").items
+        assert not mfs.search("n", "old", mode="bm25").items
     finally:
         embedder.release.set()
         mfs.close()
@@ -219,7 +219,7 @@ def test_completed_embedding_batches_survive_reopen_without_reprocessing(tmp_pat
         wait_state(mfs, identity, "failed")
         status = mfs.document_status(identity)
         assert status is not None and status.completed_batches == 1 and status.total_batches == 2
-        assert not mfs.search("line", mode="bm25", consistency="eventual").items
+        assert not mfs.search("n", "line", mode="bm25", consistency="eventual").items
     finally:
         mfs.close()
     succeeding = GateEmbedder()
@@ -258,7 +258,7 @@ def test_processing_commit_failure_reuses_completed_artifact(
         mfs.upsert("n", "a.txt", b"durable OCR output")
         mfs.wait_ready(10)
         assert processor.calls == 1 and attempts == 2
-        assert mfs.grep(select="doc").items[0].value.text == "durable OCR output"
+        assert mfs.grep("n", select="doc").items[0].value.text == "durable OCR output"
     finally:
         mfs.close()
 
@@ -285,7 +285,7 @@ def test_idempotency_receipt_replays_after_later_update_and_reopen(tmp_path: Pat
         with pytest.raises(IdempotencyConflict):
             reopened.upsert("n", "a.txt", b"different", idempotency_key="request-1")
         assert (
-            reopened.grep([ByDocumentId(DocumentId("n", "a.txt"))], select="doc")
+            reopened.grep("n", [ByDocumentId(DocumentId("n", "a.txt"))], select="doc")
             .items[0]
             .value.text
             == "second"

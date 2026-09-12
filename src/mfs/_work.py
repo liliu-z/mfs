@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
+from ._namespace import NamespaceBinding
 from .processing import Cancellation
 from .types import DocumentId
 
@@ -28,6 +29,7 @@ class ExecutionPermit:
     token: str
     cancellation: Cancellation
     payload: dict[str, Any]
+    binding: NamespaceBinding | None
 
     @property
     def identity(self) -> DocumentId:

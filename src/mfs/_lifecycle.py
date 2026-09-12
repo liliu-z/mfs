@@ -5,7 +5,7 @@ import copy
 import threading
 import time
 import uuid
-from collections.abc import Container, Sequence
+from collections.abc import Container, Mapping, Sequence
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
@@ -13,6 +13,7 @@ import blake3
 
 from ._catalog import Catalog
 from ._json import JSONValue, canonical_json
+from ._namespace import NamespaceBinding
 from ._rules import excluded, validate_rules
 from ._validation import validate_namespace
 from ._work import (
@@ -37,12 +38,13 @@ from .errors import (
     MigrationRequired,
     NamespaceNotFound,
     OperationFailed,
+    ProcessingFailed,
     RetryableError,
     RuleConflict,
     StorageFailed,
     WaitTimeout,
 )
-from .processing import Cancellation, _ProcessingStopped
+from .processing import Cancellation, _ProcessingStopped, _ProcessingYielded
 from .types import DocumentId, DropReport, IgnoreRule, MutationReport, RuleSet, TaskStage, UnderPath
 
 if TYPE_CHECKING:
@@ -68,11 +70,17 @@ class Lifecycle:
         self.progress: dict[DocumentId, dict[str, Any]] = {}
         self.executing: set[tuple[DocumentId, str]] = set()
         self.cancellations: dict[tuple[DocumentId, str], Cancellation] = {}
+        self.queries: dict[str, int] = {}
+        self.queued_at: dict[DocumentId, tuple[str, float]] = {}
+        self.bound: Mapping[str, NamespaceBinding] = {}
+        self.unavailable: Container[str] = ()
+        self.storage_error: StorageFailed | None = None
         self.namespaces = dict(catalog.list_namespaces())
         with catalog.transaction():
             for name, record in self.namespaces.items():
                 record.setdefault("incarnation", uuid.uuid4().hex)
                 record.setdefault("binding", uuid.uuid4().hex)
+                record.setdefault("index_epoch", record["incarnation"])
                 catalog.put_namespace(name, record)
             for ns, doc, job in catalog.list_targets():
                 job.setdefault("identity", asdict(DocumentId(ns, doc)))
@@ -128,6 +136,8 @@ class Lifecycle:
         deadline = None if timeout is None else time.monotonic() + timeout
         with self.condition:
             while True:
+                if self.storage_error is not None:
+                    raise self.storage_error
                 if self.stopping:
                     raise Closed("MFS instance is closing")
                 pending = False
@@ -163,7 +173,11 @@ class Lifecycle:
                 self.condition.wait(remaining)
 
     def remember(self, identity: DocumentId, job: dict[str, Any]) -> None:
-        if job["kind"] != "upsert" or job.get("indexed_revision") != job["revision"]:
+        if (
+            job["kind"] != "upsert"
+            or job.get("indexed_revision") != job["revision"]
+            or "pending_manifest" in self.namespaces.get(identity.namespace, {})
+        ):
             self.visible.pop(identity, None)
         elif job.get("snapshot_id"):
             self.visible[identity] = job["snapshot_id"]
@@ -179,20 +193,35 @@ class Lifecycle:
             self.pending.pop(identity, None)
         else:
             self.pending[identity] = str(job["revision"])
+        self.track_queue(identity, job)
         self.condition.notify_all()
 
     def persist(self, identity: DocumentId, job: dict[str, Any]) -> None:
-        with self.catalog.transaction():
-            self.catalog.put_target(identity.namespace, identity.doc_id, job)
+        try:
+            with self.catalog.transaction():
+                self.catalog.put_target(identity.namespace, identity.doc_id, job)
+        except Exception:
+            # A committed checkpoint/claim can lose its acknowledgement. Adopt the
+            # exact durable value so a running target never becomes an orphan.
+            if self.catalog.get_target(identity.namespace, identity.doc_id) != job:
+                raise
         self.remember(identity, job)
 
     def current(self, identity: DocumentId, job: dict[str, Any]) -> bool:
         current = self.targets.get(identity)
         return (
             current is not None
+            and (identity, job.get("attempt_token", "")) in self.executing
             and current["revision"] == job["revision"]
             and (current["state"] != "cancelled" or bool(job.get("cleanup")))
             and current.get("attempt_token") == job.get("attempt_token")
+            and (
+                job["kind"] != "upsert"
+                or job["stage"] == "process"
+                or bool(job.get("cleanup"))
+                or job.get("index_epoch")
+                == self.namespaces.get(identity.namespace, {}).get("index_epoch")
+            )
             and (
                 job["kind"] == "drop"
                 or (
@@ -216,6 +245,7 @@ class Lifecycle:
         with self.condition:
             if not self.current(identity, job):
                 return
+            job = copy.deepcopy(self.targets[identity])
             job.update(state="pending", error=None, failures=0, next_run=0, **changes)
             self.persist(identity, job)
 
@@ -240,10 +270,8 @@ class Lifecycle:
                 self.catalog.clear_prepared(job["revision"])
             self.remember(identity, target)
 
-    def priority(self, identity: DocumentId, job: dict[str, Any]) -> tuple[float, float, str]:
-        if job["kind"] in ("drop", "delete", "rebuild"):
-            return (-100.0, 0.0, identity.doc_id)
-        base = (
+    def base_priority(self, identity: DocumentId, job: dict[str, Any]) -> int:
+        return (
             0
             if job.get("force")
             else 1
@@ -258,9 +286,75 @@ class Lifecycle:
             )
             else 2
         )
-        enqueued = float(job.get("enqueued_at", 0))
-        age = max(0, time.time() - enqueued) / 60.0
-        return (base - age, enqueued, identity.doc_id)
+
+    def runnable(self, identity: DocumentId, job: dict[str, Any]) -> bool:
+        if any(i == identity for i, _ in self.executing):
+            return False
+        if job["state"] not in ("pending", "retry_wait") and not (
+            job.get("cleanup") and job["state"] == "cancelled"
+        ):
+            return False
+        if job["kind"] in ("drop", "rebuild"):
+            incarnations = [
+                job.get("incarnation"),
+                *job.get("incarnations", []),
+                *job.get("retired_incarnations", []),
+            ]
+            if any(
+                incarnation is not None and self.queries.get(incarnation, 0)
+                for incarnation in incarnations
+            ):
+                return False
+        if job["kind"] == "upsert" and not job.get("cleanup"):
+            if identity.namespace not in self.bound:
+                return False
+            namespace = self.namespaces[identity.namespace]
+            if job["stage"] != "process" and (
+                "pending_manifest" in namespace
+                or (namespace["paused"] and namespace["indexing"] != "off")
+                or identity.namespace in self.unavailable
+            ):
+                return False
+        return True
+
+    def candidates(self) -> tuple[list[tuple[DocumentId, dict[str, Any]]], float | None]:
+        now, due_at = time.time(), None
+        ready: list[tuple[DocumentId, dict[str, Any]]] = []
+        for identity in self.pending:
+            job = self.targets[identity]
+            if not self.runnable(identity, job):
+                continue
+            due = float(job.get("next_run", 0))
+            if due > now:
+                due_at = due if due_at is None else min(due_at, due)
+                continue
+            ready.append((identity, job))
+        eligible = {i for i, _ in ready}
+        self.queued_at = {i: value for i, value in self.queued_at.items() if i in eligible}
+        for identity, job in ready:
+            self.track_queue(identity, job)
+        observed = time.monotonic()
+        return sorted(ready, key=lambda pair: self.priority(*pair, now=observed)), due_at
+
+    def track_queue(self, identity: DocumentId, job: dict[str, Any]) -> None:
+        if self.runnable(identity, job) and float(job.get("next_run", 0)) <= time.time():
+            if self.queued_at.get(identity, (None,))[0] != job["revision"]:
+                self.queued_at[identity] = (job["revision"], time.monotonic())
+        else:
+            self.queued_at.pop(identity, None)
+
+    def priority(
+        self, identity: DocumentId, job: dict[str, Any], *, now: float
+    ) -> tuple[int, float, float, str]:
+        queued = self.queued_at.get(identity)
+        start = queued[1] if queued else now
+        age = max(0, now - start) / 60.0 if queued else 0.0
+        return (
+            0 if job.get("cleanup") or job["kind"] in ("drop", "delete", "rebuild") else 1,
+            self.base_priority(identity, job) - age,
+            start,
+            str(identity),
+        )
 
     def fail_job(self, identity: DocumentId, job: dict[str, Any], error: Exception) -> None:
         with self.condition:
@@ -304,16 +398,7 @@ class Lifecycle:
                 if state == "retry_wait"
                 else 0,
             )
-            try:
-                self.persist(identity, job)
-            except Exception as persistence_error:
-                # Keep failed work pending even when the completion/error transaction itself fails.
-                job.update(
-                    state="retry_wait",
-                    next_run=time.time() + 0.5,
-                    error=f"{error}; state persistence failed: {persistence_error}",
-                )
-                self.remember(identity, job)
+            self.persist(identity, job)
 
     def save_prepared(
         self, identity: DocumentId, job: dict[str, Any], artifact: str, record: dict[str, Any]
@@ -332,41 +417,14 @@ class Lifecycle:
                 )
 
     def claim(
-        self, bound: Container[str], unavailable: Container[str], preferred: DocumentId | None
+        self, bound: Mapping[str, NamespaceBinding], unavailable: Container[str]
     ) -> ExecutionPermit | None:
         with self.condition:
+            self.bound, self.unavailable = bound, unavailable
             while not self.stopping:
                 now = time.time()
-                due_at: float | None = None
-                candidates = sorted(
-                    ((i, self.targets[i]) for i in self.pending),
-                    key=lambda pair: (
-                        not bool(
-                            pair[1].get("cleanup")
-                            or pair[1]["kind"] in ("delete", "drop", "rebuild")
-                        ),
-                        pair[0] != preferred,
-                        self.priority(*pair),
-                    ),
-                )
+                candidates, due_at = self.candidates()
                 for identity, current in candidates:
-                    if current["state"] not in ("pending", "retry_wait") and not (
-                        current.get("cleanup") and current["state"] == "cancelled"
-                    ):
-                        continue
-                    if current["kind"] == "upsert" and not current.get("cleanup"):
-                        if identity.namespace not in bound:
-                            continue
-                        namespace = self.namespaces[identity.namespace]
-                        if current["stage"] != "process" and (
-                            (namespace["paused"] and namespace["indexing"] != "off")
-                            or identity.namespace in unavailable
-                        ):
-                            continue
-                    due = float(current.get("next_run", 0))
-                    if due > now:
-                        due_at = due if due_at is None else min(due_at, due)
-                        continue
                     job = copy.deepcopy(current)
                     if job.get("cleanup"):
                         job.setdefault(
@@ -379,6 +437,8 @@ class Lifecycle:
                         else "running",
                         attempts=int(job.get("attempts", 0)) + 1,
                         attempt_token=uuid.uuid4().hex,
+                        index_epoch=self.namespaces.get(identity.namespace, {}).get("index_epoch"),
+                        indexing=self.namespaces.get(identity.namespace, {}).get("indexing"),
                     )
                     job.setdefault("identity", asdict(identity))
                     try:
@@ -388,6 +448,7 @@ class Lifecycle:
                         break
                     token = str(job["attempt_token"])
                     cancellation = Cancellation()
+                    self.queued_at.pop(identity, None)
                     self.executing.add((identity, token))
                     self.cancellations[(identity, token)] = cancellation
                     self.last_activity = time.monotonic()
@@ -401,12 +462,78 @@ class Lifecycle:
                         else FileWork(identity, str(job["revision"]))
                     )
                     return ExecutionPermit(
-                        subject, job.get("incarnation"), token, cancellation, job
+                        subject,
+                        job.get("incarnation"),
+                        token,
+                        cancellation,
+                        job,
+                        bound.get(identity.namespace),
                     )
                 else:
-                    preferred = None
                     self.condition.wait(None if due_at is None else max(0.01, due_at - now))
             return None
+
+    def finish_execution(
+        self, permit: ExecutionPermit, result: StepResult | None, error: BaseException | None
+    ) -> bool:
+        """Called only after the adapter stack has exited; retain its lease until durable."""
+        with self.condition:
+            for attempt in range(3):
+                try:
+                    committed = False
+                    if self.current(permit.identity, permit.payload):
+                        if error is not None and not isinstance(
+                            error, (_ProcessingStopped, _ProcessingYielded)
+                        ):
+                            self.fail_job(
+                                permit.identity,
+                                permit.payload,
+                                error
+                                if isinstance(error, Exception)
+                                else ProcessingFailed(f"processor aborted: {error!r}"),
+                            )
+                        elif (
+                            error is not None
+                            or permit.cancellation._yield_requested
+                            or self.stopping
+                        ):
+                            job = dict(self.targets[permit.identity], state="pending", next_run=0)
+                            self.persist(permit.identity, job)
+                        elif result is not None:
+                            committed = self.commit(permit, result)
+                    self.retire(permit)
+                    return committed
+                except Exception as persistence_error:
+                    # A lost acknowledgement may already have committed. Reconcile before
+                    # retrying the transition, including a completion that removed plan data.
+                    try:
+                        durable = self.catalog.get_target(
+                            permit.identity.namespace, permit.identity.doc_id
+                        )
+                        if durable is not None and durable != self.targets.get(permit.identity):
+                            if permit.payload["kind"] == "rebuild":
+                                namespace = permit.identity.namespace
+                                record = self.catalog.get_namespace(namespace)
+                                if record is not None:
+                                    self.namespaces[namespace] = record
+                                    for ns, doc, target in self.catalog.list_targets():
+                                        if ns == namespace:
+                                            self.remember(DocumentId(ns, doc), target)
+                            self.remember(permit.identity, durable)
+                            if durable["state"] == "running":
+                                self.persist(permit.identity, dict(durable, state="pending"))
+                            self.retire(permit)
+                            return result is not None and error is None
+                    except Exception:
+                        pass
+                    if attempt == 2:
+                        self.storage_error = StorageFailed(
+                            f"execution completion could not persist: {persistence_error}"
+                        )
+                        self.stop()
+                        return False
+                    self.condition.wait(0.05 * (attempt + 1))
+            return False
 
     def retire(self, permit: ExecutionPermit) -> None:
         with self.condition:
@@ -428,6 +555,11 @@ class Lifecycle:
                 or not self.current(identity, job)
             ):
                 return False
+            # An unchanged-content sync may refresh source stat while this permit
+            # executes. Commit the stage onto the latest target, not its old copy.
+            job = copy.deepcopy(current)
+            if identity in self.progress:
+                job["progress"] = self.progress[identity]
             if isinstance(result, Prepared):
                 self.processed(identity, job, result.record)
             elif isinstance(result, Chunked):
@@ -732,8 +864,19 @@ class Lifecycle:
                     previous["revision"],
                 )
                 with self.catalog.transaction():
+                    refreshed = None
+                    if ns["kind"] == "external":
+                        observed = dict(
+                            previous["source"], size=source.size, mtime_ns=source.mtime_ns
+                        )
+                        if observed != previous["source"]:
+                            refreshed = dict(previous, source=observed)
+                            self.catalog.put_target(identity.namespace, identity.doc_id, refreshed)
                     if idempotency_key is not None:
                         self.catalog.put_operation(idempotency_key, request_hash, asdict(report))
+                if refreshed is not None:
+                    # This observation changes no task or publication eligibility.
+                    self.targets[identity] = copy.deepcopy(refreshed)
                 return report
             revision = uuid.uuid4().hex
             external = ns["kind"] == "external"
@@ -797,6 +940,7 @@ class Lifecycle:
     ) -> None:
         with self.condition:
             record = dict(self.namespaces[namespace], **(changes or {}))
+            record["index_epoch"] = uuid.uuid4().hex
             record["pending_manifest"] = manifest
             previous = self.targets.get(DocumentId(namespace, ""), {})
             job = dict(
@@ -817,15 +961,20 @@ class Lifecycle:
             with self.catalog.transaction():
                 self.catalog.put_namespace(namespace, record)
                 self.catalog.put_target(namespace, "", job)
+                self.catalog.clear_vector_cache(record["incarnation"])
             self.namespaces[namespace] = record
             self.visible = {i: v for i, v in self.visible.items() if i.namespace != namespace}
             self.remember(DocumentId(namespace, ""), job)
 
     def configure(self, namespace: str, record: dict[str, Any]) -> None:
         with self.condition:
+            record = dict(record, index_epoch=record.get("index_epoch", record["incarnation"]))
             with self.catalog.transaction():
                 self.catalog.put_namespace(namespace, record)
             self.namespaces[namespace] = copy.deepcopy(record)
+            for identity, job in self.targets.items():
+                if identity.namespace == namespace:
+                    self.track_queue(identity, job)
             self.condition.notify_all()
 
     def resume_blocked(self, namespace: str) -> None:
@@ -840,18 +989,39 @@ class Lifecycle:
     ) -> None:
         with self.condition:
             self.check_execution(identity, job)
-            job["progress"] = value
             self.progress[identity] = value
             if persist:
-                self.persist(identity, job)
+                self.persist(identity, dict(self.targets[identity], progress=value))
 
     def checkpoint(
         self, identity: DocumentId, job: dict[str, Any], state: JSONValue, files: dict[str, str]
-    ) -> None:
+    ) -> bool:
         with self.condition:
             self.check_execution(identity, job)
+            job = copy.deepcopy(self.targets[identity])
             job["checkpoint"] = dict(state=state, files=files)
+            if identity in self.progress:
+                job["progress"] = self.progress[identity]
             self.persist(identity, job)
+            candidates, _ = self.candidates()
+            now = time.monotonic()
+            should_yield = (
+                bool(candidates)
+                and self.priority(*candidates[0], now=now)[:2]
+                < self.priority(identity, job, now=now)[:2]
+            )
+            cancellation = self.cancellations[(identity, job["attempt_token"])]
+            if should_yield:
+                candidate_id, candidate = candidates[0]
+                should_yield = (
+                    self.priority(candidate_id, candidate, now=now)[0] == 0
+                    or self.base_priority(candidate_id, candidate)
+                    < self.base_priority(identity, job)
+                    or time.monotonic() - cancellation._started_at >= 0.05
+                )
+            if should_yield:
+                cancellation._yield_requested = True
+            return should_yield
 
     def namespace_record(self, namespace: str) -> dict[str, Any]:
         with self.condition:
@@ -982,10 +1152,6 @@ class ReadView:
         self._unavailable = unavailable
         self.condition = lifecycle.condition
 
-    def namespaces(self) -> dict[str, dict[str, Any]]:
-        with self.condition:
-            return copy.deepcopy(self._lifecycle.namespaces)
-
     def namespace(self, namespace: str) -> dict[str, Any]:
         with self.condition:
             self.require_modern_namespace(namespace)
@@ -1011,6 +1177,7 @@ class ReadView:
             return (
                 namespace is not None
                 and self._lifecycle.visible.get(identity) == snapshot
+                and "pending_manifest" not in namespace
                 and not excluded(
                     tuple(IgnoreRule(**r) for r in namespace.get("rules", [])), identity.doc_id
                 )
@@ -1040,6 +1207,8 @@ class ReadView:
                 timeout,
             )
             if lifecycle.stopping:
+                if lifecycle.storage_error is not None:
+                    raise lifecycle.storage_error
                 raise Closed("MFS instance is closing")
             if not completed:
                 raise WaitTimeout("selected namespaces have not completed indexing")

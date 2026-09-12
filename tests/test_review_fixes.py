@@ -45,13 +45,13 @@ def test_crlf_text_keeps_utf8_offsets_through_read_grep_search_reindex_and_reope
         for _ in range(2):
             document = mfs.read(DocumentId("n", name))
             assert document is not None and document.text == text
-            result = mfs.grep([TextMatch("needle")], select="doc")
+            result = mfs.grep("n", [TextMatch("needle")], select="doc")
             assert result.items[0].value.text == text
             match = result.items[0].matches[0]
             assert text.encode()[match.text_start : match.text_end] == b"needle"
             assert match.text_start == len("header\r\n二 ".encode())
             assert match.source_location.sources == ({"kind": "lines", "start": 2, "end": 2},)
-            hit = mfs.search("needle", mode="bm25").items[0].value
+            hit = mfs.search("n", "needle", mode="bm25").items[0].value
             assert hit.text == text.encode()[hit.text_start : hit.text_end].decode()
             assert "\r\n" in hit.text
             mfs.reindex("n", timeout=10)
@@ -165,7 +165,7 @@ def test_wait_follows_current_rebuild_even_when_sync_and_source_are_unchanged(
         assert mfs.scope_status("n", "a.txt").total == 1
         model.release.set()
         mfs.wait(observed, 10)
-        assert mfs.search("needle", mode="vector").items
+        assert mfs.search("n", "needle", mode="vector").items
     finally:
         model.release.set()
         mfs.close()
@@ -239,20 +239,20 @@ else:
         current = mfs.document_status(DocumentId("n", "a.txt"))
         assert current is not None and current.state == "succeeded"
         assert current.revision == target["revision"]
-        assert not mfs.search("old", mode="bm25").items
+        assert not mfs.search("n", "old", mode="bm25").items
         document = mfs.read(DocumentId("n", "a.txt"))
         if operation == "remove":
             assert document is None
         else:
             assert document is not None and document.text == "new needle"
-            assert len(mfs.search("new", mode="bm25").items) == 1
+            assert len(mfs.search("n", "new", mode="bm25").items) == 1
         # Explicit request deduplication survives, but doesn't resurrect old file state.
         replayed = mfs.upsert("n", "a.txt", b"old needle", idempotency_key="first")
         assert replayed.revision == accepted.revision
         mfs.wait(replayed, 0)
         assert mfs.document_status(replayed.id) == current
         connection = mfs._catalog.connection
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         assert connection.execute("SELECT count(*) FROM targets").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM operations").fetchone()[0] == 1
         tables = {

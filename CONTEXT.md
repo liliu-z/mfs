@@ -17,7 +17,7 @@ _Avoid_: 独立数据库、权限租户。
 
 **Source Policy（源参与规则）**：一个 Namespace 自己拥有的有序输入规则，没有全局继承；被排除的输入不通过另一个检索入口重新出现。
 
-**Search Scope（检索范围）**：一次检索或就绪判断所针对的文档集合，可由 Namespace、子路径及具体身份表达。
+**Search Scope（检索范围）**：一次检索必须显式指定一个 Namespace；子路径及具体身份只能缩小其内的文档集合。当前工作等待另按文件或 namespace/path 指定范围。
 
 **Source Revision（源版本）**：MFS 已经确认接收的一版源内容与处理配置；例如，同一份 PDF 修改前、修改后是两个源版本。它不代表文字提取或索引已经完成，也不是一次重试的编号。
 
@@ -42,7 +42,7 @@ _Avoid_: Milvus Snapshot、数据库备份。
 
 **Grep（精确匹配）**：对文字或源路径执行字面/正则匹配；External 直接文本读取外部文件，二进制正文需提取文字，路径匹配只需元数据。它不依赖排名索引，不保证与旧索引属于同一版外部内容。
 
-**Indexed Search（索引检索）**：BM25、向量或 hybrid 排序检索；它的就绪与文字是否已可 Grep 分开判断。
+**Indexed Search（索引检索）**：单 Namespace 内的 BM25、向量或 hybrid 排序检索；它的就绪与文字是否已可 Grep 分开判断。
 
 **Accepted（已接收）**：MFS 已持久记录请求并承担后续工作的责任；External 请求只保存引用，不保证输入稍后仍存在或未变。
 _Avoid_: Indexed、Ready。

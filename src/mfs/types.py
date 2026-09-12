@@ -286,14 +286,6 @@ class AnyOf(Filter):
 
 
 @dataclass(frozen=True, slots=True, init=False)
-class ByNamespace(Filter):
-    namespaces: tuple[str, ...]
-
-    def __init__(self, namespaces: str | Sequence[str]) -> None:
-        object.__setattr__(self, "namespaces", _tuple_or_one(namespaces))
-
-
-@dataclass(frozen=True, slots=True, init=False)
 class ByDocumentId(Filter):
     ids: tuple[DocumentId, ...]
 

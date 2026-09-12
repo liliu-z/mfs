@@ -69,13 +69,13 @@ raise AssertionError("crash boundary was not reached")
     try:
         mfs.wait_ready(10)
         if boundary == "before_accept_commit":
-            assert not mfs.grep().items
+            assert not mfs.grep("n").items
             for _ in range(3):
                 assert mfs.collect_garbage().error is None
             assert not list((state / "namespaces").glob("*/originals/*"))
         else:
-            assert mfs.grep(select="doc").items[0].value.text == "durable needle"
-            assert len(mfs.search("needle", mode="bm25").items) == 1
+            assert mfs.grep("n", select="doc").items[0].value.text == "durable needle"
+            assert len(mfs.search("n", "needle", mode="bm25").items) == 1
             assert mfs._runtime.index("n").count_document(DocumentId("n", "a.txt")) == 1
     finally:
         mfs.close()
@@ -107,7 +107,7 @@ def test_lost_accept_ack_reconciles_live_pending_and_replays_receipt(
         receipt = mfs.upsert("n", "a.txt", b"accepted", idempotency_key="request")
         assert receipt.outcome == "added"
         mfs.wait_ready(10)
-        assert mfs.search("accepted", mode="bm25").items
+        assert mfs.search("n", "accepted", mode="bm25").items
     finally:
         mfs.close()
 
@@ -141,8 +141,8 @@ def test_namespace_recreation_while_old_publication_runs_preserves_new_incarnati
         assert not mfs.status().ready
         release.set()
         mfs.wait_ready(10)
-        assert not mfs.search("old", mode="bm25").items
-        assert mfs.search("new", mode="bm25").items[0].value.document_id.doc_id == "new.txt"
+        assert not mfs.search("n", "old", mode="bm25").items
+        assert mfs.search("n", "new", mode="bm25").items[0].value.document_id.doc_id == "new.txt"
     finally:
         release.set()
         mfs.close()
@@ -168,7 +168,9 @@ def test_search_does_not_hold_publication_lock_after_strong_admission(
 
         monkeypatch.setattr(mfs._view, "wait_ready", admitted)
         with ThreadPoolExecutor() as pool:
-            future = pool.submit(mfs.search, "new", mode="bm25", consistency="strong", timeout=10)
+            future = pool.submit(
+                mfs.search, "n", "new", mode="bm25", consistency="strong", timeout=10
+            )
             try:
                 assert entered.wait(5)
                 mfs.upsert("n", "a.txt", b"new content")
@@ -205,15 +207,15 @@ def test_pending_delete_keeps_ready_false_and_revokes_old_hit(
         assert entered.wait(5)
         status = mfs.document_status(inserted.id)
         assert status and status.text_revision is None and status.indexed_revision is None
-        assert not mfs.grep().items
-        assert not mfs.search("old", mode="bm25", consistency="eventual").items
+        assert not mfs.grep("n").items
+        assert not mfs.search("n", "old", mode="bm25", consistency="eventual").items
         with pytest.raises(WaitTimeout):
             mfs.wait_ready(0)
         release.set()
         mfs.wait(removed, 10)
         status = mfs.document_status(inserted.id)
         assert status and status.indexed_revision is None
-        assert not mfs.search("old", mode="bm25").items
+        assert not mfs.search("n", "old", mode="bm25").items
     finally:
         release.set()
         mfs.close()
@@ -262,12 +264,12 @@ def test_v1_catalog_requires_explicit_migration_with_adapters(tmp_path: Path) ->
     reopened = MFS.open(path)
     try:
         with pytest.raises(MigrationRequired):
-            reopened.grep()
+            reopened.grep("n")
         reopened.migrate_namespace("n", processors=[Utf8TextProcessor()], indexing="bm25")
         reopened.wait_ready(10)
-        assert reopened.grep(select="doc").items[0].value.text == "migrated needle"
-        assert reopened.search("needle", mode="bm25").items
-        assert not reopened.search("stale", mode="bm25").items
+        assert reopened.grep("n", select="doc").items[0].value.text == "migrated needle"
+        assert reopened.search("n", "needle", mode="bm25").items
+        assert not reopened.search("n", "stale", mode="bm25").items
         record = reopened._catalog.get_document("n", "a.txt")
         assert record is not None and "text" not in record
         status = reopened.document_status(DocumentId("n", "a.txt"))
@@ -302,7 +304,7 @@ def test_reindex_retries_failed_index_target_and_status_does_not_hydrate_text(
             assert mfs.document_status(identity) is not None
         embedder.fail = False
         assert mfs.reindex("n", timeout=10).documents == 1
-        assert mfs.search("needle", mode="bm25").items
+        assert mfs.search("n", "needle", mode="bm25").items
     finally:
         mfs.close()
 
@@ -338,7 +340,7 @@ def test_namespace_cleanup_failure_is_visible_and_retryable(
         monkeypatch.setattr(old_index, "drop", original)
         mfs.retry(tasks[0].id)
         mfs.wait_ready(10)
-        assert not mfs.search("old", mode="bm25").items
-        assert mfs.search("new", mode="bm25").items
+        assert not mfs.search("n", "old", mode="bm25").items
+        assert mfs.search("n", "new", mode="bm25").items
     finally:
         mfs.close()

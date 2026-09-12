@@ -46,15 +46,15 @@ Context 的取消、report_progress 和 checkpoint 都可选。应用 Processor 
 
 | 应用意图 | MFS 入口 |
 | --- | --- |
-| 精确文字、正则、名称/路径匹配 | grep |
+| 精确文字、正则、名称/路径匹配 | grep(namespace, filters=...) |
 | 查看已知文档 | read |
-| 原 semantic/hybrid 意图 | search(mode="hybrid") |
-| 只按词频排序 | search(mode="bm25") |
-| 纯向量排序 | search(mode="vector") |
+| 原 semantic/hybrid 意图 | search(namespace, text, mode="hybrid") |
+| 只按词频排序 | search(namespace, text, mode="bm25") |
+| 纯向量排序 | search(namespace, text, mode="vector") |
 
 旧 public keyword 使用磁盘/派生文字 grep，并不是 BM25；旧 public semantic 通常是 dense + BM25 的 hybrid。新 MFS 与旧 daemon 的切片和候选量不完全相同，不能因使用 Milvus Lite 就宣称排名一致。
 
-新实现每 namespace 独立 collection，筛选在后端 top-k 前应用；跨 namespace 使用排名合并。旧 daemon 的扩展名过滤、hybrid 候选数和旧 Chunker 窗口需要通过实际检索效果评估迁移。
+新实现每 namespace 独立 collection，search/grep 都必须显式传入一个 namespace；筛选在后端 top-k 前应用。MFS 不提供跨 namespace 查询和排名合并。应用若保留全 Library 入口，应在应用层定义 Folder 范围和结果呈现，不把跨集合的相关性排序交给 MFS。旧 daemon 的扩展名过滤、hybrid 候选数和旧 Chunker 窗口需要通过实际检索效果评估迁移。
 
 ## 规则与状态
 
@@ -90,14 +90,24 @@ MFS 已有 reindex(namespace, embedder=..., indexing="hybrid")，可以显式换
 
 RECEIPT-002 已改为按当前目标等待，永久历史等待表已删除；源文字以前成功过，补向量尚未完成时 wait(sync(...)) 仍等待当前构建。StashBase daemon 尚未改接新库，其调用和结果映射仍为 INTEGRATION-001 的待实施工作。
 
+## External 重命名与计算复用
+
+External 重命名由覆盖新旧位置的 sync 观察：旧路径身份被删除，新路径成为新 DocumentId。这个文件生命周期不需要 rename 方法，内容相同的复制也可以走同一套计算复用。仅同步新位置不会自动观察范围外的旧位置。
+
+向量计算缓存已独立于搜索可见性：同 namespace incarnation、index_epoch、dense 配置和片段 hash 可以复用已完整验证的向量，旧路径失效和物理删除不再清掉这份计算结果。缓存持久化，重开后仍可命中；每实例最多 32 MiB 逻辑数据，LRU 淘汰或损坏时重新计算。显式 reindex 清理旧缓存并推进构建代，drop 清理旧 incarnation，不跨 namespace 复用。
+
+Processor 只有显式声明 cache_scope="content" 才能跨路径复用处理结果；应用借用的派生文字也必须满足引用有效性。升级时缓存为空、处理/模型配置改变或缓存淘汰，都可能发生重新计算，因此不承诺任意规模纯重命名零 embedding。文件生命周期仍由 sync 观察新旧位置完成。
+
 ## 扫描开销与处理调度
 
-SYNC-002 已修复：首次或 content sync 列目录后，文件 hash 校验使用规范路径逐段安全 open 重查身份，不再每文件重新列完整父目录。保留 no-follow、inode、大小写和并发变化检查。stat 未变的后续 sync 仍走短路。
+SYNC-002 已修复：首次或 content sync 列目录后，文件 hash 校验使用规范路径逐段安全 open 重查身份，不再每文件重新列完整父目录。保留 no-follow、inode、大小写和并发变化检查。stat 未变的后续 sync 仍走短路。仅 mtime 改变而 hash 相同时，会更新观察 stat 并保留当前任务；之后的 stat sync 恢复短路，执行中的旧任务副本不会覆盖新观察。
 
-长转录的调度差异见 [设计第 12 节](design.md#12-暂不实施的调度与搜索扩展)：StashBase 当前每 10 分钟音频单元写 checkpoint 后调用 yieldLane；MFS 的 Context 已有恢复能力，set_active_scopes 已提供待领取文件的优先级提示；本轮保持一个文件连续处理，checkpoint 不触发抢占。协作让出属于后续可选讨论。影响是新打开/新导入文件的处理和索引延迟，已发布文字的 grep、已有索引的 eventual 搜索不需要等整段录音处理完。
+[单 worker 协作让出](design.md#单-worker-协作让出已实现)已启用：StashBase 的 Processor 可以在完成音频/页单元后调用 context.checkpoint；应用用 set_active_scopes 标出当前目录。MFS 先持久保存中间数据，等旧调用和子进程退出，再运行更紧急的可运行目标；恢复时提供 resume_state/resume_files。StashBase 的十分钟音频单元表示音频长度，不是执行耗时上限。
+
+当前只有一个文件 worker，没有恢复 StashBase 的 2 light/1 heavy 并行吞吐；如果需要该容量，按设计第 12 节方案 B 单独实施。已发布文字的 grep 和已有索引的 eventual search 独立运行。重建/drop 等已经获准的查询真实退出后才破坏旧 collection，包括调用方已超时而 embedding 仍在运行的情况。
 
 ## 过渡与查询等待
 
-若过渡期只借用 StashBase 已准备的文件，Adapter 必须先验证源 hash 与完成标记；先前因产物未准备而 blocked 的目标，在应用完成转换后显式 retry/reprocess。相同源 bytes 的重复 sync 沿用目标，不会自动解除 blocked。此通知只在保留应用准备流程的过渡方案中需要，不是 MFS 调度 Processor 完整执行时的额外必需队列。
+若过渡期只借用 StashBase 已准备的文件，Adapter 必须先验证源 hash、转换配置与完成标记。相同源 bytes 的重复 sync 沿用目标，不会自动解除 blocked；用户明确要求恢复时可使用 retry/reprocess。自动完成通知不能直接调用无条件 retry：它会清取消门，且通知可能先于 blocked 提交。需要按 namespace incarnation/revision 限定的持久可重放唤醒与不可变产物保留合同，详见设计第 12 节方案 C。这个宿主准备方案的并发通知 Interface 尚未实现；MFS 调度 Processor 完整执行的方案不需要跨进程完成通知。
 
-默认 search 为 eventual，不等后台索引补齐；所有 consistency 模式默认 timeout=5 秒，限制搜索调用方的总等待，过期返回 WaitTimeout。RPC 将应用传入的预算交给 MFS 并映射超时错误。已经进入外部服务的调用未必立即终止，MFS 在阶段边界检查期限并丢弃迟到结果。strong 当前按 namespace 等待；一个 Folder 一个 namespace 已隔离其他 Folder，同一 Folder 内子目录是否另需 strong 暂不实施。
+默认 search 为 eventual，不等后台索引补齐；所有 consistency 模式默认 timeout=5 秒，限制搜索调用方的总等待，过期返回 WaitTimeout。RPC 将应用传入的预算交给 MFS 并映射超时错误；不能在串行 dispatcher 中执行长期 wait/reindex，使后续取消、状态或准备完成通知无法处理。已经进入外部服务的调用未必立即终止，MFS 在阶段边界检查期限并丢弃迟到结果。strong 当前按 namespace 等待；一个 Folder 一个 namespace 已隔离其他 Folder，同一 Folder 内子目录是否另需 strong 暂不实施。

@@ -94,7 +94,7 @@ def test_checkpoint_cancel_reopen_retry_and_atomic_artifact(tmp_path: Path) -> N
         status = mfs.document_status(identity)
         assert status and status.progress and status.progress.completed == 1
         assert status.content_hash and status.source_size == 6
-        assert not mfs.grep().items
+        assert not mfs.grep("n").items
         mfs.cancel(identity)
         wait_state(mfs, identity, "cancelled", retired=True)
         with pytest.raises(OperationFailed) as error:
@@ -114,7 +114,7 @@ def test_checkpoint_cancel_reopen_retry_and_atomic_artifact(tmp_path: Path) -> N
         assert adapter.resumed
         with mfs.open_artifact(identity, "transcript") as artifact:
             assert artifact.read() == b'{"complete":true}'
-            assert artifact.snapshot_id == mfs.grep(select="doc").items[0].value.snapshot_id
+            assert artifact.snapshot_id == mfs.grep("n", select="doc").items[0].value.snapshot_id
         assert mfs.scope_status("n").states == {"succeeded": 1}
         assert mfs.list_document_statuses("n", path="a.txt", limit=1)[0].artifacts == (
             "transcript",
@@ -152,7 +152,7 @@ def test_cancel_gate_survives_new_source_and_reopen(tmp_path: Path) -> None:
         mfs.retry(identity)
         mfs.wait(new, 10)
         assert not adapter.resumed  # Checkpoints belong to the old revision only.
-        assert mfs.grep(select="doc").items[0].value.text == "changed"
+        assert mfs.grep("n", select="doc").items[0].value.text == "changed"
     finally:
         mfs.close()
 
@@ -183,7 +183,7 @@ def test_wait_is_scoped_and_durable_and_receipts_use_global_ready(tmp_path: Path
         mfs.wait(good, 0)
         deletion = mfs.remove("n", "good.txt")
         mfs.wait(deletion, 10)
-        assert not mfs.search("needle", mode="bm25", consistency="eventual").items
+        assert not mfs.search("n", "needle", mode="bm25", consistency="eventual").items
         mfs.wait(good, 0)  # Successful historical operations stay successful.
         with pytest.raises(OperationFailed):
             mfs.wait(bad, 0)
@@ -202,7 +202,7 @@ def test_wait_is_scoped_and_durable_and_receipts_use_global_ready(tmp_path: Path
         fresh = mfs.upsert("n", "fresh.txt", b"fresh")
         mfs.wait(drop, 10)
         mfs.wait(fresh, 10)
-        assert mfs.search("fresh", mode="bm25").items
+        assert mfs.search("n", "fresh", mode="bm25").items
     finally:
         mfs.close()
 
@@ -252,16 +252,16 @@ def test_reuse_across_sync_calls_preserves_ids_and_reprocess_bypasses_process(
         (root / "b.txt").write_text("reuse needle")
         mfs.wait(mfs.sync("n"), 10)
         assert processor.calls == 1
-        assert embedder.calls == 2  # Last live vector was deleted along with a.txt.
+        assert embedder.calls == 1  # Complete computations survive removal of search rows.
         (root / "c.txt").write_text("reuse needle")
         mfs.wait(mfs.sync("n"), 10)
-        assert {i.value.doc_id for i in mfs.grep().items} == {"b.txt", "c.txt"}
+        assert {i.value.doc_id for i in mfs.grep("n").items} == {"b.txt", "c.txt"}
         assert {
-            i.value.doc_id for i in mfs.search("needle", mode="bm25", select="doc_id").items
+            i.value.doc_id for i in mfs.search("n", "needle", mode="bm25", select="doc_id").items
         } == {"b.txt", "c.txt"}
         mfs.wait(mfs.reprocess(DocumentId("n", "b.txt")), 10)
         assert processor.calls == 2
-        assert embedder.calls == 2
+        assert embedder.calls == 1
     finally:
         mfs.close()
 
@@ -348,14 +348,14 @@ def test_unsupported_sniff_is_bounded_and_case_rename_retires_old_spelling(
         receipt = mfs.sync("n")
         mfs.wait(receipt, 10)
         assert receipt.removed == (DocumentId("n", "Note.txt"),)
-        assert [i.value.doc_id for i in mfs.grep().items] == ["note.txt"]
+        assert [i.value.doc_id for i in mfs.grep("n").items] == ["note.txt"]
         assert [
-            i.value.doc_id for i in mfs.search("needle", mode="bm25", select="doc_id").items
+            i.value.doc_id for i in mfs.search("n", "needle", mode="bm25", select="doc_id").items
         ] == ["note.txt"]
         assert sizes == [6, 6]
         (root / "note.txt").write_text("changed")
         mfs.wait(mfs.sync("n"), 10)
-        assert not mfs.search("needle", mode="bm25").items
+        assert not mfs.search("n", "needle", mode="bm25").items
     finally:
         mfs.close()
 
@@ -430,7 +430,7 @@ if not m.list_namespaces():
     m.create_namespace('n', 'internal', processors=[P()])
 m.upsert("n","a.txt",b"source")
 m.wait_ready(10)
-assert m.grep(select="doc").items[0].value.text=="recovered"
+assert m.grep("n", select="doc").items[0].value.text=="recovered"
 m.close()
 """
     first = subprocess.run(
@@ -478,7 +478,7 @@ def test_sync_wait_includes_unchanged_pending_and_descendant_cleanup(
         release.set()
         mfs.wait(receipt, 10)
         mfs.wait(unchanged, 10)
-        assert not mfs.search("descendant", mode="bm25", consistency="eventual").items
+        assert not mfs.search("n", "descendant", mode="bm25", consistency="eventual").items
     finally:
         release.set()
         mfs.close()
@@ -501,7 +501,7 @@ def test_delete_runs_after_rejected_adapter_binding(tmp_path: Path) -> None:
         with pytest.raises(NamespaceCompatibilityError):
             mfs.open_namespace("n", processors=[Utf8TextProcessor()], chunker=chunker)
         mfs.wait(mfs.remove("n", "a.txt"), 10)
-        assert not mfs.search("retire", mode="bm25", consistency="eventual").items
+        assert not mfs.search("n", "retire", mode="bm25", consistency="eventual").items
     finally:
         mfs.close()
 
@@ -522,7 +522,7 @@ def test_corrupt_weak_cache_recomputes_and_path_dependent_adapters_do_not_share(
         (mfs._path / row[0]).write_text('{"text":"tampered"}')
         mfs.wait(mfs.upsert("n", "b.txt", b"cache"), 10)
         assert processor.calls == 2
-        assert all(i.value.text == "cache" for i in mfs.grep(select="doc").items)
+        assert all(i.value.text == "cache" for i in mfs.grep("n", select="doc").items)
     finally:
         mfs.close()
 
@@ -542,7 +542,10 @@ def test_corrupt_weak_cache_recomputes_and_path_dependent_adapters_do_not_share(
         mfs.wait(mfs.upsert("n", "first.txt", b"same"), 10)
         mfs.wait(mfs.upsert("n", "second.txt", b"same"), 10)
         assert adapter.calls == 2
-        assert {i.value.text for i in mfs.grep(select="doc").items} == {"first.txt", "second.txt"}
+        assert {i.value.text for i in mfs.grep("n", select="doc").items} == {
+            "first.txt",
+            "second.txt",
+        }
     finally:
         mfs.close()
 
@@ -600,7 +603,7 @@ def test_gc_recovers_claimed_deletion_and_never_changes_task_state(tmp_path: Pat
         mfs.close()
 
 
-def test_checkpoint_keeps_single_file_order(tmp_path: Path) -> None:
+def test_checkpoint_yields_to_active_file_and_resumes(tmp_path: Path) -> None:
     from mfs import UnderPath
 
     entered, checkpoint = threading.Event(), threading.Event()
@@ -629,7 +632,7 @@ def test_checkpoint_keeps_single_file_order(tmp_path: Path) -> None:
         mfs.upsert("n", "active.txt", b"active")
         checkpoint.set()
         mfs.wait_ready(10)
-        assert order == ["background.txt", "active.txt"]
+        assert order == ["active.txt", "background.txt"]
     finally:
         checkpoint.set()
         mfs.close()

@@ -24,11 +24,8 @@ from ._lifecycle import ReadView
 from ._runtime import NamespaceRuntime
 from ._search_execution import SearchDeadline
 from ._validation import validate_chunk_ranges
-from .errors import CorruptState, IndexUnavailable, InvalidQuery, SourceUnavailable
+from .errors import CorruptState, InvalidQuery, SourceUnavailable
 from .types import (
-    AnyOf,
-    ByDocumentId,
-    ByNamespace,
     Chunk,
     Consistency,
     Document,
@@ -38,7 +35,6 @@ from .types import (
     GrepItem,
     GrepResult,
     Match,
-    NamespaceKind,
     SearchItem,
     SearchMode,
     SearchResult,
@@ -46,7 +42,6 @@ from .types import (
     SourceLocation,
     SourceMap,
     SourceSpan,
-    UnderPath,
 )
 
 
@@ -58,24 +53,6 @@ def _line_map(text: str) -> SourceMap:
         spans.append(SourceSpan(offset, end, {"kind": "lines", "start": number, "end": number}))
         offset = end
     return SourceMap(1, tuple(spans))
-
-
-def selected_namespaces(filters: Sequence[Filter], names: set[str]) -> set[str]:
-    def selected(item: Filter) -> set[str]:
-        if isinstance(item, ByNamespace):
-            return set(item.namespaces)
-        if isinstance(item, ByDocumentId):
-            return {i.namespace for i in item.ids}
-        if isinstance(item, UnderPath):
-            return {item.namespace}
-        if isinstance(item, AnyOf):
-            return set[str]().union(*(selected(f) for f in item.filters))
-        return names
-
-    result = set(names)
-    for item in filters:
-        result &= selected(item)
-    return result
 
 
 def _merge_ranges(ranges: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -187,6 +164,7 @@ class Reader:
 
     def grep(
         self,
+        namespace: str,
         filters: Sequence[Filter],
         select: Select,
         limit: int | None,
@@ -197,13 +175,8 @@ class Reader:
             isinstance(v, bool) or not isinstance(v, int) or v < 1 for v in asdict(budget).values()
         ):
             raise InvalidQuery("grep budgets must be positive integers")
-        with self.view.condition:
-            names: dict[str, NamespaceKind] = {
-                n: cast(NamespaceKind, r["kind"]) for n, r in self.view.namespaces().items()
-            }
-        compiled = compile_filters(filters, names, search=False)
-        for namespace in selected_namespaces(filters, set(names)):
-            self.view.require_modern_namespace(namespace)
+        record = self.view.namespace(namespace)
+        compiled = compile_filters(filters, namespace, record["kind"], search=False)
         for text_filter in compiled.text:
             text_matches("", text_filter)
         items: list[GrepItem[Any]] = []
@@ -324,6 +297,7 @@ class Reader:
 
     def search(
         self,
+        namespace: str,
         text: str,
         filters: Sequence[Filter],
         mode: SearchMode,
@@ -340,32 +314,27 @@ class Reader:
         validate_query_options(select, limit, search=True)
         if select == "doc":
             raise InvalidQuery("ranked search returns chunk/doc_id; use read for a document")
-        with self.view.condition:
-            names: dict[str, NamespaceKind] = {
-                n: cast(NamespaceKind, r["kind"]) for n, r in self.view.namespaces().items()
-            }
-            chosen = sorted(selected_namespaces(filters, set(names)))
-        expressions = compile_filters(filters, names, search=True).expressions
+        initial_kind = self.view.namespace(namespace)["kind"]
+        expressions = compile_filters(filters, namespace, initial_kind, search=True).expressions
         deadline.check()
-        for namespace in chosen:
-            self.view.require_modern_namespace(namespace)
         if consistency == "strong":
-            self.view.wait_ready(deadline.remaining(), set(chosen))
-        routes: list[list[SearchHit]] = []
-        more = False
-        for namespace in chosen:
-            deadline.check()
-            if self.view.namespace(namespace)["indexing"] == "off":
-                continue
-            if "pending_manifest" in self.view.namespace(namespace):
-                raise IndexUnavailable(f"{namespace}: index configuration is being rebuilt")
-            if namespace in self.runtime.index_errors:
-                raise IndexUnavailable(f"{namespace}: collection requires explicit reindex")
+            self.view.wait_ready(deadline.remaining(), {namespace})
+        deadline.check()
+        with self.runtime.query(namespace) as (record, binding, index):
+            if record["kind"] != initial_kind:
+                expressions = compile_filters(
+                    filters, namespace, record["kind"], search=True
+                ).expressions
+            if record["indexing"] == "off":
+                return SearchResult((), False)
             vector = (
-                self.runtime.embed_query(namespace, text) if mode in ("vector", "hybrid") else None
+                self.runtime.embed_query(
+                    self.runtime.matching_embedder(binding, record["manifest"]["index"]["dense"]),
+                    text,
+                )
+                if mode in ("vector", "hybrid")
+                else None
             )
-            deadline.check()
-            index = self.runtime.index(namespace)
             candidate_limit = min(1000, max(100, limit * 10))
             while True:
                 deadline.check()
@@ -413,34 +382,31 @@ class Reader:
                 if count >= limit or not extra or candidate_limit == 1000:
                     break
                 candidate_limit = min(1000, candidate_limit * 2)
-            routes.append(ranked)
-            more |= extra
-        ranked = _rrf(routes) if len(routes) > 1 else routes[0] if routes else []
-        deadline.check()
-        items: list[SearchItem[Any]] = []
-        seen: set[DocumentId] = set()
-        with self.view.condition:
-            for hit in ranked:
-                deadline.check()
-                identity = DocumentId(hit["namespace"], hit["doc_id"])
-                if not self.view.visible(identity, hit["snapshot_id"]):
-                    continue
-                if select == "doc_id":
-                    if identity in seen:
+            deadline.check()
+            items: list[SearchItem[Any]] = []
+            seen: set[DocumentId] = set()
+            with self.view.condition:
+                for hit in ranked:
+                    deadline.check()
+                    identity = DocumentId(hit["namespace"], hit["doc_id"])
+                    if not self.view.visible(identity, hit["snapshot_id"]):
                         continue
-                    seen.add(identity)
-                    value: Any = identity
-                else:
-                    value = Chunk(
-                        identity,
-                        hit["snapshot_id"],
-                        hit["ordinal"],
-                        hit["text"],
-                        hit["text_start"],
-                        hit["text_end"],
-                        SourceLocation(
-                            1, tuple(copy_json(v) for v in hit["source_location"]["sources"])
-                        ),
-                    )
-                items.append(SearchItem(value, hit["score"], ()))
-        return SearchResult(tuple(items[:limit]), more or len(items) > limit)
+                    if select == "doc_id":
+                        if identity in seen:
+                            continue
+                        seen.add(identity)
+                        value: Any = identity
+                    else:
+                        value = Chunk(
+                            identity,
+                            hit["snapshot_id"],
+                            hit["ordinal"],
+                            hit["text"],
+                            hit["text_start"],
+                            hit["text_end"],
+                            SourceLocation(
+                                1, tuple(copy_json(v) for v in hit["source_location"]["sources"])
+                            ),
+                        )
+                    items.append(SearchItem(value, hit["score"], ()))
+            return SearchResult(tuple(items[:limit]), extra or len(items) > limit)

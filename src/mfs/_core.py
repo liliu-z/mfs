@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import contextlib
-import copy
 import math
 import os
 import shutil
@@ -56,7 +55,6 @@ from .errors import (
     OperationFailed,
     ProcessingFailed,
     RootOverlap,
-    RuleConflict,
     SourceChanged,
     SourceExcluded,
     SourceUnavailable,
@@ -675,40 +673,6 @@ class MFS:
             force=force,
         )
 
-    @staticmethod
-    def _delete_job(kind: str = "delete") -> dict[str, Any]:
-        return dict(
-            revision=uuid.uuid4().hex,
-            kind=kind,
-            stage=kind,
-            state="pending",
-            attempts=0,
-            failures=0,
-            next_run=0,
-            error=None,
-        )
-
-    def _remove(self, identity: DocumentId) -> MutationReport:
-        with self._condition:
-            old = self._tasks.targets.get(identity)
-            if old is None or old["kind"] != "upsert":
-                return MutationReport(
-                    identity,
-                    "not_found",
-                    not self._tasks.pending and self._state == "ready",
-                    old["revision"] if old else None,
-                )
-            job = self._delete_job()
-            job["incarnation"] = old.get("incarnation")
-            job["indexed_revision"] = None
-            job["published_artifacts"] = old.get("published_artifacts", {})
-            with self._catalog.transaction():
-                self._catalog.delete_document(identity.namespace, identity.doc_id)
-                self._catalog.put_target(identity.namespace, identity.doc_id, job)
-            self._tasks.visible.pop(identity, None)
-            self._tasks.remember(identity, job)
-            return MutationReport(identity, "removed", False, job["revision"])
-
     def remove(self, namespace: str, doc_id: str) -> MutationReport:
         with self._call(), self._mutation_lock:
             validate_internal_id(doc_id)
@@ -719,45 +683,12 @@ class MFS:
             return self._tasks.remove(DocumentId(namespace, doc_id))
 
     def retry(self, document_id: DocumentId, stage: TaskStage | None = None) -> None:
-        with self._call(), self._condition:
-            previous = self._tasks.targets.get(document_id)
-            if previous is None:
-                raise InvalidQuery("document has no task")
-            if previous["state"] == "running":
-                raise InvalidQuery("task is still executing")
-            job = copy.deepcopy(previous)
-            if stage is not None and stage != job["stage"]:
-                raise InvalidQuery(
-                    "retry resumes the failed stage; use reprocess for new processing"
-                )
-            if job["state"] == "succeeded":
-                return
-            job.update(
-                state="pending", next_run=0, failures=0, error=None, attempt_token=uuid.uuid4().hex
-            )
-            if job.get("cleanup"):
-                job["cleanup_restore_state"] = "pending"
-            with self._catalog.transaction():
-                self._catalog.set_cancelled(document_id.namespace, document_id.doc_id, False)
-                self._catalog.put_target(document_id.namespace, document_id.doc_id, job)
-            self._tasks.remember(document_id, job)
+        with self._call():
+            self._tasks.retry(document_id, stage)
 
     def cancel(self, document_id: DocumentId) -> None:
-        with self._call(), self._condition:
-            previous = self._tasks.targets.get(document_id)
-            if previous is None:
-                raise InvalidQuery("document has no task")
-            if previous["state"] == "succeeded":
-                return
-            if previous["kind"] in ("delete", "drop"):
-                return
-            job = copy.deepcopy(previous)
-            job["state"] = "cancelled"
-            job["attempt_token"] = uuid.uuid4().hex
-            with self._catalog.transaction():
-                self._catalog.set_cancelled(document_id.namespace, document_id.doc_id, True)
-                self._catalog.put_target(document_id.namespace, document_id.doc_id, job)
-            self._tasks.remember(document_id, job)
+        with self._call():
+            self._tasks.cancel(document_id)
 
     def reprocess(self, document_id: DocumentId) -> MutationReport:
         with self._call(), self._mutation_lock:
@@ -861,33 +792,8 @@ class MFS:
         self, namespace: str, binding: NamespaceBinding, changes: dict[str, Any] | None = None
     ) -> None:
         with self._condition:
-            record = dict(self._tasks.namespaces[namespace], **(changes or {}))
-            record["pending_manifest"] = binding.manifest
-            previous = self._tasks.targets.get(DocumentId(namespace, ""), {})
-            job = dict(
-                self._delete_job("rebuild"),
-                identity=asdict(DocumentId(namespace, "")),
-                incarnation=record["incarnation"],
-                manifest=binding.manifest,
-                legacy_cleanup=bool(previous.get("legacy_cleanup")),
-                retired_incarnations=list(
-                    dict.fromkeys(
-                        [
-                            *previous.get("retired_incarnations", []),
-                            *previous.get("incarnations", []),
-                        ]
-                    )
-                ),
-            )
-            with self._catalog.transaction():
-                self._catalog.put_namespace(namespace, record)
-                self._catalog.put_target(namespace, "", job)
-            self._tasks.namespaces[namespace] = record
+            self._tasks.request_rebuild(namespace, binding.manifest, changes)
             self._runtime.bindings[namespace] = binding
-            self._tasks.visible = {
-                i: v for i, v in self._tasks.visible.items() if i.namespace != namespace
-            }
-            self._tasks.remember(DocumentId(namespace, ""), job)
 
     def _recover_objects(self) -> None:
         # Migration rebuilds strong roots before the maintenance thread can run.
@@ -914,6 +820,7 @@ class MFS:
 
     def grep(
         self,
+        namespace: str,
         filters: Sequence[Filter] = (),
         select: Select = "doc_id",
         limit: int | None = 100,
@@ -921,7 +828,7 @@ class MFS:
         budget: GrepBudget | None = None,
     ) -> GrepResult[Any]:
         with self._call():
-            return self._reader.grep(filters, select, limit, budget or GrepBudget())
+            return self._reader.grep(namespace, filters, select, limit, budget or GrepBudget())
 
     def read(self, document_id: DocumentId) -> Document | None:
         with self._call():
@@ -929,6 +836,7 @@ class MFS:
 
     def search(
         self,
+        namespace: str,
         text: str,
         filters: Sequence[Filter] = (),
         mode: SearchMode = "hybrid",
@@ -950,7 +858,7 @@ class MFS:
         def execute(deadline: SearchDeadline) -> SearchResult[Any]:
             with self._call():
                 return self._reader.search(
-                    text, selected_filters, mode, select, limit, consistency, deadline
+                    namespace, text, selected_filters, mode, select, limit, consistency, deadline
                 )
 
         with self._calls.call():
@@ -992,55 +900,15 @@ class MFS:
         replace: Sequence[IgnoreRule] = (),
         order: Sequence[str] | None = None,
     ) -> RuleSet:
-        with self._call(), self._mutation_lock, self._condition:
-            self._required_namespace(namespace)
-            previous = self._tasks.namespaces[namespace]
-            if previous["rules_revision"] != expected_revision:
-                raise RuleConflict("namespace rules changed; read rules and retry")
-            rules = {r["rule_id"]: IgnoreRule(**r) for r in previous["rules"]}
-            for rule_id in remove:
-                if rule_id not in rules:
-                    raise InvalidConfiguration(f"unknown rule_id {rule_id!r}")
-                del rules[rule_id]
-            for rule in replace:
-                if rule.rule_id not in rules:
-                    raise InvalidConfiguration(f"unknown rule_id {rule.rule_id!r}")
-                rules[rule.rule_id] = rule
-            for rule in add:
-                if rule.rule_id in rules:
-                    raise InvalidConfiguration(f"duplicate rule_id {rule.rule_id!r}")
-                rules[rule.rule_id] = rule
-            if order is not None:
-                if len(order) != len(rules) or set(order) != set(rules):
-                    raise InvalidConfiguration("order must contain every rule_id exactly once")
-                rules = {rule_id: rules[rule_id] for rule_id in order}
-            ordered = validate_rules(tuple(rules.values()))
-            record = dict(
-                previous, rules=[asdict(r) for r in ordered], rules_revision=uuid.uuid4().hex
+        with self._call(), self._mutation_lock:
+            return self._tasks.update_rules(
+                namespace,
+                expected_revision=expected_revision,
+                add=add,
+                remove=remove,
+                replace=replace,
+                order=order,
             )
-            updates: list[tuple[DocumentId, dict[str, Any]]] = []
-            with self._catalog.transaction():
-                self._catalog.put_namespace(namespace, record)
-                for identity, target in self._tasks.targets.items():
-                    if (
-                        identity.namespace != namespace
-                        or target["kind"] != "upsert"
-                        or not excluded(ordered, identity.doc_id)
-                    ):
-                        continue
-                    deletion = dict(
-                        self._delete_job(),
-                        incarnation=target["incarnation"],
-                        identity=asdict(identity),
-                    )
-                    self._catalog.delete_document(namespace, identity.doc_id)
-                    self._catalog.put_target(namespace, identity.doc_id, deletion)
-                    updates.append((identity, deletion))
-            self._tasks.namespaces[namespace] = record
-            for identity, deletion in updates:
-                self._tasks.remember(identity, deletion)
-            self._condition.notify_all()
-            return RuleSet(record["rules_revision"], ordered)
 
     def configure_index(
         self,

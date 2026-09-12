@@ -22,11 +22,11 @@ class Catalog:
         self._connections_lock = threading.Lock()
         self.migrated = False
         version = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
-        if version > 6:
+        if version > 7:
             raise SchemaVersionUnsupported(f"catalog schema version {version} is unsupported")
-        if not initialize and version not in (1, 2, 3, 4, 5, 6):
+        if not initialize and version not in (1, 2, 3, 4, 5, 6, 7):
             raise CorruptState("catalog schema is missing or unrecognized")
-        if initialize or version < 6:
+        if initialize or version < 7:
             self._initialize()
             self.migrated = version == 1
         expected = {
@@ -39,6 +39,7 @@ class Catalog:
             "cache",
             "cancel_gates",
             "prepared",
+            "vector_cache",
         }
         actual = {
             r[0]
@@ -47,7 +48,7 @@ class Catalog:
             )
         }
         if actual != expected:
-            raise CorruptState("catalog schema does not match version 6")
+            raise CorruptState("catalog schema does not match version 7")
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -106,12 +107,17 @@ class Catalog:
                 namespace TEXT NOT NULL, doc_id TEXT NOT NULL, PRIMARY KEY(namespace,doc_id)
             );
             CREATE TABLE IF NOT EXISTS prepared (revision TEXT PRIMARY KEY, path TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS vector_cache (
+                key TEXT PRIMARY KEY, incarnation TEXT NOT NULL, vector BLOB NOT NULL,
+                digest TEXT NOT NULL, touched INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS vector_cache_lru ON vector_cache(touched);
             DROP TABLE IF EXISTS run_dependencies;
             DROP TABLE IF EXISTS wait_operations;
             DROP TABLE IF EXISTS wait_target_sets;
             DROP TABLE IF EXISTS runs;
             UPDATE operations SET value=json_remove(value,'$.operation_id');
-            PRAGMA user_version = 6;
+            PRAGMA user_version = 7;
             COMMIT;
         """)
 
@@ -160,10 +166,16 @@ class Catalog:
         ]
 
     def delete_namespace(self, namespace: str) -> None:
+        record = self.get_namespace(namespace)
+        if record is not None:
+            self.clear_vector_cache(record.get("incarnation", ""))
         for doc, _ in self.list_namespace_documents(namespace):
             self.set_references("document", namespace, doc, set())
         self.connection.execute("DELETE FROM cancel_gates WHERE namespace=?", (namespace,))
         self.connection.execute("DELETE FROM namespaces WHERE namespace=?", (namespace,))
+
+    def clear_vector_cache(self, incarnation: str) -> None:
+        self.connection.execute("DELETE FROM vector_cache WHERE incarnation=?", (incarnation,))
 
     def put_document(self, namespace: str, doc_id: str, value: dict[str, Any]) -> None:
         self.set_references("document", namespace, doc_id, self.references(value))

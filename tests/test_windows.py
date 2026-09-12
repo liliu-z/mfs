@@ -48,18 +48,18 @@ def test_windows_native_sync_lock_reopen_and_case_rename(tmp_path: Path) -> None
             MFS.open(state)
         (root / "Note.txt").rename(root / "note.txt")
         mfs.wait(mfs.sync("n"), 15)
-        assert [i.value.doc_id for i in mfs.grep().items] == ["note.txt"]
-        assert mfs.grep(select="doc").items[0].value.text == "needle\r\n"
+        assert [i.value.doc_id for i in mfs.grep("n").items] == ["note.txt"]
+        assert mfs.grep("n", select="doc").items[0].value.text == "needle\r\n"
     finally:
         mfs.close()
     mfs = MFS.open(state)
     for registered in mfs.list_namespaces():
         mfs.open_namespace(registered.namespace, processors=[Utf8TextProcessor()])
     try:
-        assert mfs.search("needle", mode="bm25").items
+        assert mfs.search("n", "needle", mode="bm25").items
         (root / "note.txt").unlink()
         mfs.wait(mfs.sync("n"), 15)
-        assert not mfs.search("needle", mode="bm25").items
+        assert not mfs.search("n", "needle", mode="bm25").items
     finally:
         mfs.close()
 

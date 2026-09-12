@@ -36,13 +36,13 @@ def test_dense_and_hybrid_then_open_without_embedder(tmp_path: Path) -> None:
         mfs.upsert("n", "cat.txt", b"cat cat")
         mfs.upsert("n", "dog.txt", b"dog dog")
         assert (
-            mfs.search("cat", mode="vector", consistency="strong", timeout=10)
+            mfs.search("n", "cat", mode="vector", consistency="strong", timeout=10)
             .items[0]
             .value.document_id.doc_id
             == "cat.txt"
         )
         assert (
-            mfs.search("dog", mode="hybrid", timeout=10).items[0].value.document_id.doc_id
+            mfs.search("n", "dog", mode="hybrid", timeout=10).items[0].value.document_id.doc_id
             == "dog.txt"
         )
     finally:
@@ -50,18 +50,18 @@ def test_dense_and_hybrid_then_open_without_embedder(tmp_path: Path) -> None:
     without = MFS.open(state)
     try:
         assert without.status().dense_enabled and not without.status().dense_available
-        assert without.search("cat", mode="bm25", timeout=10).items
+        assert without.search("n", "cat", mode="bm25", timeout=10).items
         with pytest.raises(InvalidConfiguration):
             without.open_namespace("n", processors=[Utf8TextProcessor()])
         with pytest.raises(CapabilityUnavailable):
-            without.search("cat", mode="vector", timeout=10)
+            without.search("n", "cat", mode="vector", timeout=10)
         receipt = without.upsert("n", "cat.txt", b"changed cat")
         with pytest.raises(WaitTimeout):
             without.wait(receipt, 0.1)
-        assert not without.search("cat", mode="bm25", consistency="eventual").items
+        assert not without.search("n", "cat", mode="bm25", consistency="eventual").items
         without.open_namespace("n", processors=[Utf8TextProcessor()], embedder=TinyEmbedder())
         without.wait(receipt, 10)
-        assert without.grep(select="doc").items[0].value.text == "changed cat"
+        assert without.grep("n", select="doc").items[0].value.text == "changed cat"
     finally:
         without.close()
 
@@ -80,7 +80,7 @@ def test_reindex_upgrades_bm25_index_to_dense(tmp_path: Path) -> None:
     try:
         with pytest.raises(NamespaceCompatibilityError):
             mfs.open_namespace("n", processors=[Utf8TextProcessor()], embedder=TinyEmbedder())
-        assert mfs.search("cat", mode="bm25", timeout=10).items
+        assert mfs.search("n", "cat", mode="bm25", timeout=10).items
         report = mfs.reindex(
             "n",
             timeout=10,
@@ -89,6 +89,6 @@ def test_reindex_upgrades_bm25_index_to_dense(tmp_path: Path) -> None:
             indexing="hybrid",
         )
         assert report.dense_enabled
-        assert mfs.search("cat", mode="vector", timeout=10).items
+        assert mfs.search("n", "cat", mode="vector", timeout=10).items
     finally:
         mfs.close()

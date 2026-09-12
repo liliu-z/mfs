@@ -52,7 +52,7 @@ def test_caller_times_out_during_query_embedding_and_close_retains_resources(
             )
             mfs.wait(mfs.upsert("n", "a.txt", b"needle"), 10)
             monkeypatch.setattr(mfs._runtime.index("n"), "search", unexpected_backend)
-            future = pool.submit(mfs.search, "needle", mode="vector", timeout=0.3)
+            future = pool.submit(mfs.search, "n", "needle", mode="vector", timeout=0.3)
             embedder.wait_queries(1)
             with pytest.raises(WaitTimeout):
                 future.result(2)
@@ -105,7 +105,7 @@ def test_timeout_during_backend_does_not_start_next_hybrid_channel(
                 )
 
             monkeypatch.setattr(mfs._runtime.index("n"), "search", slow_backend)
-            future = pool.submit(mfs.search, "needle", mode="hybrid", timeout=0.3)
+            future = pool.submit(mfs.search, "n", "needle", mode="hybrid", timeout=0.3)
             assert entered.wait(3)
             with pytest.raises(WaitTimeout):
                 future.result(2)
@@ -130,19 +130,19 @@ def test_timed_out_adapters_keep_concurrency_slots_and_admission_has_same_deadli
             )
             mfs.wait(mfs.upsert("n", "a.txt", b"needle"), 10)
             futures = [
-                pool.submit(mfs.search, "needle", mode="vector", timeout=1) for _ in range(4)
+                pool.submit(mfs.search, "n", "needle", mode="vector", timeout=1) for _ in range(4)
             ]
             embedder.wait_queries(4)
             for future in futures:
                 with pytest.raises(WaitTimeout):
                     future.result(2)
             with pytest.raises(WaitTimeout):
-                mfs.search("needle", mode="vector", timeout=0.1)
+                mfs.search("n", "needle", mode="vector", timeout=0.1)
             assert embedder.query_calls == 4
             embedder.query_release.set()
-            assert mfs.search("needle", mode="vector", timeout=None).items
+            assert mfs.search("n", "needle", mode="vector", timeout=None).items
             with pytest.raises(WaitTimeout):
-                mfs.search("needle", mode="bm25", timeout=0)
+                mfs.search("n", "needle", mode="bm25", timeout=0)
         finally:
             embedder.query_release.set()
             mfs.close()

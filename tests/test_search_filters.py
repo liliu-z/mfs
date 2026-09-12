@@ -14,7 +14,6 @@ from mfs import (
     ByDocumentId,
     ByExtension,
     ByMediaType,
-    ByNamespace,
     DocumentId,
     Filter,
     InvalidFilter,
@@ -99,17 +98,17 @@ def test_ranked_affixes_and_source_types_push_down_before_topk_with_no_sqlite(
 
         monkeypatch.setattr(mfs._runtime.index("n"), "search", one_candidate)
         groups: list[list[Filter]] = [
-            [ByNamespace("n"), ByExtension("pdf")],
-            [ByNamespace("n"), ByMediaType("application/pdf")],
-            [ByNamespace("n"), PathPrefix('目录/rare"\\%_')],
-            [ByNamespace("n"), PathSuffix('"\\%_Résumé.PDF')],
-            [ByNamespace("n"), NamePrefix('rare"\\%_')],
-            [ByNamespace("n"), NameSuffix("Résumé.PDF")],
+            [ByExtension("pdf")],
+            [ByMediaType("application/pdf")],
+            [PathPrefix('目录/rare"\\%_')],
+            [PathSuffix('"\\%_Résumé.PDF')],
+            [NamePrefix('rare"\\%_')],
+            [NameSuffix("Résumé.PDF")],
             [ByDocumentId(DocumentId("n", special))],
         ]
         for mode in ("bm25", "vector", "hybrid"):
             for filters in groups:
-                result = mfs.search("needle", filters=filters, mode=mode, limit=1)
+                result = mfs.search("n", "needle", filters=filters, mode=mode, limit=1)
                 assert result.items[0].value.document_id == DocumentId("n", special)
                 assert result.items[0].value.source_location.sources == (
                     {"kind": "pages", "start": 7},
@@ -117,9 +116,9 @@ def test_ranked_affixes_and_source_types_push_down_before_topk_with_no_sqlite(
                 assert result.items[0].value.snapshot_id
         assert statements == []
         with pytest.raises(InvalidFilter):
-            mfs.search("needle", [TextMatch("needle")], mode="bm25")
+            mfs.search("n", "needle", [TextMatch("needle")], mode="bm25")
         with pytest.raises(InvalidQuery):
-            mfs.search("needle", mode="bm25", select="doc")
+            mfs.search("n", "needle", mode="bm25", select="doc")
     finally:
         mfs.close()
 
@@ -139,36 +138,39 @@ def test_under_path_excludes_prefix_siblings_and_sql_point_lookup_uses_primary_k
         mfs.create_namespace("n", "external", root, processors=[Utf8TextProcessor()])
         mfs.wait(mfs.sync("n"), 10)
         assert (
-            mfs.search("needle", [UnderPath("n", "scope")], mode="bm25", limit=1)
+            mfs.search("n", "needle", [UnderPath("n", "scope")], mode="bm25", limit=1)
             .items[0]
             .value.document_id.doc_id
             == "scope/a.txt"
         )
         scopes = AnyOf([UnderPath("n", "scope"), UnderPath("n", "scope-extra")])
-        assert len(mfs.search("needle", [scopes], mode="bm25").items) == 2
-        assert len(mfs.grep([scopes]).items) == 2
+        assert len(mfs.search("n", "needle", [scopes], mode="bm25").items) == 2
+        assert len(mfs.grep("n", [scopes]).items) == 2
         # Additional filters always intersect the union; they cannot expand authorized scope.
-        assert len(mfs.search("needle", [scopes, UnderPath("n", "scope")], mode="bm25").items) == 1
+        assert (
+            len(mfs.search("n", "needle", [scopes, UnderPath("n", "scope")], mode="bm25").items)
+            == 1
+        )
         identity = DocumentId("n", "scope/a.txt")
-        compiled = compile_filters([ByDocumentId(identity)], {"n": "external"}, search=False)
+        compiled = compile_filters([ByDocumentId(identity)], "n", "external", search=False)
         plan = mfs._catalog.connection.execute(
             "EXPLAIN QUERY PLAN SELECT value FROM documents WHERE " + compiled.sql,
             compiled.params,
         ).fetchall()
         assert any("SEARCH documents USING INDEX" in str(row[3]) for row in plan)
-        assert mfs.grep([ByDocumentId(identity)]).items[0].value == identity
+        assert mfs.grep("n", [ByDocumentId(identity)]).items[0].value == identity
         # Multiple ID filters intersect rather than expanding a Cartesian product of batches.
         ids = [DocumentId("n", f"missing-{i}.txt") for i in range(1200)]
         assert (
             mfs.search(
-                "needle", [ByDocumentId([identity, *ids]), ByDocumentId(identity)], mode="bm25"
+                "n", "needle", [ByDocumentId([identity, *ids]), ByDocumentId(identity)], mode="bm25"
             )
             .items[0]
             .value.document_id
             == identity
         )
         assert not mfs.search(
-            "needle", [ByDocumentId(identity), ByDocumentId(ids)], mode="bm25"
+            "n", "needle", [ByDocumentId(identity), ByDocumentId(ids)], mode="bm25"
         ).items
     finally:
         mfs.close()
@@ -183,25 +185,31 @@ def test_grep_unicode_word_smart_case_cross_chunk_and_empty_regex_validation(
             registered.namespace, processors=[Utf8TextProcessor()], chunker=ByteChunker()
         )
     try:
-        with pytest.raises(InvalidPattern):
-            mfs.grep([TextMatch("[", regex=True)])
         mfs.create_namespace(
             "n", "internal", processors=[Utf8TextProcessor()], chunker=ByteChunker()
         )
+        with pytest.raises(InvalidPattern):
+            mfs.grep("n", [TextMatch("[", regex=True)])
         # A failing Chunker must not prevent document-level grep of Unicode text.
         mfs.upsert("n", "a.txt", "café caféine CAFÉ _café café2\n中文 中文字\ncross\nline".encode())
         with mfs._condition:
             assert mfs._condition.wait_for(
                 lambda: mfs._tasks.targets[DocumentId("n", "a.txt")]["stage"] != "process", 5
             )
-        matches = mfs.grep([TextMatch("café", smart_case=True, whole_word=True)]).items[0].matches
+        matches = (
+            mfs.grep("n", [TextMatch("café", smart_case=True, whole_word=True)]).items[0].matches
+        )
         assert len(matches) == 2
         assert (
-            len(mfs.grep([TextMatch("CAFÉ", smart_case=True, whole_word=True)]).items[0].matches)
+            len(
+                mfs.grep("n", [TextMatch("CAFÉ", smart_case=True, whole_word=True)])
+                .items[0]
+                .matches
+            )
             == 1
         )
-        assert len(mfs.grep([TextMatch("中文", whole_word=True)]).items[0].matches) == 1
-        assert mfs.grep([TextMatch("cross\nline")]).items
-        assert mfs.grep([TextMatch("cross\\s+line", regex=True)], limit=1).items
+        assert len(mfs.grep("n", [TextMatch("中文", whole_word=True)]).items[0].matches) == 1
+        assert mfs.grep("n", [TextMatch("cross\nline")]).items
+        assert mfs.grep("n", [TextMatch("cross\\s+line", regex=True)], limit=1).items
     finally:
         mfs.close()

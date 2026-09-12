@@ -30,15 +30,15 @@ def test_failed_publication_keeps_new_grep_text_and_revokes_old_index(
             assert mfs._condition.wait_for(
                 lambda: mfs._tasks.targets[DocumentId("n", "a.txt")]["state"] == "failed", 5
             )
-        assert mfs.grep(select="doc").items[0].value.text == "new snapshot"
-        assert not mfs.search("old", mode="bm25", consistency="eventual").items
+        assert mfs.grep("n", select="doc").items[0].value.text == "new snapshot"
+        assert not mfs.search("n", "old", mode="bm25", consistency="eventual").items
         with pytest.raises(WaitTimeout):
-            mfs.search("new", mode="bm25", consistency="strong", timeout=0.05)
+            mfs.search("n", "new", mode="bm25", consistency="strong", timeout=0.05)
         monkeypatch.setattr(mfs._runtime.index("n"), "publish", original)
         mfs.retry(DocumentId("n", "a.txt"))
         mfs.wait_ready(10)
-        assert mfs.search("new", mode="bm25").items
-        assert not mfs.search("old", mode="bm25").items
+        assert mfs.search("n", "new", mode="bm25").items
+        assert not mfs.search("n", "old", mode="bm25").items
     finally:
         mfs.close()
 
@@ -66,7 +66,7 @@ def test_milvus_success_before_completion_commit_replays_same_rows(
         mfs.wait_ready(10)
         assert failed
         assert mfs._runtime.index("n").count_document(DocumentId("n", "a.txt")) == 1
-        assert len(mfs.search("committed", mode="bm25").items) == 1
+        assert len(mfs.search("n", "committed", mode="bm25").items) == 1
     finally:
         mfs.close()
 
@@ -90,14 +90,14 @@ def test_failed_stage_survives_reopen_without_reprocessing(
         assert mfs._condition.wait_for(
             lambda: mfs._tasks.targets[DocumentId("n", "a.txt")]["state"] == "failed", 5
         )
-    snapshot = mfs.grep(select="doc").items[0].value.snapshot_id
+    snapshot = mfs.grep("n", select="doc").items[0].value.snapshot_id
     mfs.close()
     reopened = MFS.open(path)
     try:
         reopened.open_namespace("n", processors=[Utf8TextProcessor()])
         reopened.retry(DocumentId("n", "a.txt"))
         reopened.wait_ready(10)
-        assert reopened.grep(select="doc").items[0].value.snapshot_id == snapshot
-        assert reopened.search("persistent", mode="bm25").items
+        assert reopened.grep("n", select="doc").items[0].value.snapshot_id == snapshot
+        assert reopened.search("n", "persistent", mode="bm25").items
     finally:
         reopened.close()

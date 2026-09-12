@@ -7,7 +7,6 @@ import pytest
 from mfs import (
     MFS,
     ByDocumentId,
-    ByNamespace,
     Closed,
     DocumentId,
     InstanceLocked,
@@ -30,7 +29,7 @@ def test_internal_lifecycle_query_filters_and_projection(tmp_path: Path) -> None
         mfs.upsert("other", "folder/a.md", b"cafe")
 
         mfs.wait_ready(10)
-        result = mfs.grep([ByNamespace("notes"), TextMatch("é")], select="doc", limit=1)
+        result = mfs.grep("notes", [TextMatch("é")], select="doc", limit=1)
         assert result.truncated is False
         assert result.items[0].value.id == DocumentId("notes", "folder/a.md")
         assert (result.items[0].matches[0].text_start, result.items[0].matches[0].text_end) == (
@@ -43,18 +42,20 @@ def test_internal_lifecycle_query_filters_and_projection(tmp_path: Path) -> None
         returned_source = result.items[0].matches[0].source_location.sources[0]
         assert isinstance(returned_source, dict)
         returned_source["start"] = 999
-        fresh = mfs.grep([ByNamespace("notes"), TextMatch("é")], select="doc")
+        fresh = mfs.grep("notes", [TextMatch("é")], select="doc")
         assert fresh.items[0].matches[0].source_location.sources[0] == {
             "kind": "lines",
             "start": 1,
             "end": 1,
         }
 
-        combined = mfs.grep([TextMatch("café"), TextMatch("\n", regex=False)], select="chunk")
+        combined = mfs.grep(
+            "notes", [TextMatch("café"), TextMatch("\n", regex=False)], select="chunk"
+        )
         assert len(combined.items) == 1
         assert combined.items[0].value.text == "café\nnext"
 
-        point = mfs.grep([ByDocumentId(DocumentId("notes", "missing"))])
+        point = mfs.grep("notes", [ByDocumentId(DocumentId("notes", "missing"))])
         assert point.items == ()
         assert mfs.remove("notes", "folder/a.md").outcome == "removed"
         assert mfs.remove("notes", "folder/a.md").outcome == "not_found"
@@ -92,10 +93,12 @@ def test_bm25_order_filter_escaping_and_reopen(tmp_path: Path) -> None:
     mfs.upsert("n", "one.txt", b"hello world")
     mfs.upsert("n", odd_id, b"needle")
 
-    ranked = mfs.search("hello", mode="bm25", limit=10, consistency="strong")
+    ranked = mfs.search("n", "hello", mode="bm25", limit=10, consistency="strong")
     assert [item.value.document_id.doc_id for item in ranked.items] == ["many.txt", "one.txt"]
     assert ranked.items[0].score > ranked.items[1].score > 0
-    filtered = mfs.search("needle", filters=[ByDocumentId(DocumentId("n", odd_id))], mode="bm25")
+    filtered = mfs.search(
+        "n", "needle", filters=[ByDocumentId(DocumentId("n", odd_id))], mode="bm25"
+    )
     assert filtered.items[0].value.document_id.doc_id == odd_id
     mfs.close()
 
@@ -104,7 +107,7 @@ def test_bm25_order_filter_escaping_and_reopen(tmp_path: Path) -> None:
         reopened.open_namespace(registered.namespace, processors=[Utf8TextProcessor()])
     try:
         assert reopened.status().document_count == 3
-        assert reopened.search("needle", mode="bm25").items
+        assert reopened.search("n", "needle", mode="bm25").items
     finally:
         reopened.close()
 
@@ -129,7 +132,7 @@ def test_external_sync_under_path_and_reconcile(tmp_path: Path) -> None:
             ("raw.bin", "unsupported_media_type")
         ]
         mfs.wait_ready(10)
-        under = mfs.grep([UnderPath("files", "sub")])
+        under = mfs.grep("files", [UnderPath("files", "sub")])
         assert [item.value.doc_id for item in under.items] == ["sub/b.md"]
 
         (root / "a.txt").unlink()
@@ -159,8 +162,8 @@ def test_unregistering_processor_revokes_old_external_results(tmp_path: Path) ->
         assert [(item.path, item.reason) for item in report.skipped] == [
             ("a.txt", "unsupported_media_type")
         ]
-        assert not mfs.grep().items
-        assert not mfs.search("indexed", mode="bm25", consistency="eventual").items
+        assert not mfs.grep("files").items
+        assert not mfs.search("files", "indexed", mode="bm25", consistency="eventual").items
     finally:
         mfs.close()
 
@@ -186,10 +189,10 @@ def test_lock_close_dirty_recovery_and_reindex(tmp_path: Path) -> None:
     try:
         dirty.wait_ready(10)
         assert dirty.status().ready
-        assert dirty.grep(select="doc").items[0].value.text == "recover me"
-        assert dirty.search("recover", mode="bm25").items
+        assert dirty.grep("n", select="doc").items[0].value.text == "recover me"
+        assert dirty.search("n", "recover", mode="bm25").items
         report = dirty.reindex("n")
         assert (report.documents, report.chunks) == (1, 1)
-        assert dirty.search("recover", mode="bm25").items
+        assert dirty.search("n", "recover", mode="bm25").items
     finally:
         dirty.close()

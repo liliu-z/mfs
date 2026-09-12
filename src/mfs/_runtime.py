@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+import copy
 import math
 import threading
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from ._index import ChunkIndex
 from ._lifecycle import Lifecycle
 from ._namespace import NamespaceBinding
-from .errors import CapabilityUnavailable, EmbeddingFailed, MFSError, NamespaceCompatibilityError
+from .errors import (
+    CapabilityUnavailable,
+    EmbeddingFailed,
+    IndexUnavailable,
+    MFSError,
+    NamespaceCompatibilityError,
+)
 from .types import Embedder, Processor
 
 
@@ -48,8 +56,9 @@ class NamespaceRuntime:
             .get("dense")
         )
 
-    def processor_for(self, job: dict[str, Any]) -> Processor | None:
-        binding = self.bindings.get(job.get("identity", {}).get("namespace", ""))
+    def processor_for(
+        self, job: dict[str, Any], binding: NamespaceBinding | None
+    ) -> Processor | None:
         if binding is None:
             return None
         return next(
@@ -57,8 +66,7 @@ class NamespaceRuntime:
             None,
         )
 
-    def embed_documents(self, namespace: str, texts: Sequence[str]) -> list[list[float]]:
-        embedder = self.matching_embedder(namespace)
+    def embed_documents(self, embedder: Embedder, texts: Sequence[str]) -> list[list[float]]:
         result: list[list[float]] = []
         for start in range(0, len(texts), 128):
             batch = texts[start : start + 128]
@@ -74,8 +82,7 @@ class NamespaceRuntime:
                 raise EmbeddingFailed(f"document embedding failed: {error}") from error
         return result
 
-    def embed_query(self, namespace: str, text: str) -> list[float]:
-        embedder = self.matching_embedder(namespace)
+    def embed_query(self, embedder: Embedder, text: str) -> list[float]:
         try:
             return self.validate_vectors([embedder.embed_query(text)], 1, embedder.dimension)[0]
         except MFSError:
@@ -83,17 +90,43 @@ class NamespaceRuntime:
         except Exception as error:
             raise EmbeddingFailed(f"query embedding failed: {error}") from error
 
-    def matching_embedder(self, namespace: str) -> Embedder:
-        binding = self.binding(namespace)
-        dense = self.dense_config(namespace)
-        if dense is None or binding.embedder is None:
-            raise CapabilityUnavailable(f"namespace {namespace!r} has no dense index")
+    @staticmethod
+    def matching_embedder(
+        binding: NamespaceBinding | None, dense: dict[str, Any] | None
+    ) -> Embedder:
+        if dense is None or binding is None or binding.embedder is None:
+            raise CapabilityUnavailable("namespace has no bound dense index")
         if (
             dense["embedding_space"] != binding.embedder.embedding_space
             or dense["dimension"] != binding.embedder.dimension
         ):
             raise NamespaceCompatibilityError("Embedder declaration changed after binding")
         return binding.embedder
+
+    @contextmanager
+    def query(
+        self, namespace: str
+    ) -> Generator[tuple[dict[str, Any], NamespaceBinding | None, ChunkIndex]]:
+        lifecycle = self.lifecycle
+        with lifecycle.condition:
+            lifecycle.require_modern_namespace(namespace)
+            record = copy.deepcopy(lifecycle.namespaces[namespace])
+            if "pending_manifest" in record and record["indexing"] != "off":
+                raise IndexUnavailable(f"{namespace}: index configuration is being rebuilt")
+            if namespace in self.index_errors and record["indexing"] != "off":
+                raise IndexUnavailable(f"{namespace}: collection requires explicit reindex")
+            incarnation = record["incarnation"]
+            index = self.index(namespace, incarnation)
+            binding = self.bindings.get(namespace)
+            lifecycle.queries[incarnation] = lifecycle.queries.get(incarnation, 0) + 1
+        try:
+            yield record, binding, index
+        finally:
+            with lifecycle.condition:
+                lifecycle.queries[incarnation] -= 1
+                if not lifecycle.queries[incarnation]:
+                    del lifecycle.queries[incarnation]
+                lifecycle.condition.notify_all()
 
     @staticmethod
     def validate_vectors(

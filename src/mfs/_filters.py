@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,13 +11,12 @@ from ._validation import (
     validate_internal_id,
     validate_namespace,
 )
-from .errors import InvalidFilter, NamespaceNotFound
+from .errors import InvalidFilter
 from .types import (
     AnyOf,
     ByDocumentId,
     ByExtension,
     ByMediaType,
-    ByNamespace,
     DocumentId,
     Filter,
     NamePrefix,
@@ -58,27 +57,28 @@ class CompiledFilters:
 
 def compile_filters(
     filters: Sequence[Filter],
-    namespaces: Mapping[str, NamespaceKind],
+    namespace: str,
+    kind: NamespaceKind,
     *,
     search: bool,
 ) -> CompiledFilters:
-    sql: list[str] = []
-    params: list[Any] = []
-    clauses: list[str] = []
+    sql: list[str] = ["namespace = ?"]
+    params: list[Any] = [namespace]
+    clauses: list[str] = [f"namespace == {literal(namespace)}"]
     wanted_ids: set[DocumentId] | None = None
     text: list[TextMatch] = []
 
-    def namespace_exists(name: str) -> None:
+    def require_selected(name: str) -> None:
         validate_namespace(name)
-        if name not in namespaces:
-            raise NamespaceNotFound(f"namespace {name!r} does not exist")
+        if name != namespace:
+            raise InvalidFilter("filter namespace must match the query namespace")
 
     for item in filters:
         if isinstance(item, AnyOf):
             if not item.filters:
                 raise InvalidFilter("AnyOf must not be empty")
             branches = [
-                compile_filters([child], namespaces, search=search) for child in item.filters
+                compile_filters([child], namespace, kind, search=search) for child in item.filters
             ]
             if any(branch.text for branch in branches):
                 raise InvalidFilter("AnyOf accepts only structured metadata filters")
@@ -93,27 +93,19 @@ def compile_filters(
                 )
                 + ")"
             )
-        elif isinstance(item, ByNamespace):
-            if not item.namespaces:
-                raise InvalidFilter("ByNamespace must not be empty")
-            for name in item.namespaces:
-                namespace_exists(name)
-            sql.append("namespace IN (" + ",".join("?" for _ in item.namespaces) + ")")
-            params.extend(item.namespaces)
-            clauses.append("namespace in " + literal_list(item.namespaces))
         elif isinstance(item, ByDocumentId):
             if not item.ids:
                 raise InvalidFilter("ByDocumentId must not be empty")
             ids = tuple(dict.fromkeys(item.ids))
             for identity in ids:
-                namespace_exists(identity.namespace)
+                require_selected(identity.namespace)
                 validate_internal_id(identity.doc_id)
-                if namespaces[identity.namespace] == "external":
+                if kind == "external":
                     validate_external_path(identity.doc_id, allow_root=False)
             wanted_ids = set(ids) if wanted_ids is None else wanted_ids.intersection(ids)
         elif isinstance(item, UnderPath):
-            namespace_exists(item.namespace)
-            if namespaces[item.namespace] != "external":
+            require_selected(item.namespace)
+            if kind != "external":
                 raise InvalidFilter("UnderPath requires an external namespace")
             path = validate_external_path(item.path, allow_root=True)
             sql.append("namespace = ?")

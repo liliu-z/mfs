@@ -11,6 +11,7 @@ from ._lifecycle import Lifecycle
 from ._preparation import Preparation
 from ._runtime import NamespaceRuntime
 from ._validation import validate_chunk_ranges
+from ._vector_cache import VectorCache
 from ._work import (
     Chunked,
     ChunkPlan,
@@ -37,6 +38,7 @@ class Indexing:
     ) -> None:
         self.catalog, self.lifecycle = catalog, lifecycle
         self.runtime, self.preparation = runtime, preparation
+        self.vector_cache = VectorCache(catalog)
 
     def execute(self, permit: ExecutionPermit) -> StepResult | None:
         identity, job = permit.identity, permit.payload
@@ -71,17 +73,16 @@ class Indexing:
             if index.client.has_collection(index.collection_name):
                 index.delete_document(identity, incarnation=job.get("incarnation"))
                 index.flush()
-        elif self.lifecycle.namespace_record(identity.namespace)["indexing"] == "off":
+        elif job["indexing"] == "off":
             return Published(indexed=False)
         elif stage == "chunk":
             record = self.snapshot(identity, job)
-            text = self.preparation.read_text(record)
+            text = self.preparation.read_text(record, permit)
+            assert permit.binding is not None
             with self.runtime.chunker_lock:
                 ranges = validate_chunk_ranges(
                     text,
-                    self.runtime.binding(identity.namespace).chunker.chunk(
-                        text, parse_source_map(record)
-                    ),
+                    permit.binding.chunker.chunk(text, parse_source_map(record)),
                 )
             encoded = text.encode()
             plan = [
@@ -97,7 +98,7 @@ class Indexing:
         elif stage == "embed":
             assert index is not None
             record = self.snapshot(identity, job)
-            encoded = self.preparation.read_text(record).encode()
+            encoded = self.preparation.read_text(record, permit).encode()
             batch = int(job.get("completed_batches", 0))
             plan = job["plan"][batch * 128 : (batch + 1) * 128]
             texts: dict[str, str] = {}
@@ -107,8 +108,14 @@ class Indexing:
                     raise SourceChanged("text reference changed after chunk planning; sync again")
                 texts[chunk["text_hash"]] = raw.decode()
             vectors: dict[str, list[float]] = {}
-            dense = self.runtime.dense_config(identity.namespace)
+            assert permit.binding is not None
+            dense = permit.binding.manifest["index"]["dense"]
             if dense:
+                prefix = self.vector_cache.prefix(job, dense)
+                with self.lifecycle.condition:
+                    if not self.lifecycle.current(identity, job):
+                        return
+                    vectors = self.vector_cache.get(prefix, list(texts), int(dense["dimension"]))
                 candidates = index.vector_candidates(tuple(texts))
                 with self.lifecycle.condition:
                     for row in candidates:
@@ -122,9 +129,14 @@ class Indexing:
                 missing = [h for h in texts if h not in vectors]
                 if missing:
                     computed = self.runtime.embed_documents(
-                        identity.namespace, [texts[h] for h in missing]
+                        self.runtime.matching_embedder(permit.binding, dense),
+                        [texts[h] for h in missing],
                     )
                     vectors.update(zip(missing, computed, strict=True))
+                with self.lifecycle.condition:
+                    if not self.lifecycle.current(identity, job):
+                        return
+                    self.vector_cache.put(prefix, job["incarnation"], vectors)
             source_map = parse_source_map(record)
             rows: list[IndexRow] = []
             for chunk in plan:
