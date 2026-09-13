@@ -114,7 +114,7 @@ def test_namespace_configuration_reads_persisted_and_pending_settings_without_bi
         with pytest.raises(WaitTimeout):
             mfs.reindex("n", indexing="bm25", timeout=0.01)
         config = mfs.namespace_configuration("n")
-        assert config.paused and config.indexing == "bm25"
+        assert config.paused and config.indexing == "hybrid"
         assert isinstance(config.pending_manifest, dict)
         pending_index = config.pending_manifest["index"]
         assert isinstance(pending_index, dict) and pending_index["dense"] is None
@@ -127,7 +127,7 @@ def test_namespace_configuration_reads_persisted_and_pending_settings_without_bi
     mfs = MFS.open(state)
     try:
         config = mfs.namespace_configuration("n")
-        assert config.paused and config.indexing == "bm25"
+        assert config.paused and config.indexing == "hybrid"
         assert isinstance(config.manifest, dict) and config.manifest["processors"]
     finally:
         mfs.close()
@@ -154,6 +154,7 @@ def test_wait_follows_current_rebuild_even_when_sync_and_source_are_unchanged(
         assert model.entered.wait(5)
         unchanged = mfs.sync("n")
         assert not unchanged.changed
+        assert not unchanged.index_ready
         current = mfs.document_status(identity)
         assert current is not None and current.revision == before.revision
         assert current.indexed_revision is None
@@ -252,7 +253,7 @@ else:
         mfs.wait(replayed, 0)
         assert mfs.document_status(replayed.id) == current
         connection = mfs._catalog.connection
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
         assert connection.execute("SELECT count(*) FROM targets").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM operations").fetchone()[0] == 1
         tables = {

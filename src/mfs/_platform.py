@@ -10,6 +10,33 @@ from functools import cache
 from pathlib import Path
 from typing import Any, cast
 
+from .errors import InstanceLocked
+
+
+class ProcessOwner:
+    """An inherited POSIX flock survives the owner until its supervisors retire."""
+
+    def __init__(self, path: Path) -> None:
+        self.descriptor: int | None = None
+        if os.name == "posix":
+            import fcntl
+
+            descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BaseException as error:
+                os.close(descriptor)
+                if isinstance(error, BlockingIOError):
+                    raise InstanceLocked("previous managed processes are still retiring") from error
+                raise
+            self.descriptor = descriptor
+
+    def close(self) -> None:
+        if self.descriptor is not None:
+            # Never LOCK_UN: an inherited duplicate must keep the lock after owner death.
+            os.close(self.descriptor)
+            self.descriptor = None
+
 
 def fsync_directory(path: Path) -> None:
     if os.name == "nt":

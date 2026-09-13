@@ -249,9 +249,10 @@ def test_processing_commit_failure_reuses_completed_artifact(
 
         def fail_once(ns: str, doc: str, record: dict[str, Any]) -> None:
             nonlocal attempts
-            attempts += 1
-            if attempts == 1:
-                raise StorageFailed("injected SQLite failure before text commit")
+            if "chunk_plan" not in record:
+                attempts += 1
+                if attempts == 1:
+                    raise StorageFailed("injected SQLite failure before text commit")
             original(ns, doc, record)
 
         monkeypatch.setattr(mfs._catalog, "put_document", fail_once)
@@ -295,17 +296,13 @@ def test_idempotency_receipt_replays_after_later_update_and_reopen(tmp_path: Pat
 
 
 def test_close_wakes_strong_waiter_and_joins_workers(tmp_path: Path) -> None:
-    embedder = GateEmbedder()
-    embedder.fail = True
     mfs = MFS.open(tmp_path / "state")
-    for registered in mfs.list_namespaces():
-        mfs.open_namespace(
-            registered.namespace, processors=[Utf8TextProcessor()], embedder=embedder
-        )
     try:
-        mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()], embedder=embedder)
+        mfs.create_namespace(
+            "n", "internal", processors=[Utf8TextProcessor()], processing_paused=True
+        )
         mfs.upsert("n", "a.txt", b"text")
-        wait_state(mfs, DocumentId("n", "a.txt"), "failed")
+        wait_state(mfs, DocumentId("n", "a.txt"), "pending")
         entered = threading.Event()
 
         def waiting() -> None:
@@ -315,6 +312,7 @@ def test_close_wakes_strong_waiter_and_joins_workers(tmp_path: Path) -> None:
         with ThreadPoolExecutor() as pool:
             future = pool.submit(waiting)
             assert entered.wait(5)
+            assert not future.done()
             mfs.close()
             with pytest.raises(Closed):
                 future.result(5)

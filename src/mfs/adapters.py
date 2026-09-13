@@ -13,6 +13,8 @@ from .types import ChunkRange, ProcessedDocument, SourceMap, SourceSpan
 
 class Utf8TextProcessor:
     cache_scope = "content"
+    workload = "light"
+    concurrency = 4
 
     def __init__(self) -> None:
         self.id: str = "utf8-text"
@@ -52,6 +54,7 @@ class Utf8TextProcessor:
 
 class PdfProcessor:
     cache_scope = "content"
+    workload = "heavy"
 
     def __init__(self) -> None:
         self.id: str = "pdf"
@@ -94,6 +97,9 @@ class PdfProcessor:
 
 
 class DefaultChunker:
+    workload = "light"
+    concurrency = 4
+
     def __init__(self) -> None:
         self.id: str = "utf8-window"
         self.version: str = "1"
@@ -130,6 +136,7 @@ class DocxProcessor:
     """Basic DOCX paragraph/table text; applications can supply richer extraction."""
 
     cache_scope = "content"
+    workload = "light"
 
     def __init__(self) -> None:
         self.id: str = "docx"

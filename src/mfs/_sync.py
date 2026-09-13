@@ -118,7 +118,9 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
     requested = validate_external_path(path, allow_root=True)
     if os.name == "nt":
         validate_windows_relative(requested)
-    info = mfs._required_namespace(namespace)
+    with mfs._condition:
+        info = mfs._required_namespace(namespace)
+        initial = dict(mfs._tasks.namespaces[namespace])
     if info.kind != "external" or info.root is None:
         raise WrongNamespaceKind("sync requires an external namespace")
     mfs._require_modern_namespace(namespace)
@@ -130,12 +132,15 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
     seen: set[str] = set()
     protected: set[str] = set()
     nonmembers: set[str] = set()
+    observed_directories: set[str] = set()
+    uncertain: set[str] = set()
     complete = True
     root_fd: int | None = None
 
     def fail(relative: str, error: Exception) -> None:
         nonlocal complete
         complete = False
+        uncertain.add(relative)
         code = error.code if isinstance(error, MFSError) else "SourceUnavailable"
         failures[(relative, code)] = SyncFailure(relative, code, str(error))
 
@@ -152,7 +157,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
             tuple(sorted(removed)),
             tuple(failures[k] for k in sorted(failures)),
             tuple(skipped[k] for k in sorted(skipped)),
-            not mfs._tasks.pending and mfs._state == "ready",
+            mfs._is_ready(),
         )
 
     try:
@@ -181,10 +186,33 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
                 return False
 
         with mfs._condition:
-            ns = dict(mfs._tasks.namespaces[namespace])
+            ns = dict(mfs._tasks.namespaces.get(namespace, {}))
+            if ns.get("incarnation") != initial["incarnation"] or ns.get("root") != initial["root"]:
+                raise SourceChanged("namespace was replaced while opening its root")
+            if not root_stable():
+                raise SourceChanged("root changed before observation")
             if ns.get("root_actual") != str(root):
                 removed.update(mfs._tasks.retarget_root(namespace, str(root)))
                 requested = "."  # A new root target changes membership for the whole namespace.
+                ns = dict(mfs._tasks.namespaces[namespace])
+            baseline = {
+                doc: revision
+                for doc, revision in mfs._catalog.connection.execute(
+                    "SELECT doc_id,revision FROM targets WHERE namespace=?", (namespace,)
+                )
+            }
+
+        def validate_observation() -> None:
+            current = mfs._tasks.namespaces.get(namespace, {})
+            if current.get("building", {}).get("generation") != ns.get("building", {}).get(
+                "generation"
+            ) or any(
+                current.get(k) != ns.get(k)
+                for k in ("incarnation", "binding", "rules_revision", "root", "root_actual")
+            ):
+                raise SourceChanged(
+                    "namespace configuration changed during observation; sync again"
+                )
 
         def file(descriptor: int, relative: str, *, exact: bool) -> None:
             if os.name == "nt" and not files.path(descriptor).is_relative_to(root):
@@ -229,7 +257,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
             staged = None
             try:
                 os.lseek(descriptor, 0, os.SEEK_SET)
-                mfs._select_processor(
+                selection = mfs._select_processor(
                     namespace,
                     relative,
                     root / relative,
@@ -247,7 +275,9 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
                         raise SourceChanged("file identity changed during observation")
                 finally:
                     os.close(check)
-                report = mfs._admit(identity, staged, force=force)
+                with mfs._condition:
+                    validate_observation()
+                    report = mfs._admit(identity, staged, selection=selection, force=force)
                 if report.outcome != "unchanged":
                     changed.add(identity)
             except UnsupportedMediaType:
@@ -295,6 +325,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
                     raise SourceChanged("opened directory moved outside the root")
                 with files.scandir(descriptor) as iterator:
                     entries = sorted(iterator, key=lambda e: e.name.encode())
+                observed_directories.add(relative_dir)
                 for entry in entries:
                     relative = (
                         entry.name if relative_dir == "." else relative_dir + "/" + entry.name
@@ -364,33 +395,49 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
                     os.close(descriptor)
         except FileNotFoundError as error:
             actual_requested = str(error)
+            # The exact requested identity (possibly an entire subtree) is absent.
+            nonmembers.add(actual_requested)
         except OSError as error:
             fail(requested, error)
         if not root_stable():
             fail(".", SourceChanged("root changed during observation"))
         with mfs._condition:
+            validate_observation()
             existing = [
                 i
                 for i, j in mfs._tasks.targets.items()
                 if i.namespace == namespace and j["kind"] == "upsert"
             ]
         seen_keys = {key(s) for s in seen}
+        observed_keys = {key(s) for s in observed_directories}
+        uncertain_keys = {key(s) for s in uncertain}
+        nonmember_keys = {key(s) for s in nonmembers}
+        protected_keys = {key(s) for s in protected}
         for identity in existing:
             relative = identity.doc_id
-            excluded = any(under(relative, prefix) for prefix in nonmembers)
+            # Check path ancestors instead of scanning every observed directory
+            # for every file in a large tree.
+            parts = key(relative).split("/")
+            ancestors = {".", *("/".join(parts[:end]) for end in range(1, len(parts) + 1))}
+            excluded = bool(ancestors & nonmember_keys)
             absent = (
-                complete and under(relative, actual_requested) and key(relative) not in seen_keys
+                under(relative, actual_requested)
+                and key(relative) not in seen_keys
+                and bool(ancestors & observed_keys)
+                and not ancestors & uncertain_keys
             )
-            replacement_child = any(
-                key(relative) != key(prefix) and under(relative, prefix) for prefix in protected
-            )
+            replacement_child = bool((ancestors - {key(relative)}) & protected_keys)
             spelling_changed = (
                 not case_sensitive and key(relative) in seen_keys and relative not in seen
             )
-            if (spelling_changed or excluded or absent or replacement_child) and (
-                mfs._tasks.remove(identity).outcome == "removed"
-            ):
-                removed.add(identity)
+            if spelling_changed or excluded or absent or replacement_child:
+                with mfs._condition:
+                    validate_observation()
+                    current = mfs._tasks.targets.get(identity, {})
+                    if current.get("revision") != baseline.get(identity.doc_id):
+                        continue
+                    if mfs._tasks.remove(identity).outcome == "removed":
+                        removed.add(identity)
     except (OSError, RuntimeError, MFSError) as error:
         fail(".", error)
     finally:

@@ -18,6 +18,7 @@ from ._work import (
     Cleaned,
     Embedded,
     ExecutionPermit,
+    NeedsPreparation,
     Published,
     Rebuilt,
     StepResult,
@@ -46,20 +47,37 @@ class Indexing:
             if not self.lifecycle.current(identity, job):
                 return
         if job.get("cleanup"):
-            index = self.runtime.index(identity.namespace, job.get("incarnation"))
+            index = self.runtime.index(
+                identity.namespace, job.get("incarnation"), job.get("collection_generation")
+            )
             index.delete_document(identity, incarnation=job.get("incarnation"))
             index.flush()
             return Cleaned()
         kind, stage = job["kind"], job["stage"]
+        if stage in ("chunk", "embed") and job["indexing"] != "off":
+            record = self.snapshot(identity, job)
+            if (
+                record.get("transient")
+                and record["revision"] not in self.preparation.transient_text
+            ):
+                return NeedsPreparation()
         if kind == "rebuild":
             self.rebuild(permit)
             return Rebuilt()
         index = (
-            self.runtime.index(identity.namespace, job.get("incarnation"))
+            self.runtime.index(
+                identity.namespace, job.get("incarnation"), job.get("collection_generation")
+            )
             if kind != "drop"
             else None
         )
         if stage == "drop":
+            for collection in job.get("collections", []):
+                old_index = self.runtime.index(
+                    identity.namespace, collection["incarnation"], collection["generation"]
+                )
+                if old_index.client.has_collection(old_index.collection_name):
+                    old_index.drop()
             if job.get("legacy_cleanup") and self.runtime.legacy_index.client.has_collection(
                 self.runtime.legacy_index.collection_name
             ):
@@ -69,21 +87,24 @@ class Indexing:
                 if old_index.client.has_collection(old_index.collection_name):
                     old_index.drop()
         elif stage == "delete":
-            assert index is not None
-            if index.client.has_collection(index.collection_name):
-                index.delete_document(identity, incarnation=job.get("incarnation"))
-                index.flush()
+            # Exact snapshot debts were persisted with acceptance. They retire
+            # independently; an old cleanup failure cannot fail a replacement source.
+            pass
         elif job["indexing"] == "off":
             return Published(indexed=False)
         elif stage == "chunk":
             record = self.snapshot(identity, job)
-            text = self.preparation.read_text(record, permit)
             assert permit.binding is not None
-            with self.runtime.chunker_lock:
-                ranges = validate_chunk_ranges(
-                    text,
-                    permit.binding.chunker.chunk(text, parse_source_map(record)),
-                )
+            if (
+                "chunk_plan" in record
+                and record.get("chunker") == permit.binding.manifest["index"]["chunker"]
+            ):
+                return Chunked(record["chunk_plan"])
+            text = self.preparation.read_text(record, permit)
+            ranges = validate_chunk_ranges(
+                text,
+                permit.binding.chunker.chunk(text, parse_source_map(record)),
+            )
             encoded = text.encode()
             plan = [
                 ChunkPlan(
@@ -172,7 +193,11 @@ class Indexing:
         return Published(indexed=kind == "upsert")
 
     def snapshot(self, identity: DocumentId, job: dict[str, Any]) -> dict[str, Any]:
-        record = self.catalog.get_document(identity.namespace, identity.doc_id)
+        record = (
+            self.catalog.get_build(identity.namespace, identity.doc_id, document=True)
+            if job.get("build_generation")
+            else self.catalog.get_document(identity.namespace, identity.doc_id)
+        )
         if record is None or record.get("revision") != job["revision"]:
             raise SourceChanged("processed text no longer belongs to the current source")
         return record

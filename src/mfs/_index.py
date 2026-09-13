@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any, Literal, NotRequired, TypedDict
@@ -85,13 +86,41 @@ def index_config(chunker: dict[str, object], dense: dict[str, object] | None) ->
     }
 
 
+class _SerializedClient:
+    """Serialize native backend calls without holding Lifecycle or model capacity."""
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+        self._lock = threading.RLock()
+
+    def __getattr__(self, name: str) -> Any:
+        attribute = getattr(self._client, name)
+        if not callable(attribute):
+            return attribute
+
+        def invoke(*args: Any, **kwargs: Any) -> Any:
+            deadline: SearchDeadline | None = kwargs.pop("_deadline", None)
+            if deadline is None:
+                with self._lock:
+                    return attribute(*args, **kwargs)
+            while not self._lock.acquire(timeout=0.05):
+                deadline.check()
+            try:
+                kwargs["timeout"] = deadline.remaining()
+                return attribute(*args, **kwargs)
+            finally:
+                self._lock.release()
+
+        return invoke
+
+
 class ChunkIndex:
     def __init__(self, path: Path) -> None:
         self._path = str(path)
         self.collection_name = COLLECTION
         self._owns_client = True
         try:
-            self.client: Any = MilvusClient(uri=str(path))
+            self.client: Any = _SerializedClient(MilvusClient(uri=str(path)))
         except Exception as error:
             raise IndexFailed(f"failed to open Milvus Lite: {error}") from error
 
@@ -354,18 +383,29 @@ class ChunkIndex:
             raise IndexFailed(f"failed to read reusable vectors: {error}") from error
 
     def publish(self, document_id: DocumentId, snapshot: str, incarnation: str, count: int) -> None:
-        expression = (
+        scope = (
             f"({_documents_expression([document_id])}) and "
-            f"(snapshot_id != {_literal(snapshot)} or incarnation != {_literal(incarnation)} "
-            f"or ordinal >= {count})"
+            f"snapshot_id == {_literal(snapshot)} and incarnation == {_literal(incarnation)}"
         )
         try:
-            self.client.delete(self.collection_name, filter=expression)
+            self.client.delete(self.collection_name, filter=f"({scope}) and ordinal >= {count}")
         except Exception as error:
             raise IndexFailed(f"failed to retire previous chunks: {error}") from error
         self.flush()
-        if self.count_document(document_id) != count:
+        rows = self.client.query(self.collection_name, filter=scope, output_fields=["count(*)"])
+        if int(rows[0]["count(*)"]) != count:
             raise IndexFailed("publication is missing chunk rows")
+
+    def delete_snapshot(self, document_id: DocumentId, snapshot: str, incarnation: str) -> None:
+        expression = (
+            f"({_documents_expression([document_id])}) and "
+            f"snapshot_id == {_literal(snapshot)} and incarnation == {_literal(incarnation)}"
+        )
+        try:
+            self.client.delete(self.collection_name, filter=expression)
+            self.flush()
+        except Exception as error:
+            raise IndexFailed(f"failed to retire snapshot chunks: {error}") from error
 
     def delete_namespace(self, namespace: str, *, incarnation: str | None = None) -> None:
         try:
@@ -434,7 +474,7 @@ class ChunkIndex:
             return [], False
         else:
             batches = (documents[start : start + 200] for start in range(0, len(documents), 200))
-        all_hits: dict[tuple[str, str, int], SearchHit] = {}
+        all_hits: dict[tuple[str, str, str, int], SearchHit] = {}
         possibly_more = False
         compiled = (
             expressions
@@ -456,6 +496,7 @@ class ChunkIndex:
                     search_params={"metric_type": "BM25" if mode == "bm25" else "COSINE"},
                     consistency_level="Strong",
                     timeout=remaining,
+                    _deadline=deadline,
                 )
             except Exception as error:
                 if deadline is not None:
@@ -485,7 +526,12 @@ class ChunkIndex:
                 )
                 if not math.isfinite(parsed["score"]):
                     raise IndexFailed("search returned a non-finite score")
-                key = (parsed["namespace"], parsed["doc_id"], parsed["ordinal"])
+                key = (
+                    parsed["namespace"],
+                    parsed["doc_id"],
+                    parsed["snapshot_id"],
+                    parsed["ordinal"],
+                )
                 previous = all_hits.get(key)
                 if previous is None or parsed["score"] > previous["score"]:
                     all_hits[key] = parsed

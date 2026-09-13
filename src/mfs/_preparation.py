@@ -19,6 +19,7 @@ from ._lifecycle import Lifecycle
 from ._namespace import NamespaceBinding
 from ._platform import fsync_directory
 from ._runtime import NamespaceRuntime
+from ._source import SourceGuard
 from ._validation import validate_processed
 from ._work import ExecutionPermit, Prepared
 from .errors import CapabilityUnavailable, CorruptState, SourceChanged
@@ -36,18 +37,19 @@ class Preparation:
         artifacts: ArtifactStore,
         lifecycle: Lifecycle,
         runtime: NamespaceRuntime,
+        process_owner: int | None = None,
     ) -> None:
         self.root, self.catalog, self.artifacts = root, catalog, artifacts
         self.lifecycle, self.runtime = lifecycle, runtime
-        self.transient_text: tuple[str, str] | None = None
+        self.process_owner = process_owner
+        self.transient_text: dict[str, str] = {}
 
     def execute(self, permit: ExecutionPermit) -> Prepared:
         _, record = self.prepare_snapshot(permit.payload, permit.binding)
         return Prepared(record)
 
     def release_text(self, revision: str) -> None:
-        if self.transient_text is not None and self.transient_text[0] == revision:
-            self.transient_text = None
+        self.transient_text.pop(revision, None)
 
     def cache_key(self, identity: DocumentId, job: dict[str, Any], processor: Processor) -> str:
         # Opt-in on the concrete adapter: subclasses that change process must explicitly
@@ -56,6 +58,7 @@ class Preparation:
         return self.artifacts.key(
             "process",
             dict(
+                format=2,
                 namespace=identity.namespace,
                 incarnation=job["incarnation"],
                 hash=job["content_hash"],
@@ -72,30 +75,36 @@ class Preparation:
     ) -> dict[str, Any]:
         key = self.cache_key(identity, job, processor)
         input_path = self.root / job["input"]
-        if job.get("borrowed_input"):
-            with input_path.open("rb") as stream:
-                digest = blake3.blake3()
-                while block := stream.read(1024 * 1024):
-                    digest.update(block)
-            if digest.hexdigest() != job["content_hash"]:
-                raise SourceChanged("external input changed after sync; sync again")
+        guard = (
+            SourceGuard(input_path, job["content_hash"], job["source"])
+            if job.get("borrowed_input")
+            else None
+        )
+
+        def check_source() -> None:
+            self.lifecycle.check_execution(identity, job)
+            if guard is not None:
+                guard.check(self.lifecycle.target_record(identity)["source"])
+
         cached = None if job.get("force") else self.artifacts.cached(key)
+        if cached is not None and cached.get("uses_input"):
+            cached["text_ref"] = dict(
+                path=job["input"], owned=not job.get("borrowed_input"), encoding="utf-8-sig"
+            )
         if (
             cached is not None
             and (
                 cached.get("uses_input")
                 or cast(dict[str, Any], cached.get("text_ref") or {}).get("owned")
             )
-            and all((self.root / p).is_file() for p in cached.get("artifacts", {}).values())
+            and all((self.root / p).is_file() for p in self.catalog.references(cached))
             and (cached.get("uses_input") or (self.root / cached["text_ref"]["path"]).is_file())
         ):
-            if cached.get("uses_input"):
-                cached["text_ref"] = dict(
-                    path=job["input"], owned=not job.get("borrowed_input"), encoding="utf-8-sig"
-                )
+            check_source()
             return cast(dict[str, Any], cached)
         cancellation = self.lifecycle.cancellation_for(identity, job)
         work_dir = self.artifacts.directory(job["incarnation"], "work") / uuid.uuid4().hex
+        self.artifacts.protect(work_dir.relative_to(self.root).as_posix())
         with self.catalog.transaction():
             self.catalog.register_artifact(work_dir.relative_to(self.root).as_posix())
         work_dir.mkdir()
@@ -115,6 +124,7 @@ class Preparation:
         def checkpoint(state: JSONValue, files: Any) -> bool:
             cancellation.check()
             saved = self.artifacts.copy_files(work_dir, files)
+            check_source()
             return self.lifecycle.checkpoint(identity, job, state, saved)
 
         context = ProcessingContext(
@@ -127,6 +137,7 @@ class Preparation:
             {name: self.root / p for name, p in resume.get("files", {}).items()},
             checkpoint,
             progress,
+            process_owner=self.process_owner,
         )
         cancellation.check()
         if len(inspect.signature(processor.process).parameters) >= 3:
@@ -138,6 +149,7 @@ class Preparation:
                 self.root / job["input"], job["media_type"]
             )
         cancellation.check()
+        check_source()
         processed = validate_processed(processed)
         files = self.artifacts.copy_files(work_dir, processed.artifacts)
         cancellation.check()
@@ -166,11 +178,12 @@ class Preparation:
                 reference = dict(path=str(path), owned=False, encoding="utf-8-sig")
         elif processed.grep_path is not None:
             # HTML-style adapters can grep the source and index extracted text in memory.
-            self.transient_text = (str(job["revision"]), processed.text)
+            self.transient_text[str(job["revision"])] = processed.text
             reference = None
         else:
             directory = self.artifacts.directory(job["incarnation"], "derived")
             relative = (directory / (uuid.uuid4().hex + ".md")).relative_to(self.root).as_posix()
+            self.artifacts.protect(relative)
             with self.catalog.transaction():
                 self.catalog.register_artifact(relative)
             with (self.root / relative).open("xb") as stream:
@@ -188,12 +201,18 @@ class Preparation:
             artifacts=files,
         )
         if processed.grep_path is not None:
-            value["grep_ref"] = dict(
-                path=str(processed.grep_path.resolve(strict=True)),
-                owned=False,
-                encoding="utf-8-sig",
-            )
-        self.lifecycle.check_execution(identity, job)
+            path = processed.grep_path.resolve(strict=True)
+            if path.is_relative_to(work_dir):
+                value["grep_ref"] = dict(
+                    path=self.artifacts.copy_files(work_dir, {"grep": path})["grep"],
+                    owned=True,
+                    encoding="utf-8-sig",
+                )
+            elif path == input_path.resolve() and not job.get("borrowed_input"):
+                value["grep_ref"] = dict(path=job["input"], owned=True, encoding="utf-8-sig")
+            else:
+                value["grep_ref"] = dict(path=str(path), owned=False, encoding="utf-8-sig")
+        check_source()
         artifact = self.artifacts.write(uuid.uuid4().hex + "-processed", value, job["incarnation"])
         self.artifacts.cache(key, artifact)
         return value
@@ -212,6 +231,16 @@ class Preparation:
             snapshot = cast(dict[str, Any], cached)
             if snapshot.get("revision") != job["revision"]:
                 raise CorruptState("processed artifact does not match target revision")
+            if snapshot.get("transient") and job["revision"] not in self.transient_text:
+                processor = self.runtime.processor_for(job, binding)
+                if processor is None:
+                    raise CapabilityUnavailable("transient index text requires its Processor")
+                self.prepare(DocumentId(**job["identity"]), job, processor)
+                if (
+                    blake3.blake3(self.transient_text[job["revision"]].encode()).hexdigest()
+                    != snapshot["text_hash"]
+                ):
+                    raise SourceChanged("transient text changed since preparation; reprocess again")
             return artifact, snapshot
         processor = self.runtime.processor_for(job, binding)
         if processor is None:
@@ -239,13 +268,11 @@ class Preparation:
         self, record: dict[str, Any], permit: ExecutionPermit, *, grep: bool = False
     ) -> str:
         if record.get("transient") and not grep:
-            if self.transient_text is None or self.transient_text[0] != record["revision"]:
-                identity = DocumentId(**record["identity"])
-                job = permit.payload
-                processor = self.runtime.processor_for(job, permit.binding)
-                if processor is None:
-                    raise CapabilityUnavailable("transient index text requires its Processor")
-                self.prepare(identity, job, processor)
-            assert self.transient_text is not None
-            return self.transient_text[1]
-        return self.artifacts.read_text(record, grep=grep)
+            if record["revision"] not in self.transient_text:
+                raise CorruptState("transient text was not restored by the preparation stage")
+            text = self.transient_text[record["revision"]]
+        else:
+            text = self.artifacts.read_text(record, grep=grep)
+        if not grep and blake3.blake3(text.encode()).hexdigest() != record.get("text_hash"):
+            raise SourceChanged("text reference changed since preparation; sync/reprocess again")
+        return text

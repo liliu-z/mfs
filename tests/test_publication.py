@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from mfs import MFS, DocumentId, IndexFailed, StorageFailed, Utf8TextProcessor, WaitTimeout
+from mfs import MFS, DocumentId, IndexFailed, OperationFailed, StorageFailed, Utf8TextProcessor
 
 
 def test_failed_publication_keeps_new_grep_text_and_revokes_old_index(
@@ -25,15 +25,16 @@ def test_failed_publication_keeps_new_grep_text_and_revokes_old_index(
             raise IndexFailed("injected publication failure")
 
         monkeypatch.setattr(mfs._runtime.index("n"), "publish", fail)
-        mfs.upsert("n", "a.txt", b"new snapshot")
+        report = mfs.upsert("n", "a.txt", b"new snapshot")
         with mfs._condition:
             assert mfs._condition.wait_for(
                 lambda: mfs._tasks.targets[DocumentId("n", "a.txt")]["state"] == "failed", 5
             )
         assert mfs.grep("n", select="doc").items[0].value.text == "new snapshot"
         assert not mfs.search("n", "old", mode="bm25", consistency="eventual").items
-        with pytest.raises(WaitTimeout):
+        with pytest.raises(OperationFailed) as failed:
             mfs.search("n", "new", mode="bm25", consistency="strong", timeout=0.05)
+        assert failed.value.revision == report.revision and failed.value.error_code == "IndexFailed"
         monkeypatch.setattr(mfs._runtime.index("n"), "publish", original)
         mfs.retry(DocumentId("n", "a.txt"))
         mfs.wait_ready(10)

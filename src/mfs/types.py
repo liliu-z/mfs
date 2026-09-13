@@ -98,6 +98,21 @@ class NamespaceConfiguration:
     manifest: JSONValue
     pending_manifest: JSONValue
     max_file_bytes: int | None
+    processing_paused: bool = False
+    active_revision: str | None = None
+    pending_revision: str | None = None
+    cleanup_pending: bool = False
+    cleanup_error: str | None = None
+    pending_error: str | None = None
+    pending_failures: int = 0
+    pending_retry_at: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigurationReport:
+    namespace: str
+    revision: str
+    changed: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +188,10 @@ class DocumentStatus:
     error_detail: TaskError | None = None
     progress: Progress | None = None
     artifacts: tuple[str, ...] = ()
+    active_run_id: str | None = None
+    attempt_token: str | None = None
+    cleanup_pending: bool = False
+    configuration_revision: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,9 +377,16 @@ class SearchItem[T]:
 
 
 @dataclass(frozen=True, slots=True)
+class GrepFailure:
+    id: DocumentId
+    error: TaskError
+
+
+@dataclass(frozen=True, slots=True)
 class GrepResult[T]:
     items: tuple[GrepItem[T], ...]
     truncated: bool
+    failures: tuple[GrepFailure, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

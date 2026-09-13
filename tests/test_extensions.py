@@ -184,11 +184,12 @@ def test_wait_is_scoped_and_durable_and_receipts_use_global_ready(tmp_path: Path
         deletion = mfs.remove("n", "good.txt")
         mfs.wait(deletion, 10)
         assert not mfs.search("n", "needle", mode="bm25", consistency="eventual").items
-        mfs.wait(good, 0)  # Successful historical operations stay successful.
+        mfs.wait(good, 0)  # This file's current deletion has completed.
         with pytest.raises(OperationFailed):
             mfs.wait(bad, 0)
-        with pytest.raises(WaitTimeout):
+        with pytest.raises(OperationFailed) as failed:
             mfs.wait_ready(0)
+        assert failed.value.revision == bad.revision and failed.value.error_code == "ValueError"
     finally:
         mfs.close()
     mfs = MFS.open(state)
@@ -459,14 +460,14 @@ def test_sync_wait_includes_unchanged_pending_and_descendant_cleanup(
         (root / "folder.txt" / "child.txt").unlink()
         (root / "folder.txt").rmdir()
         (root / "folder.txt").write_text("replacement")
-        original = mfs._runtime.index("n").delete_document
+        original = mfs._runtime.index("n").delete_snapshot
 
-        def delayed(identity: DocumentId, *, incarnation: str | None = None) -> None:
+        def delayed(identity: DocumentId, snapshot: str, incarnation: str) -> None:
             entered.set()
             assert release.wait(10)
-            original(identity, incarnation=incarnation)
+            original(identity, snapshot, incarnation)
 
-        monkeypatch.setattr(mfs._runtime.index("n"), "delete_document", delayed)
+        monkeypatch.setattr(mfs._runtime.index("n"), "delete_snapshot", delayed)
         receipt = mfs.sync("n")
         assert entered.wait(5)
         with pytest.raises(WaitTimeout):

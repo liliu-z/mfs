@@ -23,8 +23,9 @@ from ._json import copy_json
 from ._lifecycle import ReadView
 from ._runtime import NamespaceRuntime
 from ._search_execution import SearchDeadline
+from ._source import open_regular
 from ._validation import validate_chunk_ranges
-from .errors import CorruptState, InvalidQuery, SourceUnavailable
+from .errors import CapabilityUnavailable, CorruptState, InvalidQuery, SourceUnavailable
 from .types import (
     Chunk,
     Consistency,
@@ -32,6 +33,7 @@ from .types import (
     DocumentId,
     Filter,
     GrepBudget,
+    GrepFailure,
     GrepItem,
     GrepResult,
     Match,
@@ -42,6 +44,7 @@ from .types import (
     SourceLocation,
     SourceMap,
     SourceSpan,
+    TaskError,
 )
 
 
@@ -114,7 +117,10 @@ class Reader:
         record = self.catalog.get_document(document_id.namespace, document_id.doc_id)
         if record is None or not self.view.current_text(document_id, record.get("revision")):
             return None
-        document = self._document(document_id, record)
+        with self.view.source_read(document_id, record.get("revision")) as current:
+            if not current:
+                return None
+            document = self._document(document_id, record)
         return document if self.view.current_text(document_id, record.get("revision")) else None
 
     def _document(self, document_id: DocumentId, record: dict[str, Any]) -> Document:
@@ -127,7 +133,7 @@ class Reader:
             source_map = parse_source_map(record)
             if (
                 reference
-                and not reference["owned"]
+                and (not reference["owned"] or record.get("grep_ref"))
                 and (blake3.blake3(text.encode()).hexdigest() != record.get("text_hash"))
             ):
                 source_map = _line_map(text)
@@ -150,7 +156,7 @@ class Reader:
             else Path(reference["path"])
         )
         try:
-            with path.open("rb") as stream:
+            with open_regular(path) as stream:
                 raw = stream.read(maximum + 1)
             truncated = len(raw) > maximum
             decoder = codecs.getincrementaldecoder(reference.get("encoding", "utf-8"))()
@@ -169,21 +175,42 @@ class Reader:
         select: Select,
         limit: int | None,
         budget: GrepBudget,
+        consistency: Consistency,
+        deadline: SearchDeadline,
     ) -> GrepResult[Any]:
+        deadline.check()
+        if consistency not in ("strong", "eventual"):
+            raise InvalidQuery("invalid grep consistency")
         validate_query_options(select, limit, search=False)
         if any(
             isinstance(v, bool) or not isinstance(v, int) or v < 1 for v in asdict(budget).values()
         ):
             raise InvalidQuery("grep budgets must be positive integers")
+        if consistency == "strong":
+            self.view.wait_text_ready(namespace, deadline.remaining())
+        deadline.check()
         record = self.view.namespace(namespace)
+        chunk_binding = None
+        if select == "chunk":
+            with self.view.condition:
+                generation = record.get("building", {}).get("generation")
+                chunk_binding = (
+                    self.runtime.build_bindings.get((namespace, generation))
+                    if consistency == "strong" and generation
+                    else self.runtime.binding(namespace)
+                )
         compiled = compile_filters(filters, namespace, record["kind"], search=False)
         for text_filter in compiled.text:
             text_matches("", text_filter)
         items: list[GrepItem[Any]] = []
+        failures: list[GrepFailure] = []
         bytes_read = matches_seen = documents_seen = 0
         truncated = False
         maximum_items = limit if limit is not None else budget.max_documents
-        for namespace, doc_id, stored in self.catalog.iter_documents(compiled.sql, compiled.params):
+        for namespace, doc_id, stored in self.catalog.iter_documents(
+            compiled.sql, compiled.params, candidate=consistency == "strong"
+        ):
+            deadline.check()
             identity = DocumentId(namespace, doc_id)
             with self.view.condition:
                 if not self.view.current_text(identity, stored.get("revision")):
@@ -200,7 +227,16 @@ class Reader:
                 if remaining <= 0:
                     truncated = True
                     break
-                text, cut, used = self._read(record, remaining)
+                try:
+                    with self.view.source_read(identity, record.get("revision")) as current:
+                        if not current:
+                            continue
+                        text, cut, used = self._read(record, remaining)
+                except (SourceUnavailable, CapabilityUnavailable) as error:
+                    failures.append(GrepFailure(identity, TaskError(error.code, str(error), True)))
+                    truncated = True
+                    continue
+                deadline.check()
                 bytes_read += used
                 truncated |= cut
                 reference = record.get("grep_ref") or record["text_ref"]
@@ -222,6 +258,7 @@ class Reader:
             ranges: list[tuple[int, int]] = []
             failed = False
             for text_filter in compiled.text:
+                deadline.check()
                 found = text_matches(text, text_filter, limit=budget.max_matches - matches_seen + 1)
                 if not found:
                     failed = True
@@ -232,9 +269,11 @@ class Reader:
                 matches_seen += min(allowed, len(found))
             if failed:
                 continue
-            matches = tuple(
-                Match(a, b, source_location(source_map, a, b)) for a, b in _merge_ranges(ranges)
-            )
+            located_matches: list[Match] = []
+            for a, b in _merge_ranges(ranges):
+                deadline.check()
+                located_matches.append(Match(a, b, source_location(source_map, a, b)))
+            matches = tuple(located_matches)
             if select == "doc_id":
                 values: list[GrepItem[Any]] = [GrepItem(identity, matches)]
             elif select == "doc":
@@ -255,13 +294,16 @@ class Reader:
                     )
                 ]
             else:
-                with self.runtime.chunker_lock:
-                    chunks = validate_chunk_ranges(
-                        text, self.runtime.binding(namespace).chunker.chunk(text, source_map)
-                    )
+                if chunk_binding is None:
+                    raise InvalidQuery("selected text configuration needs a Chunker binding")
+                chunks = validate_chunk_ranges(
+                    text, self.runtime.chunk_text(chunk_binding.chunker, text, source_map, deadline)
+                )
+                deadline.check()
                 encoded = text.encode()
                 values = []
                 for ordinal, chunk in enumerate(chunks):
+                    deadline.check()
                     located = tuple(
                         m
                         for m in matches
@@ -288,12 +330,13 @@ class Reader:
                     continue
                 for value in values:
                     if len(items) == maximum_items:
-                        return GrepResult(tuple(items), True)
+                        return GrepResult(tuple(items), True, tuple(failures))
                     items.append(value)
             if matches_seen >= budget.max_matches:
                 truncated = True
                 break
-        return GrepResult(tuple(items), truncated)
+        deadline.check()
+        return GrepResult(tuple(items), truncated, tuple(failures))
 
     def search(
         self,
@@ -325,12 +368,13 @@ class Reader:
                 expressions = compile_filters(
                     filters, namespace, record["kind"], search=True
                 ).expressions
-            if record["indexing"] == "off":
+            if record["indexing"] == "off" or not self.view.has_visible(namespace):
                 return SearchResult((), False)
             vector = (
                 self.runtime.embed_query(
                     self.runtime.matching_embedder(binding, record["manifest"]["index"]["dense"]),
                     text,
+                    deadline,
                 )
                 if mode in ("vector", "hybrid")
                 else None
@@ -368,7 +412,7 @@ class Reader:
                             h
                             for h in channel
                             if self.view.visible(
-                                DocumentId(h["namespace"], h["doc_id"]), h["snapshot_id"]
+                                DocumentId(h["namespace"], h["doc_id"]), h["snapshot_id"], record
                             )
                         ]
                         for channel in channels
@@ -389,7 +433,7 @@ class Reader:
                 for hit in ranked:
                     deadline.check()
                     identity = DocumentId(hit["namespace"], hit["doc_id"])
-                    if not self.view.visible(identity, hit["snapshot_id"]):
+                    if not self.view.visible(identity, hit["snapshot_id"], record):
                         continue
                     if select == "doc_id":
                         if identity in seen:

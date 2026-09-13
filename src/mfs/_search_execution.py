@@ -34,10 +34,10 @@ class SearchExecution:
     Search bodies own their MFS resource lease until they actually finish.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, capacity: int = 4) -> None:
         self._condition = threading.Condition()
         self._closing = threading.Event()
-        self._capacity = 4
+        self._capacity = capacity
         self._active = 0
         self._executor = ThreadPoolExecutor(
             max_workers=self._capacity, thread_name_prefix="mfs-search"

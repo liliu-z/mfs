@@ -4,10 +4,11 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
+import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Generator, Iterator, Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, cast
 
@@ -17,7 +18,9 @@ from ._catalog import Catalog
 from ._json import canonical_json, compact_json, load_json
 from ._lifecycle import Lifecycle
 from ._platform import fsync_directory
+from ._source import open_regular
 from .errors import CorruptState, InvalidQuery, SourceUnavailable, StorageFailed
+from .execution import ResourceGrant, ResourceLease
 from .types import GCPolicy, GCReport
 
 
@@ -56,6 +59,46 @@ class ArtifactStore:
         self._collect_lock = threading.Lock()
         self._inventory: Iterator[Path] | None = None
         self.last_report = GCReport()
+        self._pins: dict[str, int] = {}
+        self._local = threading.local()
+        lifecycle.pin_artifact = self.pin
+
+    @contextlib.contextmanager
+    def operation(self) -> Generator[None]:
+        previous = getattr(self._local, "leases", None)
+        leases: list[ResourceLease] = []
+        self._local.leases = leases
+        try:
+            yield
+        finally:
+            self._local.leases = previous
+            for lease in reversed(leases):
+                lease.release()
+
+    def protect(self, relative: str) -> None:
+        leases: list[ResourceLease] | None = getattr(self._local, "leases", None)
+        if leases is not None:
+            leases.append(self.pin(relative))
+
+    def pin(self, relative: str) -> ResourceLease:
+        with self.lifecycle.condition:
+            row = self.catalog.connection.execute(
+                "SELECT state FROM artifacts WHERE path=?", (relative,)
+            ).fetchone()
+            if row and row[0] == "deleting":
+                raise SourceUnavailable("artifact is already being retired")
+            self._pins[relative] = self._pins.get(relative, 0) + 1
+
+        def release() -> None:
+            with self.lifecycle.condition:
+                remaining = self._pins[relative] - 1
+                if remaining:
+                    self._pins[relative] = remaining
+                else:
+                    del self._pins[relative]
+                self.lifecycle.condition.notify_all()
+
+        return ResourceGrant(release)
 
     def directory(self, incarnation: str, area: str) -> Path:
         if (
@@ -69,7 +112,12 @@ class ArtifactStore:
             path = path / part
             if path.is_symlink():
                 raise CorruptState("namespace storage cannot traverse symlinks")
-            path.mkdir(exist_ok=True)
+            try:
+                path.mkdir()
+            except FileExistsError:
+                pass
+            else:
+                fsync_directory(path.parent)
         return path
 
     def read_text(self, record: dict[str, Any], *, grep: bool = False) -> str:
@@ -81,9 +129,8 @@ class ArtifactStore:
             raise CorruptState("document has no text reference")
         path = self.path(reference["path"]) if reference["owned"] else Path(reference["path"])
         try:
-            from ._text import read_text
-
-            return read_text(path, reference.get("encoding", "utf-8"))
+            with open_regular(path) as stream:
+                return stream.read().decode(reference.get("encoding", "utf-8"))
         except (OSError, UnicodeError) as error:
             raise SourceUnavailable(f"search text is unavailable: {path}: {error}") from error
 
@@ -117,6 +164,10 @@ class ArtifactStore:
         return kind + ":" + blake3.blake3(canonical_json(value)).hexdigest()
 
     def cached(self, key: str) -> Any | None:
+        with self.lifecycle.condition:
+            return self._cached(key)
+
+    def _cached(self, key: str) -> Any | None:
         catalog = self.catalog
         row = catalog.connection.execute(
             "SELECT cache.path,cache.digest FROM cache JOIN artifacts USING(path) "
@@ -126,12 +177,17 @@ class ArtifactStore:
         if row is None:
             return None
         try:
+            self.protect(str(row[0]))
             path = self.path(str(row[0]))
             data = path.read_bytes()
             if blake3.blake3(data).hexdigest() != row[1]:
                 raise CorruptState("cached artifact checksum mismatch")
-            return load_json(data.decode("utf-8"))
-        except (CorruptState, OSError, ValueError):
+            value = load_json(data.decode("utf-8"))
+            if isinstance(value, dict):
+                for reference in self.catalog.references(value):
+                    self.protect(reference)
+            return value
+        except (CorruptState, SourceUnavailable, OSError, ValueError):
             with catalog.transaction():
                 catalog.connection.execute("DELETE FROM cache WHERE key=?", (key,))
             return None
@@ -174,6 +230,7 @@ class ArtifactStore:
             area = work_dir.relative_to(self.root).parts
             directory = self.directory(area[1], "derived")
             path = (directory / (uuid.uuid4().hex + ".bin")).relative_to(self.root).as_posix()
+            self.protect(path)
             with self.catalog.transaction():
                 self.catalog.register_artifact(path)
             destination = self.root / path
@@ -222,8 +279,7 @@ class ArtifactStore:
                 try:
                     if (
                         lifecycle.stopping
-                        or lifecycle.readers
-                        or lifecycle.executing
+                        or lifecycle.boot_paused
                         or time.monotonic() - lifecycle.last_activity < policy.idle_seconds
                     ):
                         return GCReport(deleted, skipped, busy=True)
@@ -247,6 +303,9 @@ class ArtifactStore:
                             ).fetchone()
                             if row:
                                 path = str(row[0])
+                                if any(path == p or path.startswith(p + "/") for p in self._pins):
+                                    deferred.add(path)
+                                    continue
                                 catalog.connection.execute(
                                     "UPDATE artifacts SET state='deleting' WHERE path=?", (path,)
                                 )
@@ -301,7 +360,18 @@ class ArtifactStore:
                     break
             self.last_report = GCReport(deleted, skipped)
         except Exception as error:
-            self.last_report = GCReport(deleted, skipped, error=str(error))
+            cause: BaseException | None = error
+            busy = False
+            while cause is not None:
+                if isinstance(cause, sqlite3.Error) and (
+                    getattr(cause, "sqlite_errorcode", 0) & 0xFF
+                ) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                    busy = True
+                    break
+                cause = cause.__cause__
+            self.last_report = GCReport(
+                deleted, skipped, busy=busy, error=None if busy else str(error)
+            )
         finally:
             self._collect_lock.release()
         return self.last_report
@@ -325,6 +395,7 @@ class ArtifactStore:
             .relative_to(self.root)
             .as_posix()
         )
+        self.protect(relative)
         with self.catalog.transaction():
             self.catalog.register_artifact(relative)
         self.write_json(self.root / relative, value)
@@ -332,6 +403,7 @@ class ArtifactStore:
 
     def write_json(self, path: Path, value: Any) -> None:
         temporary = path.parent / ("." + uuid.uuid4().hex + ".tmp")
+        self.protect(temporary.relative_to(self.root).as_posix())
         try:
             with temporary.open("x", encoding="utf-8") as stream:
                 stream.write(compact_json(value))

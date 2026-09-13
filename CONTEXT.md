@@ -19,7 +19,7 @@ _Avoid_: 独立数据库、权限租户。
 
 **Search Scope（检索范围）**：一次检索必须显式指定一个 Namespace；子路径及具体身份只能缩小其内的文档集合。当前工作等待另按文件或 namespace/path 指定范围。
 
-**Source Revision（源版本）**：MFS 已经确认接收的一版源内容与处理配置；例如，同一份 PDF 修改前、修改后是两个源版本。它不代表文字提取或索引已经完成，也不是一次重试的编号。
+**Source Revision（源版本）**：MFS 已经确认接收的处理目标版本；内部 input_version 独立标识输入观察，配置代独立标识模型/算子清单；例如，同一份 PDF 修改前、修改后是两个源版本。它不代表文字提取或索引已经完成，也不是一次重试的编号。
 
 **Document Target（文档当前目标）**：某个文档现在应被处理到哪一版，或应从检索中删除。重复通知可以归并到这个目标；它不是必须逐个执行的历史事件列表。
 
@@ -69,3 +69,15 @@ checkpoint 可让下一次执行从持久边界恢复。attempt token 阻止旧�
 
 **User Cancellation Gate（用户取消门）**：跨自动源更新保留的取消意图，retry/reprocess 显式解除。
 内部 supersede/drop/close 的执行停止不创建此门。
+
+**Scope Lease（范围租约）**：临时禁止指定 namespace 创建代及路径内的新执行和源文字读取，并等待既有执行/读取真实退出；释放只解除自身限制，不修改用户取消意图。应用用它保护自己拥有的源文件操作，磁盘操作和 sync 的互斥仍由应用负责。
+
+**Processing Pause（处理暂停）**：namespace 持久保存的准备及新增索引准入门；与只暂停新增索引的 paused 分开。它可用于迁移恢复用户意图，关闭/重开不自动解除；不阻止清理，也不以暂停确认代替实际执行退休。
+
+**Active Run（当前处理链）**：文件的持久逻辑执行占用，以 active_run_id 区分；捕获输入/配置、stage/state 和恢复数据。一次阶段调用结束会释放资源，但处理链可继续存在。attempt_token 区分实际调用，失去提交资格不等于调用已退出。
+
+**Configuration Generation（配置代）**：一份处理/索引兼容清单及其私有文字和 collection。active 正在服务，building 追赶当前成员，retiring 等实际读写退出后清理。仅配置变化不撤销仍有效的旧输入。
+
+**Cleanup Debt（清理责任）**：按 namespace incarnation、collection generation、DocumentId、snapshot 保存的物理删除责任，独立于最新目标的成功/失败；取消及目标合并不能遗失它。
+
+**Startup Gate（启动恢复门）**：宿主通过 start_paused 在执行启动前安装的进程内门。恢复宿主持久磁盘日志后 resume_background；不是持久事务日志或用户取消门。

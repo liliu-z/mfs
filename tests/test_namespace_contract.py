@@ -15,7 +15,6 @@ from mfs import (
     GrepBudget,
     NamespaceCompatibilityError,
     RootOverlap,
-    SourceUnavailable,
     TextMatch,
     Utf8TextProcessor,
     WrongNamespaceKind,
@@ -68,8 +67,9 @@ def test_external_references_live_text_without_copy(tmp_path: Path) -> None:
         with pytest.raises(WrongNamespaceKind):
             mfs.remove("files", "a.md")
         original.unlink()
-        with pytest.raises(SourceUnavailable):
-            mfs.grep("files", [TextMatch("changed")])
+        missing = mfs.grep("files", [TextMatch("changed")])
+        assert not missing.items and missing.truncated
+        assert missing.failures[0].error.code == "SourceUnavailable"
         mfs.wait(mfs.sync("files"), 10)
         assert not mfs.search("files", "searchable", mode="bm25").items
     finally:
@@ -145,7 +145,7 @@ def test_replacement_hides_old_results_while_processor_is_blocked(tmp_path: Path
         with pytest.raises(OperationFailed):
             mfs.wait(replacement, 10)
         assert not mfs.search("n", "searchable", mode="bm25", consistency="eventual").items
-        assert [t.name for t in mfs._workers if t.name != "mfs-maintenance"] == ["mfs-worker"]
+        assert len([t for t in mfs._workers if t.name.startswith("mfs-worker-")]) == 4
     finally:
         release.set()
         mfs.close()

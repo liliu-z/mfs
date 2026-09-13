@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_right
 from typing import Any
 
 from ._json import JSONValue, canonical_json, copy_json
@@ -43,7 +44,11 @@ def parse_source_map(record: dict[str, Any]) -> SourceMap:
 def source_location(source_map: SourceMap, start: int, end: int) -> SourceLocation:
     sources: list[JSONValue] = []
     seen: set[bytes] = set()
-    for span in source_map.spans:
+    first = bisect_right(source_map.spans, start, key=lambda span: span.text_end)
+    for index in range(first, len(source_map.spans)):
+        span = source_map.spans[index]
+        if span.text_start >= end:
+            break
         if span.text_start < end and start < span.text_end:
             encoded = canonical_json(span.source)
             if encoded not in seen:
@@ -72,9 +77,14 @@ def text_matches(
         )
     except Exception as error:
         raise InvalidPattern(f"invalid RE2 pattern: {error}") from error
-    offsets = [0]
-    for character in text:
-        offsets.append(offsets[-1] + len(character.encode()))
+    # Keep offsets only for matched boundaries, not one Python integer per
+    # character of an otherwise bounded (up to multi-MiB) grep input.
+    offsets: dict[int, int] = {}
+    previous = size = 0
+    for boundary in sorted({point for match in ranges for point in match}):
+        size += len(text[previous:boundary].encode())
+        offsets[boundary] = size
+        previous = boundary
     return [(offsets[start], offsets[end]) for start, end in ranges]
 
 

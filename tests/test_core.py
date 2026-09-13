@@ -145,7 +145,7 @@ def test_external_sync_under_path_and_reconcile(tmp_path: Path) -> None:
         mfs.close()
 
 
-def test_unregistering_processor_revokes_old_external_results(tmp_path: Path) -> None:
+def test_unavailable_candidate_processor_preserves_serving_results(tmp_path: Path) -> None:
     root = tmp_path / "source"
     root.mkdir()
     source = root / "a.txt"
@@ -156,13 +156,13 @@ def test_unregistering_processor_revokes_old_external_results(tmp_path: Path) ->
         mfs.wait(mfs.sync("files"), 10)
         source.write_text("changed but unsupported")
         report = mfs.reprocess_namespace("files", processors=[])
-        from mfs import SyncReport
+        from mfs import OperationFailed
 
-        assert isinstance(report, SyncReport)
-        assert [(item.path, item.reason) for item in report.skipped] == [
-            ("a.txt", "unsupported_media_type")
-        ]
-        assert not mfs.grep("files").items
+        with pytest.raises(OperationFailed):
+            mfs.wait(report, 10)
+        assert mfs.search("files", "indexed", mode="bm25", consistency="eventual").items
+        # Only an actual source observation invalidates the serving generation.
+        mfs.sync("files", verify="content")
         assert not mfs.search("files", "indexed", mode="bm25", consistency="eventual").items
     finally:
         mfs.close()

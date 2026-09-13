@@ -195,22 +195,24 @@ def test_pending_delete_keeps_ready_false_and_revokes_old_hit(
         mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()])
         inserted = mfs.upsert("n", "a.txt", b"old content")
         mfs.wait_ready(10)
-        original = mfs._runtime.index("n").delete_document
+        original = mfs._runtime.index("n").delete_snapshot
 
-        def delayed(identity: DocumentId, *, incarnation: str | None = None) -> None:
+        def delayed(identity: DocumentId, snapshot: str, incarnation: str) -> None:
             entered.set()
             assert release.wait(10)
-            original(identity, incarnation=incarnation)
+            original(identity, snapshot, incarnation)
 
-        monkeypatch.setattr(mfs._runtime.index("n"), "delete_document", delayed)
+        monkeypatch.setattr(mfs._runtime.index("n"), "delete_snapshot", delayed)
         removed = mfs.remove("n", "a.txt")
         assert entered.wait(5)
         status = mfs.document_status(inserted.id)
         assert status and status.text_revision is None and status.indexed_revision is None
         assert not mfs.grep("n").items
         assert not mfs.search("n", "old", mode="bm25", consistency="eventual").items
+        mfs.wait_ready(0)
+        assert status.cleanup_pending
         with pytest.raises(WaitTimeout):
-            mfs.wait_ready(0)
+            mfs.wait(removed, 0)
         release.set()
         mfs.wait(removed, 10)
         status = mfs.document_status(inserted.id)

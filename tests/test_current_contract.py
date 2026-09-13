@@ -102,22 +102,20 @@ def test_reprocess_transaction_rolls_back_and_keeps_owned_source_for_missing_rou
             raise StorageFailed("injected target failure")
 
         with monkeypatch.context() as check:
-            check.setattr(mfs._catalog, "put_target", fail)
+            check.setattr(mfs._catalog, "put_namespace", fail)
             with pytest.raises(StorageFailed):
                 mfs.reprocess_namespace("n", processors=[])
         mfs.open_namespace("n", processors=[Utf8TextProcessor()])
         assert mfs.search("n", "needle", mode="bm25").items
         reports = mfs.reprocess_namespace("n", processors=[])
-        assert isinstance(reports, tuple)
         with pytest.raises(OperationFailed):
-            mfs.wait(reports[0], 10)
-        assert not mfs.grep("n").items
-        assert not mfs.search("n", "needle", mode="bm25", consistency="eventual").items
+            mfs.wait(reports, 10)
+        assert mfs.grep("n").items
+        assert mfs.search("n", "needle", mode="bm25", consistency="eventual").items
         for _ in range(3):
             assert mfs.collect_garbage().error is None
         restored = mfs.reprocess_namespace("n", processors=[Utf8TextProcessor()])
-        assert isinstance(restored, tuple)
-        mfs.wait(restored[0], 10)
+        mfs.wait(restored, 10)
         document = mfs.read(DocumentId("n", "a.txt"))
         assert document is not None and document.original == b"owned needle"
     finally:
@@ -221,19 +219,19 @@ def test_cancelled_cleanup_retry_keeps_cancellation(
         with mfs._condition:
             receipt = mfs.upsert("n", "a.txt", b"new needle")
             mfs.cancel(receipt.id)
-            original = mfs._runtime.index("n").delete_document
+            original = mfs._runtime.index("n").delete_snapshot
             calls = 0
 
-            def temporary(identity: DocumentId, *, incarnation: str | None = None) -> None:
+            def temporary(identity: DocumentId, snapshot: str, incarnation: str) -> None:
                 nonlocal calls
                 calls += 1
                 if calls == 1:
                     raise OSError("retry the physical cleanup")
-                original(identity, incarnation=incarnation)
+                original(identity, snapshot, incarnation)
 
-            monkeypatch.setattr(mfs._runtime.index("n"), "delete_document", temporary)
+            monkeypatch.setattr(mfs._runtime.index("n"), "delete_snapshot", temporary)
             assert mfs._condition.wait_for(
-                lambda: calls == 2 and not mfs._tasks.targets[receipt.id].get("cleanup"), 10
+                lambda: calls == 2 and not mfs._catalog.cleanup_rows("n"), 10
             )
             assert mfs._tasks.targets[receipt.id]["state"] == "cancelled"
         assert not mfs.grep("n").items

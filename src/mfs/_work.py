@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Literal, TypedDict
 
 from ._namespace import NamespaceBinding
+from .execution import ResourceLease
 from .processing import Cancellation
 from .types import DocumentId
 
@@ -30,6 +31,7 @@ class ExecutionPermit:
     cancellation: Cancellation
     payload: dict[str, Any]
     binding: NamespaceBinding | None
+    lease: ResourceLease | None = None
 
     @property
     def identity(self) -> DocumentId:
@@ -48,6 +50,11 @@ class ChunkPlan(TypedDict):
 @dataclass(frozen=True)
 class Prepared:
     record: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class NeedsPreparation:
+    """Retire the current stage and reacquire Processor admission for missing text."""
 
 
 @dataclass(frozen=True)
@@ -76,7 +83,7 @@ class Rebuilt:
     pass
 
 
-type StepResult = Prepared | Chunked | Embedded | Published | Cleaned | Rebuilt
+type StepResult = Prepared | NeedsPreparation | Chunked | Embedded | Published | Cleaned | Rebuilt
 
 
 @dataclass(frozen=True)
@@ -87,3 +94,5 @@ class SourceInput:
     mtime_ns: int | None
     media_type: str
     processor: dict[str, Any]
+    original_revision: str | None = None
+    namespace_incarnation: str | None = None

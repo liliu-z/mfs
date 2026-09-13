@@ -106,6 +106,8 @@ def migrate(
         legacy_cleanup=True,
     )
     with mfs._condition:
-        mfs._tasks.migrate_namespace(namespace, record, updates, control)
-        mfs._runtime.bindings[namespace] = binding
+        try:
+            mfs._tasks.migrate_namespace(namespace, record, updates, control)
+        finally:
+            mfs._runtime.bind_if_current(namespace, binding)
     return mfs._namespace_info(namespace, record)

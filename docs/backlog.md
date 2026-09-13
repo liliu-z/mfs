@@ -40,7 +40,7 @@ READY-001 不在本轮范围：由 StashBase 使用已有状态选择 fallback�
 - [x] **TEXT-002** 统一 UTF-8 文字引用的换行读取和字节偏移语义，修复 CRLF TXT/Markdown 被内置 Processor 校验拒绝；覆盖 Internal/External、grep/read/search 与 SourceMap。
 - [x] **RECEIPT-002** 按文件当前状态恢复待办，移除每次 sync/upsert 的永久操作回执及其历史等待依赖。保留文件粒度的删除标记、更新中的旧索引清理责任、当前任务和必要恢复数据；更新覆盖同一文件目标，不拆成独立 delete/insert 事件。重建完成判断读取当前任务，避免历史成功误判。已完成 schema 6 迁移；wait 使用当前文件/范围，返回值移除 operation_id，显式 idempotency_key 去重保留。
 - [x] **SYNC-002** 去除首次/content sync 对每个文件重新枚举完整父目录的平方级开销；保留路径身份、大小写、符号链接和并发变动校验。已确认作为实现 bug 修复，不增加公开配置。
-- [x] **REF-002** 按 [设计第 11 节](design.md#11-内部重构与当前状态迁移ref-002--receipt-002) 重构 Lifecycle、Worker 和执行模块：有类型的执行许可/结果、集中生命周期事务、显式模块依赖、移除对整个 MFS 私有状态的穿透。
+- [x] **REF-002** 按 [设计第 11 节](design.md#11-内部职责与状态迁移) 重构 Lifecycle、Worker 和执行模块：有类型的执行许可/结果、集中生命周期事务、显式模块依赖、移除对整个 MFS 私有状态的穿透。
 - [x] **CONFIG-001** 补 namespace_configuration(namespace) 只读完整配置，包括 indexing、paused、Processor/Chunker/Embedder 清单和待生效配置；用于 StashBase 重启恢复 Folder 设置，不包含运行对象或凭据。
 
 item 9 已确认不缺 MFS interface：StashBase 提供的 Processor 自己完成提取，MFS 随后切片/索引；撤销 INTEGRATION-002，实际应用改接统一归 INTEGRATION-001。
@@ -65,8 +65,60 @@ item 9 已确认不缺 MFS interface：StashBase 提供的 Processor 自己完�
 - [x] **SYNC-003** 内容 hash 相同但 stat 改变时，只更新观察 stat，保留 revision 和任务进度。阶段提交、进度和 checkpoint 回调合并最新目标，不能用执行开始时的快照覆盖新观察；覆盖处理/embedding 期间刷新和重开后的 stat 快速路径。
 - [x] **REF-003** 删除 MFS facade 中重复的删除、取消、重试、规则更新和重建状态逻辑，统一由 Lifecycle 持有事务与状态变化。
 - [x] **REUSE-002** External 重命名/复制复用经过验证的完整向量；缓存独立于搜索行删除，持久化、校验和、32 MiB 逻辑容量/LRU 淘汰，按 incarnation/epoch/模型/片段 hash 隔离。显式重建/drop 清理缓存；schema 7 自动迁移，不新增 rename 方法。见 [External 重命名与计算复用](stashbase-integration.md#external-重命名与计算复用)。
-- [x] **SCHED-001** [单 worker 协作让出](design.md#单-worker-协作让出已实现)已实现：checkpoint 持久化与丢确认核对、统一完成/退休、活跃执行许可验证、不可撤回的让出意图、失败预算保留、可运行任务优先级/老化、捕获 Adapter、索引 epoch 和查询 collection 租约。退出前保留 GC 保护，连续完成事务故障停止调度并可重开恢复。多文件资源并发和宿主自动完成通知仍为方案 B/C，不在本次实施范围。
+- [x] **SCHED-001** [单 worker 协作让出](design.md#多-worker-与资源准入)已实现：checkpoint 持久化与丢确认核对、统一完成/退休、活跃执行许可验证、不可撤回的让出意图、失败预算保留、可运行任务优先级/老化、捕获 Adapter、索引 epoch 和查询 collection 租约。退出前保留 GC 保护，连续完成事务故障停止调度并可重开恢复。多文件资源并发和宿主自动完成通知仍为方案 B/C，不在本次实施范围。
 
 实施调度前验收：完整回归 **98 passed、3 skipped**（216.70 秒）；跳过的是 Windows 原生句柄测试。`ruff check`、`ruff format --check`、strict `pyright` 与 `git diff --check` 通过。新增 stat 用例先复现重复 hash 和回调覆盖新观察，再验证修复；checkpoint 取消/重开与进程终止恢复专项一并通过。该次验收尚不包括后来新增的调度测试。
 
 实施后最终验收：完整回归 **119 passed、3 skipped**（276.38 秒），`ruff check`、`ruff format --check`、strict `pyright` 与 `git diff --check` 通过。新增 21 个用例覆盖执行退出前替换/取消重试/drop/reindex/close、finally 吞让出或抛异常、超时查询与重建/drop 的租约、checkpoint 与重建提交后丢确认、迟到索引写入、失败预算、暂停资格、等待老化、连续事务故障及重开恢复，以及重命名后跨重开复用、缓存损坏和 LRU 淘汰。Windows 原生句柄测试仅在原生 Windows 上执行；PDF 依赖的 7 条 SWIG 弃用警告未影响结果。
+
+## 并发与接入边界修复（2026-09-12）
+
+依据 [本次审查](review-2026-09-12.md)，用户确认后的实施范围：
+
+- [x] **RECOVERY-003** 状态命令提交后确认失败统一核对；配置绑定跟随持久结果；无法核对时停止调度/发布，重开恢复。
+- [x] **SOURCE-003** 源身份、hash、变动时间保护 checkpoint/结果及缓存；索引读取核对准备文字 hash，阻止跨阶段源变化；处理缓存格式升级。
+- [x] **PROCESS-003** POSIX 父死监督、进程组实际退休与继承实例锁；支持冻结 sidecar 的早期监督入口。
+- [x] **REBUILD-003** 重建保持用户取消，同时丢弃旧索引阶段与批次，显式 retry 可恢复。
+- [x] **WAIT-003** strong/current wait 统一识别失败、blocked、cancelled 终态。
+- [x] **GC-003** 工作目录 grep 引用受管理保存，参与持久引用与缓存完整性检查。
+- [x] **SYNC-004** 成功观察范围独立清理缺失，失败前缀保守保留。
+- [x] **QUIESCE-001** 按 namespace 创建代和路径获取可释放退休租约，等待实际执行及源读取；处理嵌套、超时、迟到读取与同名 namespace 重建。
+- [x] **MIGRATION-003** 持久处理暂停与初始失败/取消导入，校验 revision；重开保持暂停，重复导入不撤销用户 retry。
+
+StashBase 本身未作修改。INTEGRATION-001、实际冻结打包、真实 OCR/转录/模型端到端验证与 corpus 吞吐验收仍须在应用接入时完成。方案 B/C 仍保持原范围。
+
+验收：完整回归 **146 passed、3 skipped**（328.61 秒），比修复前新增 27 项。跳过的是当前 macOS 无法运行的 Windows 原生句柄测试；7 条 PDF SWIG 弃用警告不影响结果。新增用例覆盖丢确认及核对失败、源改变后恢复、跨阶段文字校验、SIGKILL 后子进程退出与重开、普通/模拟冻结入口分派、取消后重建、GC、扫描隔离、租约和迁移恢复。
+
+最后收拢接收事务的重复核对、调整扫描覆盖查询及统一 read/grep 行定位后，相关读取/源/扫描/接收/租约专项 **19 passed**。`ruff check`、`ruff format --check`、strict `pyright`、`git diff --check` 通过；本地文档链接均可解析。模拟冻结入口测试不替代 StashBase 的实际打包验收。
+
+## 2026-09-13 并发、配置与恢复重构
+
+用户确认全部实施，并明确保留字段。当前 MFS 库侧实现：
+
+- [x] **STATE-004 / item 1、4** latest target 合并与持久 active_runs；保留 active_run_id、stage/state、attempts、attempt_token。旧调用退出后执行最新目标，旧算子失败不污染新版本；同文件顺序，不同文件并行。
+- [x] **EXECUTION-004** 默认 4 Worker、4 查询槽，heavy=1/light=2；先原子申请资源再领取阶段。Adapter 默认串行，具体实现类声明 concurrency 后并发；查询与后台共用额度。非阻塞 Admission 支持宿主共享容量，超时不释放实际调用的资源。
+- [x] **ADMISSION-004 / item 1** Internal 完整落盘再提交 SQLite；复制/待提交文件有 GC pin，原件 rename/fsync 在生命周期锁外。新建父目录同步，后来的 upsert/remove/reprocess 不被旧复制覆盖，丢确认按持久目标核对。External 不保存历史 bytes，不将新内容按旧 hash 缓存。
+- [x] **CONFIG-004 / item 2** configure_namespace 一次合并 Processor/Chunker/Embedder/模式变化；有效文字与兼容切片可复用。G0 服务、G1 全员完成后切换；失败/取消保留旧配置。重启可分别绑定两套实现，连续变更只保留最新候选，退休代有界。旧查询捕获匹配的模型与 publication，真实退出后才清理；后台 collection 创建/退休也参与 namespace 执行屏障。
+- [x] **SYNC-005 / item 3** protected/nonmember 集合与有限祖先查询消除剩余 O(N²) 检查；使用已有 SQLite namespace/path 索引，不维护第二份完整树。同 namespace 扫描串行，跨 namespace 并行；遍历/hash 不持全局 mutation 锁，提交复核 incarnation、root、绑定、规则与候选代，旧扫描不删除后来接收的目标。
+- [x] **VIS-004 / item 5** 两种 namespace 的受管理派生物集中存放，借用路径仍由宿主保证。删除/更新/排除接收后立即过滤；strong grep 只等文字，strong search 等当前索引配置，均不等已删除文件的物理清理。wait(report) 保留清理等待。精确 cleanup debt 独立重试；GC 使用文件/读句柄 pin。
+- [x] **INTEGRATION-004 库侧 / item 6** quiesce 覆盖真实源使用者及 namespace 后台操作；新增 start_paused/resume_background，宿主可在任何执行/GC 开始前恢复磁盘事务。已记录路径锁 → 全范围退休 → 磁盘操作 → 完整持久 sync → 释放的接入合同，后续索引失败不应回滚已接收磁盘操作。
+- [ ] **INTEGRATION-001 应用侧** StashBase 当前旧 mfs-cli daemon、实际转换器、共享 RPC grant、宿主持久路径日志及 Viewer 生命周期未改接。该 checkout 本轮未修改，应用端到端和 corpus 验收不能用 MFS 库测试替代。
+
+已修复并覆盖原先三个复现：cleanup 恢复覆盖取消、reindex 等待漏报致命存储故障、无变化 sync 平方级路径检查。历史操作回执仍不恢复。配置改动统一走候选代，reprocess_namespace 返回 ConfigurationReport；显式全 namespace reprocess 可解除取消，普通配置替换不能。
+
+验证：完整回归 **162 passed、3 skipped**（388.88 秒）；随后补齐候选文字状态、index_ready 与 root 打开期间 namespace 重建的窗口，相关并发/等待/租约专项 **28 passed**（79.41 秒）。`ruff check`、`ruff format --check`、strict `pyright`、`git diff --check` 通过，本地文档链接检查通过。
+
+3 项跳过为当前 macOS 不能执行的 Windows 原生句柄测试；PDF 依赖的 7 条 SWIG 弃用警告未影响测试。包含真实 Milvus Lite 和故障注入，不代表实际断电、StashBase 原生转换器或打包应用已验证。未创建 commit。
+
+## 2026-09-13 边界修复与独立复审
+
+- [x] 搜索去重保留 snapshot 身份；后端锁等待计入同一 deadline，超时排队请求不再启动。
+- [x] grep 总期限覆盖全部阶段，来源定位按有序区间查找；单文件不可用返回结构化 failures 和 truncated；grep 执行池独立于排名搜索。
+- [x] 安全打开源/借用文字，拒绝读取期间的链接/特殊文件替换；Internal 输入复制同样防止 FIFO 竞争。
+- [x] 配置分批补齐成员、同进程故障与丢提交确认恢复、候选维护错误公开及相同配置重试；重绑提交时复核配置代。
+- [x] GC 将 SQLite 忙竞争归类为 busy；后台老化不能超过交互优先级。
+- [x] 独立复审四项：sniff 不持状态锁且只做一次；临时文字重建重新领取 Processor 额度；晋升连续故障准确达到五次上限；drop 后释放运行绑定和闲置许可引用。
+
+修复前专项稳定复现缺陷；修复后 25 项相关回归通过。独立 agent 对四项原触发机制重新注入均通过，详见 [独立复审](review-2026-09-13-independent.md)。3000 个已接收、处理暂停文件的本机测量：新配置接收 0.00148 秒，接收及其后 0.2 秒内 52 次状态采样的最大耗时 0.01406 秒；这是合成数据测量，不能外推百万文件晋升或网络文件系统。
+
+最终全量回归：**186 passed、3 skipped**，474.71 秒；3 项跳过需要原生 Windows 句柄，7 条 PDF SWIG 弃用警告。`ruff check`、`ruff format --check`、strict `pyright`、`git diff --check` 与本地 Markdown 链接检查通过。StashBase 仍未修改；daemon/RPC、真实格式 Processor、跨进程共享额度、宿主事务/迁移与打包验收仍属于 INTEGRATION-001。

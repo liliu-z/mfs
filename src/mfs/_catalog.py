@@ -22,11 +22,11 @@ class Catalog:
         self._connections_lock = threading.Lock()
         self.migrated = False
         version = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
-        if version > 7:
+        if version > 8:
             raise SchemaVersionUnsupported(f"catalog schema version {version} is unsupported")
-        if not initialize and version not in (1, 2, 3, 4, 5, 6, 7):
+        if not initialize and version not in (1, 2, 3, 4, 5, 6, 7, 8):
             raise CorruptState("catalog schema is missing or unrecognized")
-        if initialize or version < 7:
+        if initialize or version < 8:
             self._initialize()
             self.migrated = version == 1
         expected = {
@@ -40,6 +40,10 @@ class Catalog:
             "cancel_gates",
             "prepared",
             "vector_cache",
+            "active_runs",
+            "build_targets",
+            "build_documents",
+            "index_cleanup",
         }
         actual = {
             r[0]
@@ -48,7 +52,7 @@ class Catalog:
             )
         }
         if actual != expected:
-            raise CorruptState("catalog schema does not match version 7")
+            raise CorruptState("catalog schema does not match version 8")
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -86,6 +90,26 @@ class Catalog:
                 PRIMARY KEY(namespace,doc_id)
             );
             CREATE INDEX IF NOT EXISTS targets_state ON targets(json_extract(value,'$.state'));
+            CREATE INDEX IF NOT EXISTS targets_namespace_kind
+                ON targets(namespace,json_extract(value,'$.kind'),doc_id);
+            CREATE TABLE IF NOT EXISTS active_runs (
+                namespace TEXT NOT NULL, doc_id TEXT NOT NULL,
+                value TEXT NOT NULL CHECK(json_valid(value)), PRIMARY KEY(namespace,doc_id)
+            );
+            CREATE TABLE IF NOT EXISTS build_targets (
+                namespace TEXT NOT NULL, doc_id TEXT NOT NULL,
+                value TEXT NOT NULL CHECK(json_valid(value)), PRIMARY KEY(namespace,doc_id)
+            );
+            CREATE TABLE IF NOT EXISTS build_documents (
+                namespace TEXT NOT NULL, doc_id TEXT NOT NULL,
+                value TEXT NOT NULL CHECK(json_valid(value)), PRIMARY KEY(namespace,doc_id)
+            );
+            CREATE TABLE IF NOT EXISTS index_cleanup (
+                key TEXT PRIMARY KEY, value TEXT NOT NULL CHECK(json_valid(value))
+            );
+            CREATE INDEX IF NOT EXISTS cleanup_scope ON index_cleanup(
+                json_extract(value,'$.namespace'),json_extract(value,'$.doc_id')
+            );
             CREATE TABLE IF NOT EXISTS operations (
                 key TEXT PRIMARY KEY, request_hash TEXT NOT NULL,
                 value TEXT NOT NULL CHECK(json_valid(value))
@@ -117,7 +141,7 @@ class Catalog:
             DROP TABLE IF EXISTS wait_target_sets;
             DROP TABLE IF EXISTS runs;
             UPDATE operations SET value=json_remove(value,'$.operation_id');
-            PRAGMA user_version = 7;
+            PRAGMA user_version = 8;
             COMMIT;
         """)
 
@@ -131,7 +155,7 @@ class Catalog:
             yield
             if not nested:
                 connection.execute("COMMIT")
-        except Exception as error:
+        except BaseException as error:
             if not nested and connection.in_transaction:
                 connection.execute("ROLLBACK")
             if isinstance(error, sqlite3.Error):
@@ -197,9 +221,12 @@ class Catalog:
         ).fetchone()
         return self.decode(row[0]) if row else None
 
-    def get_document_revision(self, namespace: str, doc_id: str) -> str | None:
+    def get_document_revision(
+        self, namespace: str, doc_id: str, *, candidate: bool = False
+    ) -> str | None:
+        table = "build_documents" if candidate else "documents"
         row = self.connection.execute(
-            "SELECT json_extract(value,'$.revision') FROM documents WHERE namespace=? AND doc_id=?",
+            f"SELECT json_extract(value,'$.revision') FROM {table} WHERE namespace=? AND doc_id=?",
             (namespace, doc_id),
         ).fetchone()
         return str(row[0]) if row and row[0] is not None else None
@@ -221,10 +248,17 @@ class Catalog:
         return self.select_documents()
 
     def iter_documents(
-        self, where: str = "1", params: Sequence[Any] = ()
+        self, where: str = "1", params: Sequence[Any] = (), *, candidate: bool = False
     ) -> Generator[tuple[str, str, dict[str, Any]]]:
+        source = (
+            "(SELECT namespace,doc_id,value FROM build_documents UNION ALL "
+            "SELECT d.namespace,d.doc_id,d.value FROM documents d WHERE NOT EXISTS "
+            "(SELECT 1 FROM build_targets b WHERE b.namespace=d.namespace AND b.doc_id=d.doc_id))"
+            if candidate
+            else "documents"
+        )
         cursor = self.connection.execute(
-            "SELECT namespace,doc_id,value FROM documents WHERE "
+            f"SELECT namespace,doc_id,value FROM {source} WHERE "
             + where
             + " ORDER BY namespace,doc_id",
             params,
@@ -252,6 +286,11 @@ class Catalog:
 
     def put_target(self, namespace: str, doc_id: str, value: dict[str, Any]) -> None:
         previous = self.get_target(namespace, doc_id)
+        if previous and (
+            previous.get("snapshot_id") != value.get("snapshot_id")
+            or previous.get("collection_generation") != value.get("collection_generation")
+        ):
+            self.enqueue_cleanup(namespace, doc_id, previous)
         self.set_references("target", namespace, doc_id, self.references(value))
         if previous and previous["revision"] != value["revision"]:
             self.clear_prepared(str(previous["revision"]))
@@ -268,6 +307,87 @@ class Catalog:
             "SELECT value FROM targets WHERE namespace=? AND doc_id=?", (namespace, doc_id)
         ).fetchone()
         return self.decode_target(row[0], namespace, doc_id) if row else None
+
+    def put_active(self, namespace: str, doc_id: str, value: dict[str, Any] | None) -> None:
+        self.set_references("active", namespace, doc_id, self.references(value) if value else set())
+        if value is None:
+            self.connection.execute(
+                "DELETE FROM active_runs WHERE namespace=? AND doc_id=?", (namespace, doc_id)
+            )
+        else:
+            self.connection.execute(
+                "INSERT INTO active_runs VALUES(?,?,?) ON CONFLICT(namespace,doc_id) "
+                "DO UPDATE SET value=excluded.value",
+                (namespace, doc_id, compact_json(value)),
+            )
+
+    def put_build(
+        self,
+        namespace: str,
+        doc_id: str,
+        value: dict[str, Any] | None,
+        *,
+        document: bool = False,
+        retire: bool = True,
+    ) -> None:
+        table = "build_documents" if document else "build_targets"
+        if not document and retire:
+            previous = self.get_build(namespace, doc_id)
+            if previous and (
+                value is None
+                or any(
+                    previous.get(k) != value.get(k)
+                    for k in ("snapshot_id", "collection_generation")
+                )
+            ):
+                self.enqueue_cleanup(namespace, doc_id, previous)
+        self.set_references(table, namespace, doc_id, self.references(value) if value else set())
+        if value is None:
+            self.connection.execute(
+                f"DELETE FROM {table} WHERE namespace=? AND doc_id=?", (namespace, doc_id)
+            )
+        else:
+            self.connection.execute(
+                f"INSERT INTO {table} VALUES(?,?,?) ON CONFLICT(namespace,doc_id) "
+                "DO UPDATE SET value=excluded.value",
+                (namespace, doc_id, compact_json(value)),
+            )
+
+    def get_build(
+        self, namespace: str, doc_id: str, *, document: bool = False
+    ) -> dict[str, Any] | None:
+        table = "build_documents" if document else "build_targets"
+        row = self.connection.execute(
+            f"SELECT value FROM {table} WHERE namespace=? AND doc_id=?", (namespace, doc_id)
+        ).fetchone()
+        return self.decode(row[0]) if row else None
+
+    def enqueue_cleanup(self, namespace: str, doc_id: str, job: dict[str, Any]) -> None:
+        snapshot = job.get("snapshot_id")
+        if not snapshot:
+            return
+        value = dict(
+            namespace=namespace,
+            doc_id=doc_id,
+            incarnation=job["incarnation"],
+            generation=job.get("collection_generation"),
+            snapshot=snapshot,
+            failures=0,
+            next_run=0,
+            error=None,
+        )
+        key = compact_json([namespace, doc_id, value["incarnation"], value["generation"], snapshot])
+        self.connection.execute(
+            "INSERT OR IGNORE INTO index_cleanup VALUES(?,?)", (key, compact_json(value))
+        )
+
+    def cleanup_rows(self, namespace: str | None = None) -> list[tuple[str, dict[str, Any]]]:
+        rows = self.connection.execute(
+            "SELECT key,value FROM index_cleanup"
+            + (" WHERE json_extract(value,'$.namespace')=?" if namespace is not None else ""),
+            (namespace,) if namespace is not None else (),
+        )
+        return [(key, self.decode(value)) for key, value in rows]
 
     def list_targets(self, namespace: str | None = None) -> list[tuple[str, str, dict[str, Any]]]:
         sql = "SELECT namespace,doc_id,value FROM targets"
@@ -330,7 +450,9 @@ class Catalog:
         stages: dict[str, int] = {}
         for state, stage, count in self.connection.execute(
             "SELECT json_extract(value,'$.state'),json_extract(value,'$.stage'),count(*) "
-            f"FROM targets WHERE {where} GROUP BY 1,2",
+            "FROM (SELECT t.namespace,t.doc_id,coalesce(b.value,t.value) AS value "
+            "FROM targets t LEFT JOIN build_targets b USING(namespace,doc_id)) "
+            f"WHERE {where} GROUP BY 1,2",
             parameters,
         ):
             states[state] = states.get(state, 0) + count

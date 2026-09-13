@@ -1,5 +1,6 @@
 from ._artifacts import ArtifactHandle
 from ._core import MFS
+from ._quiesce import ScopeLease
 from .adapters import DefaultChunker, DocxProcessor, PdfProcessor, Utf8TextProcessor
 from .errors import (
     CapabilityUnavailable,
@@ -37,7 +38,8 @@ from .errors import (
     WaitTimeout,
     WrongNamespaceKind,
 )
-from .processing import Cancellation, ProcessingContext
+from .execution import Admission, ExecutionPolicy, LocalAdmission, ResourceLease
+from .processing import Cancellation, ProcessingContext, run_process_supervisor
 from .types import (
     AnyOf,
     ByDocumentId,
@@ -46,6 +48,7 @@ from .types import (
     Chunk,
     Chunker,
     ChunkRange,
+    ConfigurationReport,
     Consistency,
     ContextProcessor,
     Document,
@@ -57,6 +60,7 @@ from .types import (
     GCPolicy,
     GCReport,
     GrepBudget,
+    GrepFailure,
     GrepItem,
     GrepResult,
     IgnoreRule,
@@ -103,6 +107,7 @@ from .types import (
 
 __all__ = [
     "MFS",
+    "Admission",
     "AnyOf",
     "ArtifactHandle",
     "ByDocumentId",
@@ -114,6 +119,7 @@ __all__ = [
     "ChunkRange",
     "Chunker",
     "Closed",
+    "ConfigurationReport",
     "Consistency",
     "ContextProcessor",
     "CorruptState",
@@ -125,10 +131,12 @@ __all__ = [
     "DropReport",
     "Embedder",
     "EmbeddingFailed",
+    "ExecutionPolicy",
     "Filter",
     "GCPolicy",
     "GCReport",
     "GrepBudget",
+    "GrepFailure",
     "GrepItem",
     "GrepResult",
     "IdempotencyConflict",
@@ -146,6 +154,7 @@ __all__ = [
     "InvalidPattern",
     "InvalidQuery",
     "LegacyProcessor",
+    "LocalAdmission",
     "MFSError",
     "Match",
     "MigrationRequired",
@@ -169,11 +178,13 @@ __all__ = [
     "Processor",
     "Progress",
     "ReindexReport",
+    "ResourceLease",
     "RetryableError",
     "RootOverlap",
     "RuleConflict",
     "RuleSet",
     "SchemaVersionUnsupported",
+    "ScopeLease",
     "ScopeStatus",
     "SearchItem",
     "SearchMode",
@@ -204,4 +215,5 @@ __all__ = [
     "Vector",
     "WaitTimeout",
     "WrongNamespaceKind",
+    "run_process_supervisor",
 ]

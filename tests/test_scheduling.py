@@ -75,7 +75,9 @@ def test_yield_keeps_execution_and_files_until_stack_exits(tmp_path: Path, actio
             mfs.upsert("n", "active.txt", b"active")
             checkpoint.set()
             assert retiring.wait(5)
-            assert len(contexts) == 1 and mfs.collect_garbage().busy
+            assert len(contexts) == 1
+            assert mfs.collect_garbage().error is None
+            assert (contexts[0].work_dir / "part").read_text() == "saved"
             status = mfs.document_status(bg)
             assert status and status.state == "running" and status.revision == first.revision
             future = None
@@ -92,7 +94,7 @@ def test_yield_keeps_execution_and_files_until_stack_exits(tmp_path: Path, actio
                 future = pool.submit(mfs.reindex, "n", timeout=10)
                 with mfs._condition:
                     assert mfs._condition.wait_for(
-                        lambda: "pending_manifest" in mfs._tasks.namespaces["n"], 5
+                        lambda: "building" in mfs._tasks.namespaces["n"], 5
                     )
             else:
                 future = pool.submit(mfs.close)
@@ -210,7 +212,7 @@ def test_timed_out_query_pins_collection_before_backend_admission(
                 future = pool.submit(mfs.reindex, "n", timeout=10)
                 with mfs._condition:
                     assert mfs._condition.wait_for(
-                        lambda: "pending_manifest" in mfs._tasks.namespaces["n"], 5
+                        lambda: "building" in mfs._tasks.namespaces["n"], 5
                     )
             else:
                 report = mfs.drop_namespace("n")
@@ -257,7 +259,7 @@ def test_checkpoint_lost_ack_is_adopted_before_yield(
             nonlocal ack_lost
             with original():
                 yield
-            if threading.current_thread().name == "mfs-worker" and not ack_lost:
+            if threading.current_thread().name.startswith("mfs-worker-") and not ack_lost:
                 durable = mfs._catalog.get_target("n", "background.txt")
                 if durable and durable.get("checkpoint", {}).get("state") == {"unit": 1}:
                     ack_lost = True
@@ -305,7 +307,7 @@ def test_late_insert_is_retired_before_new_index_generation(
                 future = pool.submit(mfs.reindex, "n", embedder=Model(3, "new-space"), timeout=10)
                 with mfs._condition:
                     assert mfs._condition.wait_for(
-                        lambda: "pending_manifest" in mfs._tasks.namespaces["n"], 5
+                        lambda: "building" in mfs._tasks.namespaces["n"], 5
                     )
             else:
                 if action == "drop":
@@ -409,28 +411,28 @@ def test_rebuild_supersession_and_lost_ack_activate_only_latest_manifest(
             mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()], embedder=old)
             mfs.wait(mfs.upsert("n", "a.txt", b"needle"), 10)
             index = mfs._runtime.index("n")
-            recreate, transaction = index.recreate, mfs._catalog.transaction
+            recreate, transaction = type(index).recreate, mfs._catalog.transaction
             dimensions: list[int | None] = []
 
-            def blocked_recreate(*, dense_dimension: int | None) -> None:
+            def blocked_recreate(self: Any, *, dense_dimension: int | None) -> None:
                 dimensions.append(dense_dimension)
                 if len(dimensions) == 1:
                     entered.set()
                     assert release.wait(10)
-                recreate(dense_dimension=dense_dimension)
+                recreate(self, dense_dimension=dense_dimension)
 
             @contextmanager
             def lost_ack() -> Generator[None]:
                 nonlocal ack_lost
                 with transaction():
                     yield
-                if threading.current_thread().name == "mfs-worker" and not ack_lost:
+                if threading.current_thread().name == "mfs-configurations" and not ack_lost:
                     record = mfs._catalog.get_namespace("n")
                     if record and record["manifest"]["index"]["dense"]["dimension"] == 4:
                         ack_lost = True
                         raise OSError("rebuild committed, acknowledgement lost")
 
-            monkeypatch.setattr(index, "recreate", blocked_recreate)
+            monkeypatch.setattr(type(index), "recreate", blocked_recreate)
             monkeypatch.setattr(mfs._catalog, "transaction", lost_ack)
             first = pool.submit(mfs.reindex, "n", embedder=intermediate, timeout=10)
             assert entered.wait(5)
@@ -438,7 +440,7 @@ def test_rebuild_supersession_and_lost_ack_activate_only_latest_manifest(
             with mfs._condition:
                 assert mfs._condition.wait_for(
                     lambda: (
-                        mfs._tasks.namespaces["n"]["pending_manifest"]["index"]["dense"][
+                        mfs._tasks.namespaces["n"]["building"]["manifest"]["index"]["dense"][
                             "dimension"
                         ]
                         == 4
@@ -450,7 +452,7 @@ def test_rebuild_supersession_and_lost_ack_activate_only_latest_manifest(
             second.result(10)
             assert dimensions == [3, 4] and ack_lost
             assert intermediate.calls == 0 and newest.calls == 1
-            assert "pending_manifest" not in mfs._tasks.namespaces["n"]
+            assert "building" not in mfs._tasks.namespaces["n"]
             assert mfs.search("n", "needle", mode="vector").items
         finally:
             release.set()
@@ -509,7 +511,7 @@ def test_completion_storage_failure_retains_lease_and_reopens_checkpoint(
         mfs.close()
 
 
-def test_aged_background_runs_then_resets_its_queue_age(tmp_path: Path) -> None:
+def test_aged_background_does_not_preempt_equal_priority_active_work(tmp_path: Path) -> None:
     entered, release = threading.Event(), threading.Event()
     turns: list[str] = []
 
@@ -544,7 +546,9 @@ def test_aged_background_runs_then_resets_its_queue_age(tmp_path: Path) -> None:
                 cancellation._started_at -= 0.1
         release.set()
         mfs.wait_ready(10)
-        assert turns == ["active.txt", "background.txt", "active.txt", "background.txt"]
+        # Aging reaches active-folder priority; it does not become more urgent
+        # than an active-folder call already running at that same priority.
+        assert turns == ["active.txt", "background.txt"]
     finally:
         release.set()
         mfs.close()
