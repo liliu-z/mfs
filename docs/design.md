@@ -40,7 +40,7 @@ mfs-state/
 
 相同 dimension 不等于相同向量空间。声明与已保存清单或实际 collection schema 不一致时，绑定立即报错并指出差异；不能自动覆盖配置或暗中重建。实际向量输出继续检查数量、维度、有限数值。
 
-调用方可以显式向两个 namespace 传同一个对象；持久身份、规则和索引仍独立。模型调用不持有 MFS 状态锁；同一 Adapter 对象默认串行，额度覆盖后台和查询。只有具体实现类显式声明 concurrency 才允许并发；子类不继承父类的线程安全承诺。
+调用方可以显式向两个 namespace 传同一个对象；持久身份、规则和索引仍独立。模型调用不持有 MFS 状态锁；同一 Adapter 对象的 process/chunk/embedding 默认串行，额度覆盖后台和查询。只有具体实现类显式声明 concurrency 才允许并发；子类不继承父类的线程安全承诺。 Processor 的单文件可变状态放在局部变量或每次独立的 ProcessingContext/work_dir 中；共享模型和缓存自行保证线程安全。sniff 是快速、无状态的头部识别，不占 process 的资源/并发额度，可能与同对象的 process 同时调用。
 
 有意更换 Processor/Chunker/Embedder 使用 configure_namespace 一次提交。reprocess_namespace 返回 ConfigurationReport，是强制处理的兼容入口；reindex 是阻塞等待的索引修复入口，两者走相同的候选代发布协议。configure_index 保留暂停和索引模式控制。源内容未变的索引重建保留有效文字；源已替换则不能恢复旧文字。迁移要有持久状态，失败可重试，不能把半完成配置作为活动配置。
 
@@ -98,7 +98,7 @@ External 不保存历史 bytes。处理可能碰到更新后的原路径；Sourc
 
 取消门独立保存用户意图。cancel(DocumentId) 返回表示取消已接收，不表示实际调用已退出；不删源、不撤销已完成且仍有效的 publication。普通 sync、清理和配置变更不会解除取消，包括源再次变化。retry/reprocess 才恢复。仍有引用的原件、文字与 checkpoint 保留；无引用临时物由 GC 回收，失效索引由持久 cleanup debt 清理。
 
-每个阶段完成都更新 SQLite。可重试故障按阶段指数退避，最多 5 次；永久失败直接 failed，缺能力为 blocked。相同内容的 sync 不重试失败；新内容是新目标，有自己的失败预算。状态包含当前阶段、attempts、实际 executing、active_run_id/attempt_token、错误及 cleanup_pending。当前状态可轮询，不要求用户确认回执，也不保存每次调用的历史队列。
+每个阶段完成都更新 SQLite。可重试故障按阶段指数退避，最多 5 次；永久失败直接 failed，缺能力为 blocked。 ExecutionPolicy.stage_timeout 默认 300 秒（有限正数），从阶段领取开始计时，覆盖 process/chunk/embed 及 Worker 的后端阶段。独立期限线程将超时目标持久标记为 failed / ExecutionTimeout，撤销 attempt 的提交资格；协作检查点和 run_process 同时检查期限。超时不自动重试，显式 retry 仍须等待旧调用真实退出；崩溃恢复保留已持久失败。准备、embedding、写入及完成边界再次检查，丢弃迟到结果。相同内容的 sync 不重试失败；新内容是新目标，有自己的失败预算。状态包含当前阶段、attempts、实际 executing、active_run_id/attempt_token、错误及 cleanup_pending。当前状态可轮询，不要求用户确认回执，也不保存每次调用的历史队列。
 
 wait(DocumentId)、wait(namespace, path=...) 和 wait(report) 跟随最新文件/范围，包含配置构建和物理清理。ConfigurationReport 同样可等待；它不是历史完成凭证。failed/blocked/cancelled 抛 OperationFailed，不完整扫描报告观察失败，存储无法核对立即抛 StorageFailed，超时只终止等待。显式 idempotency_key 仍去重接收，不覆盖后来文件状态。
 
@@ -148,7 +148,7 @@ grep 的 timeout 同样是总等待预算，包含排队、文字就绪、读取
 
 search 默认 consistency="eventual"、timeout=5.0 秒。eventual 查询当前有效索引，允许结果尚未补齐，但不能返回已失效旧源。显式 strong 目前等待指定的这一个 namespace 的索引工作。timeout 是调用方搜索的总等待预算，包含查询执行容量等待、一致性等待、query embedding、Milvus 调用、候选扩充及合并。到期抛 WaitTimeout；None 不设期限，0 立即超时。grepping 文字不需要等待 embedding。目录级 strong 尚未实现，讨论方案见下文。
 
-SearchExecution 使用单调时钟建立一个 deadline；等待和阶段边界复用它，取得串行后端锁后重新核对并向 Milvus 传递剩余时间。排名搜索和 grep 各使用独立的有界执行池，容量分别为 ExecutionPolicy.queries（默认各 4），并与后台文件 Worker 池分开；向量查询占满槽位不占用 grep 的执行槽。超时调用返回后，尚未退出的 Adapter 继续占用容量及资源租约，返回后丢弃结果，不执行后续阶段，避免连续超时无限增加线程或任务。close 唤醒调用方并等待实际执行退出，再关闭存储。不能强杀不响应取消的 Python Adapter；这个限制不延长搜索调用方的等待预算。
+SearchExecution 使用单调时钟建立一个 deadline；等待和阶段边界复用它，取得串行后端锁后重新核对并向 Milvus 传递剩余时间。排名搜索和 grep 各使用独立的有界执行池，容量分别为 ExecutionPolicy.queries（默认各 4），并与后台文件 Worker 池分开；向量查询占满槽位不占用 grep 的执行槽。超时调用返回后，尚未退出的 Adapter 继续占用容量及资源租约，返回后丢弃结果，不执行后续阶段，避免连续超时无限增加线程或任务。close(timeout=30) 立即关闭请求准入，由唯一清理线程取消执行、等待实际调用/读句柄退出，再关闭存储。调用方等待超时抛 WaitTimeout，清理继续，实例锁和资源在真实退出前不释放；再次 close 等同等待同一次清理，timeout=None 可无限等待。不能强杀不响应取消的 Python Adapter；需要硬退出时由宿主终止 MFS 进程。
 
 hybrid 在指定 namespace 的同一 collection 内对 BM25/dense 使用 RRF。Reader 只打开该 namespace 的检索路由，一次查询只计算一次 query embedding；不提供跨 namespace 路由、分数比较或结果合并。宿主若有多个 Folder 的产品入口，由宿主明确组织各自范围和结果，MFS 不赋予它们统一排名。
 
@@ -167,6 +167,8 @@ hybrid 在指定 namespace 的同一 collection 内对 BM25/dense 使用 RRF。R
 | ArtifactStore | 受管理文件持久化、引用、读句柄和 GC |
 
 慢调用在状态锁外，提交在短事务内统一核验。执行模块不各自维护另一套目标或互相归并队列。
+
+SQLite 使用最多 8 个连接的实例内池，查询/事务结束即归还，不绑定调用方线程寿命。嵌套事务复用当前租约，最外层提交或回滚；事务中不得调用适配器、访问外部文件或反向申请生命周期锁。文档枚举按 128 行键集分页，每页释放连接，读取方逐条复核版本与资格；不持数据库游标跨越 grep/Chunker 等用户代码。
 
 SQLite catalog schema 8 保存上述状态；元数据表结构可升级，但旧 namespace 需要调用方使用 migrate_namespace 显式提供适配器和索引模式。迁移撤销旧处理文字和索引，再从 Internal 原件或 External 原路径处理，不回放旧正文缓存。缺少可用原件或处理实现时明确报错。旧布局中的受管理文件在引用释放后由 GC 回收。
 
@@ -238,13 +240,13 @@ grep_path 与内存索引文字并用时，已发布后的临时文字可释放�
 
 G0 继续服务，G1 保存私有文字/索引。源变动更新两代的期望成员；同文件仍顺序执行。所有当前成员在 G1 成功才切换，失败或用户取消阻止切换而保留 G0。strong grep 可读取 G1 已完成的文字，不依赖其向量成功；eventual grep 留在 G0。
 
-再次改配置时只保留最新候选；旧在途调用真实退出后才继续同文件。最多一个 active、一个 building，以及有界的 retiring generations；两代尚不能退休时暂停新 collection 创建。切换事务同时更新配置、collection 和 publication；提交后确认丢失也必须采用已持久配置对应的绑定。
+configure_index 比较最新候选（无候选时比较 active），只改 paused 不覆盖候选模式；关闭后再开启同样以最后请求为准。开启自动追赶已接收输入，不触发 External sync；关闭保留准备文字，排名索引异步清理。再次改配置时只保留最新候选；过时调用在阶段边界和协作检查点提前退出；旧在途调用真实退出后才继续同文件。最多一个 active、一个 building，以及有界的 retiring generations；两代尚不能退休时暂停新 collection 创建。切换事务同时更新配置、collection 和 publication；提交后确认丢失也必须采用已持久配置对应的绑定。
 
 namespace_configuration 返回 active_revision/pending_revision 和两份清单。重启通过 open_namespace(..., configuration_revision=...) 分别绑定 G0/G1，缺新模型只阻塞构建；不允许 G1 Embedder 查询 G0 collection。
 
 ### 并行扫描
 
-同 namespace 扫描串行，不同 namespace 可并行；遍历和 hash 不持实例全局 mutation 锁。protected/nonmember 用集合及有限祖先查询，消除旧 O(N²) 路径检查。现有 SQLite namespace/path 主键和目标索引承担目录查询；不维护第二份完整文件树，也不凭目录 mtime 跳过子文件检查。
+同 namespace 扫描串行，不同 namespace 可并行；遍历和 hash 不持实例全局 mutation 锁；root 的 resolve/stat 也在生命周期锁外完成，随后锁内复核 namespace 身份与配置。protected/nonmember 用集合及有限祖先查询，消除旧 O(N²) 路径检查。现有 SQLite namespace/path 主键和目标索引承担目录查询；不维护第二份完整文件树，也不凭目录 mtime 跳过子文件检查。
 
 扫描捕获 namespace incarnation、绑定、root 和规则版本，提交时复核；删除只针对扫描开始时已知且版本未变的目标，旧扫描不能删除后来接收的文件。无变化不创建后台任务，失败前缀保守保留。
 

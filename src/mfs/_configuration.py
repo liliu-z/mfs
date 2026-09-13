@@ -82,9 +82,7 @@ class Configuration:
             with lifecycle.state_transaction():
                 self.catalog.put_namespace(namespace, record)
                 if force_process:
-                    self.catalog.connection.execute(
-                        "DELETE FROM cancel_gates WHERE namespace=?", (namespace,)
-                    )
+                    self.catalog.execute("DELETE FROM cancel_gates WHERE namespace=?", (namespace,))
                 for identity in list(lifecycle.build_targets):
                     if identity.namespace == namespace:
                         self.catalog.put_build(namespace, identity.doc_id, None)
@@ -97,8 +95,14 @@ class Configuration:
                     lifecycle.build_targets.pop(identity)
             self.runtime.build_bindings[(namespace, generation)] = binding
             for (identity, _), cancellation in lifecycle.cancellations.items():
-                if identity.namespace == namespace and lifecycle.active.get(identity, {}).get(
-                    "build_generation"
+                active = lifecycle.active.get(identity, {})
+                if identity.namespace == namespace and (
+                    active.get("build_generation")
+                    or (
+                        mode == "off"
+                        and active.get("kind") == "upsert"
+                        and active.get("stage") != "process"
+                    )
                 ):
                     cancellation._cancel("superseded")
             # The candidate declaration is the durable intent. Membership expansion
@@ -113,7 +117,7 @@ class Configuration:
             building = lifecycle.namespaces.get(namespace, {}).get("building", {})
             if building.get("generation") != generation:
                 return
-            rows = self.catalog.connection.execute(
+            rows = self.catalog.query(
                 "SELECT t.doc_id FROM targets t LEFT JOIN build_targets b "
                 "ON b.namespace=t.namespace AND b.doc_id=t.doc_id "
                 "WHERE t.namespace=? AND t.doc_id!='' "
@@ -121,7 +125,7 @@ class Configuration:
                 "(b.doc_id IS NULL OR json_extract(b.value,'$.source_revision')!=t.revision "
                 "OR json_extract(b.value,'$.build_generation')!=?) ORDER BY t.doc_id LIMIT 32",
                 (namespace, generation),
-            ).fetchall()
+            )
         for (doc_id,) in rows:
             with lifecycle.condition:
                 if (

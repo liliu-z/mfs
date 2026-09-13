@@ -41,19 +41,17 @@ class VectorCache:
         with self.catalog.transaction():
             for text_hash in hashes:
                 key = prefix + text_hash
-                row = self.catalog.connection.execute(
-                    "SELECT vector,digest FROM vector_cache WHERE key=?", (key,)
-                ).fetchone()
+                row = self.catalog.one("SELECT vector,digest FROM vector_cache WHERE key=?", (key,))
                 if row is None:
                     continue
                 data = bytes(row[0])
                 valid = len(data) == dimension * 8 and blake3.blake3(data).hexdigest() == row[1]
                 vector = list(struct.unpack(f"<{dimension}d", data)) if valid else []
                 if not valid or not all(math.isfinite(value) for value in vector):
-                    self.catalog.connection.execute("DELETE FROM vector_cache WHERE key=?", (key,))
+                    self.catalog.execute("DELETE FROM vector_cache WHERE key=?", (key,))
                     continue
                 result[text_hash] = vector
-                self.catalog.connection.execute(
+                self.catalog.execute(
                     "UPDATE vector_cache SET touched=? WHERE key=?", (time.time_ns(), key)
                 )
         return result
@@ -62,7 +60,7 @@ class VectorCache:
         with self.catalog.transaction():
             for text_hash, vector in vectors.items():
                 data = struct.pack(f"<{len(vector)}d", *vector)
-                self.catalog.connection.execute(
+                self.catalog.execute(
                     "INSERT INTO vector_cache VALUES(?,?,?,?,?) ON CONFLICT(key) "
                     "DO UPDATE SET vector=excluded.vector,digest=excluded.digest,"
                     "touched=excluded.touched",
@@ -76,10 +74,10 @@ class VectorCache:
                 )
             # Newest computations win. Also evict an individual oversize entry.
             total = 0
-            for key, size in self.catalog.connection.execute(
+            for key, size in self.catalog.query(
                 "SELECT key,length(key)+length(incarnation)+length(vector)+length(digest)+8 "
                 "FROM vector_cache ORDER BY touched DESC,key DESC"
-            ).fetchall():
+            ):
                 total += int(size)
                 if total > self.MAX_BYTES:
-                    self.catalog.connection.execute("DELETE FROM vector_cache WHERE key=?", (key,))
+                    self.catalog.execute("DELETE FROM vector_cache WHERE key=?", (key,))

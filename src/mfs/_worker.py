@@ -45,10 +45,12 @@ class Worker:
         result: StepResult | None = None
         error: BaseException | None = None
         try:
+            permit.cancellation.check()
             if permit.payload["stage"] == "process" and not permit.payload.get("cleanup"):
                 result = self.preparation.execute(permit)
             else:
                 result = self.indexing.execute(permit)
+            permit.cancellation.check()
         except BaseException as caught:
             error = caught
         with self.lifecycle.condition:

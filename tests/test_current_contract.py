@@ -139,16 +139,13 @@ def test_scoped_search_and_receipts_work_without_other_namespace_binding(tmp_pat
         repeats = [mfs.upsert("b", "a.txt", b"new needle") for _ in range(3)]
         assert all(r.revision == pending.revision for r in repeats)
         assert (
-            mfs._catalog.connection.execute(
+            mfs._catalog.query(
                 "SELECT count(*) FROM targets WHERE namespace='b' AND doc_id='a.txt'"
-            ).fetchone()[0]
+            )[0][0]
             == 1
         )
         tables = {
-            r[0]
-            for r in mfs._catalog.connection.execute(
-                "SELECT name FROM sqlite_schema WHERE type='table'"
-            )
+            r[0] for r in mfs._catalog.query("SELECT name FROM sqlite_schema WHERE type='table'")
         }
         assert not tables.intersection(
             {"runs", "wait_operations", "wait_target_sets", "run_dependencies"}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -18,8 +19,16 @@ class ExecutionPolicy:
     workers: int = 4
     queries: int = 4
     resources: Mapping[str, int] = field(default_factory=lambda: {"heavy": 1, "light": 2})
+    stage_timeout: float = 300.0
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.stage_timeout, bool)
+            or not isinstance(cast(object, self.stage_timeout), (int, float))
+            or not math.isfinite(self.stage_timeout)
+            or self.stage_timeout <= 0
+        ):
+            raise InvalidConfiguration("stage_timeout must be finite and positive")
         for value in (self.workers, self.queries, *self.resources.values()):
             if isinstance(value, bool) or not isinstance(cast(object, value), int) or value < 1:
                 raise InvalidConfiguration("execution capacities must be positive integers")

@@ -252,18 +252,17 @@ else:
         assert replayed.revision == accepted.revision
         mfs.wait(replayed, 0)
         assert mfs.document_status(replayed.id) == current
-        connection = mfs._catalog.connection
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
-        assert connection.execute("SELECT count(*) FROM targets").fetchone()[0] == 1
-        assert connection.execute("SELECT count(*) FROM operations").fetchone()[0] == 1
+        catalog = mfs._catalog
+        assert catalog.query("PRAGMA user_version")[0][0] == 8
+        assert catalog.query("SELECT count(*) FROM targets")[0][0] == 1
+        assert catalog.query("SELECT count(*) FROM operations")[0][0] == 1
         tables = {
-            row[0]
-            for row in connection.execute("SELECT name FROM sqlite_schema WHERE type='table'")
+            row[0] for row in catalog.query("SELECT name FROM sqlite_schema WHERE type='table'")
         }
         assert not tables.intersection(
             {"runs", "wait_operations", "wait_target_sets", "run_dependencies"}
         )
-        stored = json.loads(connection.execute("SELECT value FROM operations").fetchone()[0])
+        stored = json.loads(catalog.query("SELECT value FROM operations")[0][0])
         assert "operation_id" not in stored
         with pytest.raises(NamespaceNotFound):
             mfs.wait("receipt", 0)

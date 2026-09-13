@@ -51,13 +51,10 @@ def test_cache_miss_recomputes_without_changing_search_visibility(
         mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()], embedder=model)
         mfs.wait(mfs.upsert("n", "a.txt", b"first needle"), 10)
         if cause == "corrupt":
-            mfs._catalog.connection.execute("UPDATE vector_cache SET vector=x'00'")
+            mfs._catalog.execute("UPDATE vector_cache SET vector=x'00'")
         else:
             mfs.wait(mfs.upsert("n", "b.txt", b"second needle"), 10)
-            assert (
-                mfs._catalog.connection.execute("SELECT count(*) FROM vector_cache").fetchone()[0]
-                == 1
-            )
+            assert mfs._catalog.query("SELECT count(*) FROM vector_cache")[0][0] == 1
         assert mfs.search("n", "first", mode="bm25").items
         mfs.wait(mfs.remove("n", "a.txt"), 10)
         mfs.wait(mfs.upsert("n", "copy.txt", b"first needle"), 10)

@@ -51,7 +51,7 @@ def test_distinct_files_execute_together_with_durable_active_inputs(tmp_path: Pa
             processor.entered.wait(5)
             with mfs._condition:
                 assert len(mfs._tasks.executing) == 2
-                rows = mfs._catalog.connection.execute("SELECT value FROM active_runs").fetchall()
+                rows = mfs._catalog.query("SELECT value FROM active_runs")
                 assert len(rows) == 2
                 for row in rows:
                     active = mfs._catalog.decode(row[0])

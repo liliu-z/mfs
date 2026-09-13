@@ -1,6 +1,7 @@
 # pyright: reportPrivateUsage=false
 from __future__ import annotations
 
+import threading
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Literal
@@ -74,7 +75,17 @@ def test_ranked_affixes_and_source_types_push_down_before_topk_with_no_sqlite(
         mfs.upsert("other", special, b"needle")
         mfs.wait_ready(10)
         statements: list[str] = []
-        mfs._catalog.connection.set_trace_callback(statements.append)
+        caller = threading.get_ident()
+
+        def trace(statement: str) -> None:
+            # Pooled connections also serve maintenance. Observe both the search
+            # caller and its executor body, without counting unrelated cleanup.
+            if threading.get_ident() == caller or threading.current_thread().name.startswith(
+                "mfs-search"
+            ):
+                statements.append(statement)
+
+        mfs._catalog.set_trace_callback(trace)
         # Force a candidate budget of one at the actual backend for a rare type.
         original = mfs._runtime.index("n").search
 
@@ -153,10 +164,10 @@ def test_under_path_excludes_prefix_siblings_and_sql_point_lookup_uses_primary_k
         )
         identity = DocumentId("n", "scope/a.txt")
         compiled = compile_filters([ByDocumentId(identity)], "n", "external", search=False)
-        plan = mfs._catalog.connection.execute(
+        plan = mfs._catalog.query(
             "EXPLAIN QUERY PLAN SELECT value FROM documents WHERE " + compiled.sql,
             compiled.params,
-        ).fetchall()
+        )
         assert any("SEARCH documents USING INDEX" in str(row[3]) for row in plan)
         assert mfs.grep("n", [ByDocumentId(identity)]).items[0].value == identity
         # Multiple ID filters intersect rather than expanding a Cartesian product of batches.

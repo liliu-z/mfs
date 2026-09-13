@@ -51,10 +51,10 @@ class IndexCleanup:
                 debt.update(failures=debt["failures"] + 1, error=str(error))
                 debt["next_run"] = time.time() + min(30, 0.25 * 2 ** debt["failures"])
                 with self.lifecycle.condition, self.catalog.transaction():
-                    self.catalog.connection.execute(
+                    self.catalog.execute(
                         "UPDATE index_cleanup SET value=? WHERE key=?", (compact_json(debt), key)
                     )
                 continue
             with self.lifecycle.condition, self.catalog.transaction():
-                self.catalog.connection.execute("DELETE FROM index_cleanup WHERE key=?", (key,))
+                self.catalog.execute("DELETE FROM index_cleanup WHERE key=?", (key,))
                 self.lifecycle.condition.notify_all()

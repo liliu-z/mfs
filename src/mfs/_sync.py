@@ -185,19 +185,19 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
             except OSError:
                 return False
 
+        if not root_stable():
+            raise SourceChanged("root changed before observation")
         with mfs._condition:
             ns = dict(mfs._tasks.namespaces.get(namespace, {}))
             if ns.get("incarnation") != initial["incarnation"] or ns.get("root") != initial["root"]:
                 raise SourceChanged("namespace was replaced while opening its root")
-            if not root_stable():
-                raise SourceChanged("root changed before observation")
             if ns.get("root_actual") != str(root):
                 removed.update(mfs._tasks.retarget_root(namespace, str(root)))
                 requested = "."  # A new root target changes membership for the whole namespace.
                 ns = dict(mfs._tasks.namespaces[namespace])
             baseline = {
                 doc: revision
-                for doc, revision in mfs._catalog.connection.execute(
+                for doc, revision in mfs._catalog.query(
                     "SELECT doc_id,revision FROM targets WHERE namespace=?", (namespace,)
                 )
             }

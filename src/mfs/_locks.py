@@ -28,18 +28,17 @@ class CallGate:
                 if self._active == 0:
                     self._condition.notify_all()
 
-    def begin_close(self) -> bool:
+    def start_close(self) -> bool:
         with self._condition:
-            if self._closed:
-                return False
             if self._closing:
-                while not self._closed:
-                    self._condition.wait()
                 return False
             self._closing = True
+            return True
+
+    def drain(self) -> None:
+        with self._condition:
             while self._active:
                 self._condition.wait()
-            return True
 
     def finish_close(self) -> None:
         with self._condition:

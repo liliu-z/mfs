@@ -28,6 +28,7 @@ from mfs import (
     SourceMap,
     StorageFailed,
     Utf8TextProcessor,
+    WaitTimeout,
     _sync,
 )
 
@@ -289,8 +290,12 @@ def test_cancelled_publication_restarts_index_stages_after_rebuild(
         report = mfs.upsert("n", "a.txt", b"recover cancelled publication")
         assert entered.wait(5)
         mfs.cancel(report.id)
-        with pytest.raises(OperationFailed, match="cancelled"):
+        # Candidate membership expands asynchronously. With the scheduler excluded,
+        # a zero budget sees pending intent before cancellation has been copied.
+        with mfs._condition, pytest.raises(WaitTimeout):
             mfs.reindex("n", timeout=0)
+        with pytest.raises(OperationFailed, match="cancelled"):
+            mfs.wait(report, 5)
         release.set()
         with mfs._condition:
             assert mfs._condition.wait_for(lambda: not mfs._tasks.executing, 10)

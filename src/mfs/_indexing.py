@@ -43,6 +43,7 @@ class Indexing:
 
     def execute(self, permit: ExecutionPermit) -> StepResult | None:
         identity, job = permit.identity, permit.payload
+        permit.cancellation.check()
         with self.lifecycle.condition:
             if not self.lifecycle.current(identity, job):
                 return
@@ -101,6 +102,7 @@ class Indexing:
             ):
                 return Chunked(record["chunk_plan"])
             text = self.preparation.read_text(record, permit)
+            permit.cancellation.check()
             ranges = validate_chunk_ranges(
                 text,
                 permit.binding.chunker.chunk(text, parse_source_map(record)),
@@ -149,6 +151,7 @@ class Indexing:
                             )[0]
                 missing = [h for h in texts if h not in vectors]
                 if missing:
+                    self.lifecycle.check_execution(identity, job)
                     computed = self.runtime.embed_documents(
                         self.runtime.matching_embedder(permit.binding, dense),
                         [texts[h] for h in missing],
@@ -182,7 +185,9 @@ class Indexing:
                 if not self.lifecycle.current(identity, job):
                     return
             # Complete vectors are durable in Milvus. These rows stay invisible until publish.
+            permit.cancellation.check()
             index.insert(rows)
+            permit.cancellation.check()
             index.flush()
             return Embedded(batch + 1, batch + 1 == job["batches"])
         elif stage == "publish":

@@ -2,12 +2,50 @@
 from __future__ import annotations
 
 import random
+from importlib.metadata import version
 from pathlib import Path
 
 import pytest
 
 from mfs import DocumentId
 from mfs._index import ChunkIndex, IndexRow
+
+
+@pytest.mark.conformance
+@pytest.mark.xfail(
+    version("milvus-lite") == "3.2.1",
+    reason="Milvus Lite 3.2.1 _search_sparse uses segment-local IDF/avgdl (upstream TODO)",
+    strict=True,
+    raises=AssertionError,
+)
+def test_bm25_ranking_does_not_depend_on_flush_boundaries(tmp_path: Path) -> None:
+    texts = [("many", "hello hello hello"), ("one", "hello world"), ("other", "needle")]
+    rankings: list[list[str]] = []
+    for split in (False, True):
+        index = ChunkIndex(tmp_path / f"{split}.db")
+        try:
+            index.recreate(dense_dimension=None)
+            rows = [
+                IndexRow(
+                    namespace="n",
+                    doc_id=name,
+                    ordinal=0,
+                    text=text,
+                    text_start=0,
+                    text_end=len(text),
+                    dense_vector=[],
+                )
+                for name, text in texts
+            ]
+            for batch in [rows[:1], rows[1:]] if split else [rows]:
+                index.insert(batch)
+                index.flush()
+            hits, _ = index.search("hello", mode="bm25", limit=10)
+            rankings.append([hit["doc_id"] for hit in hits])
+        finally:
+            index.close()
+    assert rankings[0] == ["many", "one"]
+    assert rankings[1] == rankings[0]
 
 
 @pytest.mark.conformance

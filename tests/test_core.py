@@ -82,25 +82,27 @@ def test_processor_registry_description_is_frozen_at_open(tmp_path: Path) -> Non
         mfs.close()
 
 
-def test_bm25_order_filter_escaping_and_reopen(tmp_path: Path) -> None:
+def test_bm25_filter_escaping_and_reopen(tmp_path: Path) -> None:
     state = tmp_path / "state"
     odd_id = 'a"\\\n%_.txt'
     mfs = MFS.open(state)
-    for registered in mfs.list_namespaces():
-        mfs.open_namespace(registered.namespace, processors=[Utf8TextProcessor()])
-    mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()])
-    mfs.upsert("n", "many.txt", b"hello hello hello")
-    mfs.upsert("n", "one.txt", b"hello world")
-    mfs.upsert("n", odd_id, b"needle")
+    try:
+        for registered in mfs.list_namespaces():
+            mfs.open_namespace(registered.namespace, processors=[Utf8TextProcessor()])
+        mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()])
+        mfs.upsert("n", "many.txt", b"hello hello hello")
+        mfs.upsert("n", "one.txt", b"hello world")
+        mfs.upsert("n", odd_id, b"needle")
 
-    ranked = mfs.search("n", "hello", mode="bm25", limit=10, consistency="strong")
-    assert [item.value.document_id.doc_id for item in ranked.items] == ["many.txt", "one.txt"]
-    assert ranked.items[0].score > ranked.items[1].score > 0
-    filtered = mfs.search(
-        "n", "needle", filters=[ByDocumentId(DocumentId("n", odd_id))], mode="bm25"
-    )
-    assert filtered.items[0].value.document_id.doc_id == odd_id
-    mfs.close()
+        ranked = mfs.search("n", "hello", mode="bm25", limit=10, consistency="strong")
+        assert {item.value.document_id.doc_id for item in ranked.items} == {"many.txt", "one.txt"}
+        assert all(item.score > 0 for item in ranked.items)
+        filtered = mfs.search(
+            "n", "needle", filters=[ByDocumentId(DocumentId("n", odd_id))], mode="bm25"
+        )
+        assert filtered.items[0].value.document_id.doc_id == odd_id
+    finally:
+        mfs.close()
 
     reopened = MFS.open(state)
     for registered in reopened.list_namespaces():

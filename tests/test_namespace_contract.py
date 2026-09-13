@@ -55,7 +55,7 @@ def test_external_references_live_text_without_copy(tmp_path: Path) -> None:
                 assert b"unique original searchable content" not in path.read_bytes()
         # The only permanent plain text copy used by indexing is the Milvus chunk.
         for table in ("documents", "targets"):
-            values = mfs._catalog.connection.execute(f"SELECT value FROM {table}").fetchall()
+            values = mfs._catalog.query(f"SELECT value FROM {table}")
             assert all("unique original searchable content" not in value for (value,) in values)
         original.write_text("changed live text")
         assert mfs.grep("files", [TextMatch("changed")]).items
@@ -164,9 +164,7 @@ def test_state_root_overlap_rejected_and_grep_budget_is_visible(tmp_path: Path) 
         result = mfs.grep("a", [TextMatch("token")], budget=GrepBudget(max_matches=3))
         assert result.truncated and len(result.items[0].matches) == 3
         assert not hasattr(mfs, "query")
-        assert "text" not in json.loads(
-            mfs._catalog.connection.execute("SELECT value FROM documents").fetchone()[0]
-        )
+        assert "text" not in json.loads(mfs._catalog.query("SELECT value FROM documents")[0][0])
     finally:
         mfs.close()
 

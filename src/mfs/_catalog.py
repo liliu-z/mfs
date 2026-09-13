@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -13,15 +13,29 @@ from .errors import CorruptState, SchemaVersionUnsupported, StorageFailed
 
 
 class Catalog:
-    """Thread-owned SQLite connections; callers coordinate related state transitions."""
+    """Short database leases; no connection follows the lifetime of a caller thread.
+
+    Transactions pin a lease for nested catalog operations. Do not run adapters,
+    filesystem work or acquire Lifecycle.condition inside a catalog transaction.
+    """
 
     def __init__(self, path: Path, *, initialize: bool) -> None:
         self.path = path
         self._local = threading.local()
         self._connections: list[sqlite3.Connection] = []
-        self._connections_lock = threading.Lock()
+        self._idle: list[sqlite3.Connection] = []
+        self._connections_lock = threading.Condition()
+        self._closed = False
+        self._trace: Callable[[str], None] | None = None
         self.migrated = False
-        version = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
+        try:
+            self._load(initialize)
+        except BaseException:
+            self.close()
+            raise
+
+    def _load(self, initialize: bool) -> None:
+        version = int(self.query("PRAGMA user_version")[0][0])
         if version > 8:
             raise SchemaVersionUnsupported(f"catalog schema version {version} is unsupported")
         if not initialize and version not in (1, 2, 3, 4, 5, 6, 7, 8):
@@ -47,32 +61,88 @@ class Catalog:
         }
         actual = {
             r[0]
-            for r in self.connection.execute(
+            for r in self.query(
                 "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             )
         }
         if actual != expected:
             raise CorruptState("catalog schema does not match version 8")
 
-    @property
-    def connection(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connection(self) -> Generator[sqlite3.Connection]:
         connection = getattr(self._local, "connection", None)
-        if connection is None:
-            connection = sqlite3.connect(
-                self.path, check_same_thread=False, isolation_level=None, timeout=30
-            )
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute("PRAGMA synchronous = FULL")
-            connection.create_function("mfs_name", 1, _name, deterministic=True)
-            connection.create_function("mfs_suffix", 1, _suffix, deterministic=True)
-            self._local.connection = connection
-            with self._connections_lock:
+        if connection is not None:
+            yield connection
+            return
+        with self._connections_lock:
+            if not self._connections_lock.wait_for(
+                lambda: self._closed or self._idle or len(self._connections) < 8, timeout=30
+            ):
+                raise StorageFailed("catalog connection acquisition timed out")
+            if self._closed:
+                raise StorageFailed("catalog is closed")
+            if self._idle:
+                connection = self._idle.pop()
+            else:
+                connection = sqlite3.connect(
+                    self.path, check_same_thread=False, isolation_level=None, timeout=30
+                )
+                try:
+                    connection.execute("PRAGMA foreign_keys = ON")
+                    connection.execute("PRAGMA journal_mode = WAL")
+                    connection.execute("PRAGMA synchronous = FULL")
+                    connection.create_function("mfs_name", 1, _name, deterministic=True)
+                    connection.create_function("mfs_suffix", 1, _suffix, deterministic=True)
+                except BaseException:
+                    connection.close()
+                    raise
                 self._connections.append(connection)
-        return connection
+        self._local.connection = connection
+        try:
+            connection.set_trace_callback(self._trace)
+            yield connection
+        finally:
+            self._local.connection = None
+            reusable = False
+            try:
+                if connection.in_transaction:
+                    connection.rollback()
+                reusable = True
+            finally:
+                with self._connections_lock:
+                    if reusable:
+                        self._idle.append(connection)
+                    else:
+                        connection.close()
+                        self._connections.remove(connection)
+                    self._connections_lock.notify()
+
+    def set_trace_callback(self, callback: Callable[[str], None] | None) -> None:
+        self._trace = callback
+
+    def execute(self, sql: str, params: Sequence[Any] = ()) -> None:
+        with self._connection() as connection:
+            connection.execute(sql, params).close()
+
+    def query(self, sql: str, params: Sequence[Any] = ()) -> list[tuple[Any, ...]]:
+        with self._connection() as connection:
+            cursor = connection.execute(sql, params)
+            try:
+                return cursor.fetchall()
+            finally:
+                cursor.close()
+
+    def one(self, sql: str, params: Sequence[Any] = ()) -> tuple[Any, ...] | None:
+        with self._connection() as connection:
+            cursor = connection.execute(sql, params)
+            try:
+                return cursor.fetchone()
+            finally:
+                cursor.close()
 
     def _initialize(self) -> None:
-        self.connection.executescript("""
+        with self._connection() as connection:
+            connection.executescript("""
             BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS namespaces (
                 namespace TEXT PRIMARY KEY COLLATE BINARY,
@@ -146,47 +216,51 @@ class Catalog:
         """)
 
     @contextmanager
-    def transaction(self) -> Generator[None]:
-        connection = self.connection
-        nested = connection.in_transaction
-        try:
-            if not nested:
-                connection.execute("BEGIN IMMEDIATE")
-            yield
-            if not nested:
-                connection.execute("COMMIT")
-        except BaseException as error:
-            if not nested and connection.in_transaction:
-                connection.execute("ROLLBACK")
-            if isinstance(error, sqlite3.Error):
-                raise StorageFailed(f"catalog transaction failed: {error}") from error
-            raise
+    def transaction(self, *, blocking: bool = True) -> Generator[None]:
+        with self._connection() as connection:
+            nested = connection.in_transaction
+            try:
+                if not blocking:
+                    connection.execute("PRAGMA busy_timeout=0")
+                if not nested:
+                    connection.execute("BEGIN IMMEDIATE")
+                yield
+                if not nested:
+                    connection.execute("COMMIT")
+            except BaseException as error:
+                if not nested and connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                if isinstance(error, sqlite3.Error):
+                    raise StorageFailed(f"catalog transaction failed: {error}") from error
+                raise
+            finally:
+                if not blocking:
+                    connection.execute("PRAGMA busy_timeout=30000")
 
     def close(self) -> None:
         with self._connections_lock:
+            self._closed = True
             for connection in self._connections:
                 connection.close()
             self._connections.clear()
+            self._idle.clear()
+            self._connections_lock.notify_all()
 
     def put_namespace(self, namespace: str, value: dict[str, Any]) -> None:
-        self.connection.execute(
+        self.execute(
             "INSERT INTO namespaces VALUES(?,?) ON CONFLICT(namespace) "
             "DO UPDATE SET value=excluded.value",
             (namespace, compact_json(value)),
         )
 
     def get_namespace(self, namespace: str) -> dict[str, Any] | None:
-        row = self.connection.execute(
-            "SELECT value FROM namespaces WHERE namespace=?", (namespace,)
-        ).fetchone()
+        row = self.one("SELECT value FROM namespaces WHERE namespace=?", (namespace,))
         return self.decode(row[0]) if row else None
 
     def list_namespaces(self) -> list[tuple[str, dict[str, Any]]]:
         return [
             (n, self.decode(v))
-            for n, v in self.connection.execute(
-                "SELECT namespace,value FROM namespaces ORDER BY namespace"
-            )
+            for n, v in self.query("SELECT namespace,value FROM namespaces ORDER BY namespace")
         ]
 
     def delete_namespace(self, namespace: str) -> None:
@@ -195,15 +269,15 @@ class Catalog:
             self.clear_vector_cache(record.get("incarnation", ""))
         for doc, _ in self.list_namespace_documents(namespace):
             self.set_references("document", namespace, doc, set())
-        self.connection.execute("DELETE FROM cancel_gates WHERE namespace=?", (namespace,))
-        self.connection.execute("DELETE FROM namespaces WHERE namespace=?", (namespace,))
+        self.execute("DELETE FROM cancel_gates WHERE namespace=?", (namespace,))
+        self.execute("DELETE FROM namespaces WHERE namespace=?", (namespace,))
 
     def clear_vector_cache(self, incarnation: str) -> None:
-        self.connection.execute("DELETE FROM vector_cache WHERE incarnation=?", (incarnation,))
+        self.execute("DELETE FROM vector_cache WHERE incarnation=?", (incarnation,))
 
     def put_document(self, namespace: str, doc_id: str, value: dict[str, Any]) -> None:
         self.set_references("document", namespace, doc_id, self.references(value))
-        self.connection.execute(
+        self.execute(
             "INSERT INTO documents VALUES(?,?,?) ON CONFLICT(namespace,doc_id) "
             "DO UPDATE SET value=excluded.value",
             (namespace, doc_id, compact_json(value)),
@@ -211,24 +285,22 @@ class Catalog:
 
     def delete_document(self, namespace: str, doc_id: str) -> None:
         self.set_references("document", namespace, doc_id, set())
-        self.connection.execute(
-            "DELETE FROM documents WHERE namespace=? AND doc_id=?", (namespace, doc_id)
-        )
+        self.execute("DELETE FROM documents WHERE namespace=? AND doc_id=?", (namespace, doc_id))
 
     def get_document(self, namespace: str, doc_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute(
+        row = self.one(
             "SELECT value FROM documents WHERE namespace=? AND doc_id=?", (namespace, doc_id)
-        ).fetchone()
+        )
         return self.decode(row[0]) if row else None
 
     def get_document_revision(
         self, namespace: str, doc_id: str, *, candidate: bool = False
     ) -> str | None:
         table = "build_documents" if candidate else "documents"
-        row = self.connection.execute(
+        row = self.one(
             f"SELECT json_extract(value,'$.revision') FROM {table} WHERE namespace=? AND doc_id=?",
             (namespace, doc_id),
-        ).fetchone()
+        )
         return str(row[0]) if row and row[0] is not None else None
 
     def select_documents(
@@ -236,7 +308,7 @@ class Catalog:
     ) -> list[tuple[str, str, dict[str, Any]]]:
         return [
             (n, d, self.decode(v))
-            for n, d, v in self.connection.execute(
+            for n, d, v in self.query(
                 "SELECT namespace,doc_id,value FROM documents WHERE "
                 + where
                 + " ORDER BY namespace,doc_id",
@@ -257,17 +329,23 @@ class Catalog:
             if candidate
             else "documents"
         )
-        cursor = self.connection.execute(
-            f"SELECT namespace,doc_id,value FROM {source} WHERE "
-            + where
-            + " ORDER BY namespace,doc_id",
-            params,
-        )
-        try:
-            for namespace, doc_id, value in cursor:
+        # Never retain a database lease across a caller yield (grep may run adapters).
+        # Membership may change between pages; ReadView validates each selected revision.
+        after: tuple[str, str] | None = None
+        while True:
+            rows = self.query(
+                f"SELECT namespace,doc_id,value FROM {source} WHERE ("
+                + where
+                + ")"
+                + (" AND (namespace,doc_id) > (?,?)" if after is not None else "")
+                + " ORDER BY namespace,doc_id LIMIT 128",
+                (*params, *after) if after is not None else params,
+            )
+            if not rows:
+                return
+            for namespace, doc_id, value in rows:
                 yield namespace, doc_id, self.decode(value)
-        finally:
-            cursor.close()
+            after = rows[-1][0], rows[-1][1]
 
     def list_namespace_documents(self, namespace: str) -> list[tuple[str, dict[str, Any]]]:
         return [(d, v) for _, d, v in self.select_documents("namespace=?", (namespace,))]
@@ -275,14 +353,14 @@ class Catalog:
     def document_count(self, namespace: str | None = None) -> int:
         sql = "SELECT count(*) FROM documents"
         return int(
-            self.connection.execute(
+            self.query(
                 sql + (" WHERE namespace=?" if namespace is not None else ""),
                 (namespace,) if namespace is not None else (),
-            ).fetchone()[0]
+            )[0][0]
         )
 
     def namespace_count(self) -> int:
-        return int(self.connection.execute("SELECT count(*) FROM namespaces").fetchone()[0])
+        return int(self.query("SELECT count(*) FROM namespaces")[0][0])
 
     def put_target(self, namespace: str, doc_id: str, value: dict[str, Any]) -> None:
         previous = self.get_target(namespace, doc_id)
@@ -296,26 +374,26 @@ class Catalog:
             self.clear_prepared(str(previous["revision"]))
         if value["stage"] != "process":
             self.clear_prepared(str(value["revision"]))
-        self.connection.execute(
+        self.execute(
             "INSERT INTO targets VALUES(?,?,?,?) ON CONFLICT(namespace,doc_id) "
             "DO UPDATE SET revision=excluded.revision,value=excluded.value",
             (namespace, doc_id, value["revision"], compact_json(value)),
         )
 
     def get_target(self, namespace: str, doc_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute(
+        row = self.one(
             "SELECT value FROM targets WHERE namespace=? AND doc_id=?", (namespace, doc_id)
-        ).fetchone()
+        )
         return self.decode_target(row[0], namespace, doc_id) if row else None
 
     def put_active(self, namespace: str, doc_id: str, value: dict[str, Any] | None) -> None:
         self.set_references("active", namespace, doc_id, self.references(value) if value else set())
         if value is None:
-            self.connection.execute(
+            self.execute(
                 "DELETE FROM active_runs WHERE namespace=? AND doc_id=?", (namespace, doc_id)
             )
         else:
-            self.connection.execute(
+            self.execute(
                 "INSERT INTO active_runs VALUES(?,?,?) ON CONFLICT(namespace,doc_id) "
                 "DO UPDATE SET value=excluded.value",
                 (namespace, doc_id, compact_json(value)),
@@ -343,11 +421,9 @@ class Catalog:
                 self.enqueue_cleanup(namespace, doc_id, previous)
         self.set_references(table, namespace, doc_id, self.references(value) if value else set())
         if value is None:
-            self.connection.execute(
-                f"DELETE FROM {table} WHERE namespace=? AND doc_id=?", (namespace, doc_id)
-            )
+            self.execute(f"DELETE FROM {table} WHERE namespace=? AND doc_id=?", (namespace, doc_id))
         else:
-            self.connection.execute(
+            self.execute(
                 f"INSERT INTO {table} VALUES(?,?,?) ON CONFLICT(namespace,doc_id) "
                 "DO UPDATE SET value=excluded.value",
                 (namespace, doc_id, compact_json(value)),
@@ -357,9 +433,9 @@ class Catalog:
         self, namespace: str, doc_id: str, *, document: bool = False
     ) -> dict[str, Any] | None:
         table = "build_documents" if document else "build_targets"
-        row = self.connection.execute(
+        row = self.one(
             f"SELECT value FROM {table} WHERE namespace=? AND doc_id=?", (namespace, doc_id)
-        ).fetchone()
+        )
         return self.decode(row[0]) if row else None
 
     def enqueue_cleanup(self, namespace: str, doc_id: str, job: dict[str, Any]) -> None:
@@ -377,12 +453,10 @@ class Catalog:
             error=None,
         )
         key = compact_json([namespace, doc_id, value["incarnation"], value["generation"], snapshot])
-        self.connection.execute(
-            "INSERT OR IGNORE INTO index_cleanup VALUES(?,?)", (key, compact_json(value))
-        )
+        self.execute("INSERT OR IGNORE INTO index_cleanup VALUES(?,?)", (key, compact_json(value)))
 
     def cleanup_rows(self, namespace: str | None = None) -> list[tuple[str, dict[str, Any]]]:
-        rows = self.connection.execute(
+        rows = self.query(
             "SELECT key,value FROM index_cleanup"
             + (" WHERE json_extract(value,'$.namespace')=?" if namespace is not None else ""),
             (namespace,) if namespace is not None else (),
@@ -391,7 +465,7 @@ class Catalog:
 
     def list_targets(self, namespace: str | None = None) -> list[tuple[str, str, dict[str, Any]]]:
         sql = "SELECT namespace,doc_id,value FROM targets"
-        rows = self.connection.execute(
+        rows = self.query(
             sql
             + (" WHERE namespace=?" if namespace is not None else "")
             + " ORDER BY namespace,doc_id",
@@ -403,22 +477,20 @@ class Catalog:
         for _, doc, job in self.list_targets(namespace):
             self.set_references("target", namespace, doc, set())
             self.clear_prepared(str(job["revision"]))
-        self.connection.execute("DELETE FROM targets WHERE namespace=?", (namespace,))
+        self.execute("DELETE FROM targets WHERE namespace=?", (namespace,))
 
     def get_operation(self, key: str) -> tuple[str, dict[str, Any]] | None:
-        row = self.connection.execute(
-            "SELECT request_hash,value FROM operations WHERE key=?", (key,)
-        ).fetchone()
+        row = self.one("SELECT request_hash,value FROM operations WHERE key=?", (key,))
         return (str(row[0]), self.decode(row[1])) if row else None
 
     def put_operation(self, key: str, request_hash: str, value: dict[str, Any]) -> None:
-        self.connection.execute(
+        self.execute(
             "INSERT INTO operations VALUES(?,?,?)", (key, request_hash, compact_json(value))
         )
 
     def clear_prepared(self, revision: str) -> None:
         self.set_references("prepared", "", revision, set())
-        self.connection.execute("DELETE FROM prepared WHERE revision=?", (revision,))
+        self.execute("DELETE FROM prepared WHERE revision=?", (revision,))
 
     @staticmethod
     def _scope(namespace: str | None, path: str) -> tuple[str, list[str]]:
@@ -436,11 +508,11 @@ class Catalog:
         self, namespace: str | None, path: str, limit: int, offset: int
     ) -> list[tuple[str, str]]:
         where, parameters = self._scope(namespace, path)
-        return self.connection.execute(
+        return self.query(
             f"SELECT namespace,doc_id FROM targets WHERE {where} "
             "ORDER BY namespace,doc_id LIMIT ? OFFSET ?",
             [*parameters, limit, offset],
-        ).fetchall()
+        )
 
     def status_counts(
         self, namespace: str | None, path: str
@@ -448,7 +520,7 @@ class Catalog:
         where, parameters = self._scope(namespace, path)
         states: dict[str, int] = {}
         stages: dict[str, int] = {}
-        for state, stage, count in self.connection.execute(
+        for state, stage, count in self.query(
             "SELECT json_extract(value,'$.state'),json_extract(value,'$.stage'),count(*) "
             "FROM (SELECT t.namespace,t.doc_id,coalesce(b.value,t.value) AS value "
             "FROM targets t LEFT JOIN build_targets b USING(namespace,doc_id)) "
@@ -461,19 +533,17 @@ class Catalog:
 
     def set_cancelled(self, namespace: str, doc_id: str, cancelled: bool) -> None:
         if cancelled:
-            self.connection.execute(
-                "INSERT OR IGNORE INTO cancel_gates VALUES(?,?)", (namespace, doc_id)
-            )
+            self.execute("INSERT OR IGNORE INTO cancel_gates VALUES(?,?)", (namespace, doc_id))
         else:
-            self.connection.execute(
+            self.execute(
                 "DELETE FROM cancel_gates WHERE namespace=? AND doc_id=?", (namespace, doc_id)
             )
 
     def cancelled(self, namespace: str, doc_id: str) -> bool:
         return (
-            self.connection.execute(
+            self.one(
                 "SELECT 1 FROM cancel_gates WHERE namespace=? AND doc_id=?", (namespace, doc_id)
-            ).fetchone()
+            )
             is not None
         )
 
@@ -494,7 +564,7 @@ class Catalog:
         return {p for p in paths if isinstance(p, str)}
 
     def register_artifact(self, path: str, size: int = 0) -> None:
-        self.connection.execute(
+        self.execute(
             "INSERT OR IGNORE INTO artifacts(path,unreferenced_at,size) VALUES(?,?,?)",
             (path, time.time(), size),
         )
@@ -503,27 +573,23 @@ class Catalog:
         params = (owner, namespace, doc_id)
         previous = {
             str(r[0])
-            for r in self.connection.execute(
+            for r in self.query(
                 "SELECT path FROM artifact_refs WHERE owner=? AND namespace=? AND doc_id=?", params
             )
         }
         for path in paths - previous:
             self.register_artifact(path)
-            row = self.connection.execute(
-                "SELECT state FROM artifacts WHERE path=?", (path,)
-            ).fetchone()
-            if row[0] != "live":
+            row = self.one("SELECT state FROM artifacts WHERE path=?", (path,))
+            if row is None or row[0] != "live":
                 raise CorruptState("cannot reference an artifact claimed for deletion")
-            self.connection.execute("INSERT INTO artifact_refs VALUES(?,?,?,?)", (*params, path))
-            self.connection.execute(
-                "UPDATE artifacts SET unreferenced_at=NULL WHERE path=?", (path,)
-            )
+            self.execute("INSERT INTO artifact_refs VALUES(?,?,?,?)", (*params, path))
+            self.execute("UPDATE artifacts SET unreferenced_at=NULL WHERE path=?", (path,))
         for path in previous - paths:
-            self.connection.execute(
+            self.execute(
                 "DELETE FROM artifact_refs WHERE owner=? AND namespace=? AND doc_id=? AND path=?",
                 (*params, path),
             )
-            self.connection.execute(
+            self.execute(
                 "UPDATE artifacts SET unreferenced_at=? WHERE path=? "
                 "AND NOT EXISTS(SELECT 1 FROM artifact_refs WHERE path=?)",
                 (time.time(), path, path),

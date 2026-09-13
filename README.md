@@ -57,7 +57,11 @@ Processor 可使用两参数 `process(path, media_type)`，或额外接收 `Proc
 
 本轮等待 API 变更：返回值移除 `operation_id`，`wait` 的字符串参数现在是 namespace。SQLite 自动升级到 schema 8，删除历史等待表，保留当前任务、删除标记和显式 `idempotency_key` 去重记录。旧 operation ID 不再是等待凭证；请改为文件身份或 namespace/path。重复 idempotency key 仍返回首次接收结果，不覆盖文件的新状态；随后 `wait(report)` 等待文件当前状态。
 
-独立 GC 线程回收无引用的受管理文件。可用 `GCPolicy(enabled=False)` 关闭自动 GC，由宿主调用 `collect_garbage()`。GC 不删除外部原件或借用的应用产物；已打开的产物句柄受保护。Adapter 默认串行；具体实现类可声明 concurrency，查询与后台共享额度。ExecutionPolicy 默认 workers=4、queries=4、heavy=1、light=2；resources={} 可声明无需本地计算资源。
+独立 GC 线程回收无引用的受管理文件。可用 `GCPolicy(enabled=False)` 关闭自动 GC，由宿主调用 `collect_garbage()`。GC 不删除外部原件或借用的应用产物；已打开的产物句柄受保护。Adapter 默认串行；具体实现类可声明 concurrency，查询与后台共享额度。ExecutionPolicy 默认 workers=4、queries=4、heavy=1、light=2；resources={} 可声明无需本地计算资源。 SQLite 连接由 MFS 按短查询/事务借还，最多 8 个，不要求调用方固定使用同一线程。
+
+`ExecutionPolicy(stage_timeout=300)` 限制每个后台阶段的执行时间；长音视频可显式增加预算。到期目标进入 failed，错误码为 `ExecutionTimeout`，可显式 retry；尚未退出的调用仍占用资源，同文件重试须等它退出。Processor 可用 `context.cancellation.remaining()` 给内部请求设置更短的超时，受管理子进程会在超时后退出。
+
+`close(timeout=30)` 停止接收新请求并等待清理；到期抛 `WaitTimeout`，清理继续、实例锁继续持有。可以再次 close 等待，`timeout=None` 则一直等实际退出。库不能强杀任意 Python/模型线程；daemon 宿主在关闭预算耗尽后可终止整个进程，再按恢复协议重开。
 
 源文件改名、移动或删除前，可用临时租约等待相关执行和源文字读取退出。租约不会创建或清除用户取消门；重叠租约分别释放。原有索引搜索仍可使用，租约内新的 `read` 报 `CapabilityUnavailable`，需要文字的 `grep` 对相应文件返回部分失败。应用负责串行化磁盘操作及其 sync；同一源属于多个 Folder 时，要一起列出相关 namespace 范围。`wait` 应放在租约释放后：
 
@@ -83,6 +87,8 @@ POSIX 的 `run_process` 使用独立监督进程；宿主硬退出后，监督�
 开发检查：`uv sync --locked --dev`，然后 `uv run pytest -q`、`uv run ruff check src tests`、`uv run ruff format --check src tests`、`uv run pyright`。测试包含真实 Milvus Lite、进程崩溃恢复和 Windows 专用路径用例。
 
 完整向量的计算缓存与搜索可见性独立，按 namespace、索引构建代、模型配置和片段 hash 复用。缓存以带校验和的二进制形式保存，逻辑上限为每实例 32 MiB，按 LRU 淘汰；rename 通过覆盖新旧路径的 sync 处理，不需要 rename 方法。缓存命中可省去重复 embedding；淘汰或损坏时重新计算，显式 reindex 切换缓存代并重建，旧缓存按有界 LRU 回收。
+
+`configure_index` 的连续开关与 `configure_namespace` 合并到最后接收的配置；只改 paused 不改变正在构建的模式。开启索引会追赶已接收文件，不会隐式 sync 外部目录；关闭保留搜索文字，排名索引在后台清理。
 
 配置替换可以先接收，再轮询/等待，不阻塞 daemon 的状态和取消入口：
 

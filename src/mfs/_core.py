@@ -63,6 +63,7 @@ from .errors import (
     StorageFailed,
     Superseded,
     UnsupportedMediaType,
+    WaitTimeout,
     WrongNamespaceKind,
 )
 from .execution import Admission, ExecutionPolicy, ResourceLease
@@ -173,6 +174,9 @@ class MFS:
         if self._gc_policy.interval <= 0:
             raise InvalidConfiguration("GC interval must be positive")
         self._calls = CallGate()
+        self._close_lock = threading.Lock()
+        self._close_done = threading.Event()
+        self._close_error: BaseException | None = None
         self._stopping = False
         self._state: IndexState = "ready"
         self._workers: list[threading.Thread] = []
@@ -194,7 +198,9 @@ class MFS:
             for name in ("objects", "artifacts", "staging", "work", "namespaces"):
                 (self._path / name).mkdir(exist_ok=True)
             self._catalog = Catalog(self._path / "catalog.sqlite", initialize=initialize)
-            self._tasks = Lifecycle(self._catalog, self._condition)
+            self._tasks = Lifecycle(
+                self._catalog, self._condition, stage_timeout=policy.stage_timeout
+            )
             self._tasks.boot_paused = start_paused
             self._artifacts = ArtifactStore(self._path, self._catalog, self._tasks, self._gc_policy)
             self._runtime = NamespaceRuntime(self._path, self._tasks, policy, admission)
@@ -224,6 +230,9 @@ class MFS:
             self._recover_objects()
             indexing = Indexing(self._catalog, self._tasks, self._runtime, self._preparation)
             self._worker = Worker(self._tasks, self._runtime, self._preparation, indexing)
+            watchdog = threading.Thread(target=self._tasks.watch_deadlines, name="mfs-deadlines")
+            watchdog.start()
+            self._workers.append(watchdog)
             for number in range(policy.workers):
                 worker = threading.Thread(target=self._worker.run, name=f"mfs-worker-{number}")
                 worker.start()
@@ -331,32 +340,55 @@ class MFS:
                         self._tasks.readers -= 1
                         self._tasks.last_activity = time.monotonic()
 
-    def close(self) -> None:
+    def close(self, timeout: float | None = 30.0) -> None:
+        """Stop admission and wait for actual retirement, at most timeout seconds.
+
+        On WaitTimeout, cleanup continues and the store remains exclusively locked.
+        A later close may wait again. Only the host can forcibly terminate a stuck
+        in-process adapter by terminating the MFS process.
+        """
+        self._validate_timeout(timeout)
+        started = time.monotonic()
+        with self._close_lock:
+            if self._calls.start_close():
+                threading.Thread(target=self._close, name="mfs-close").start()
+        remaining = None if timeout is None else max(0.0, timeout - (time.monotonic() - started))
+        if not self._close_done.wait(remaining):
+            raise WaitTimeout("MFS close timed out; cleanup continues with the store locked")
+        if self._close_error is not None:
+            raise self._close_error
+
+    def _close(self) -> None:
+        try:
+            self._retire()
+        except BaseException as error:
+            self._close_error = error
+        finally:
+            self._calls.finish_close()
+            self._close_done.set()
+
+    def _retire(self) -> None:
         self._search_execution.stop()
         self._grep_execution.stop()
         self._tasks.stop()
         with self._condition:
             self._stopping = True
             self._condition.notify_all()
-        if not self._calls.begin_close():
-            return
+        self._calls.drain()
+        for thread in self._workers:
+            thread.join()
+        self._search_execution.close()
+        self._grep_execution.close()
         try:
-            for thread in self._workers:
-                thread.join()
-            self._search_execution.close()
-            self._grep_execution.close()
+            self._runtime.close()
+        finally:
             try:
-                self._runtime.close()
+                self._catalog.close()
             finally:
                 try:
-                    self._catalog.close()
+                    self._process_owner.close()
                 finally:
-                    try:
-                        self._process_owner.close()
-                    finally:
-                        self._instance_lock.release()
-        finally:
-            self._calls.finish_close()
+                    self._instance_lock.release()
 
     def wait(
         self,
@@ -491,16 +523,17 @@ class MFS:
         lease.enter_context(self._call())
         try:
             with self._condition:
-                row = self._catalog.connection.execute(
+                row = self._catalog.one(
                     "SELECT json_extract(value,'$.snapshot_id'),json_extract(value,'$.artifacts') "
                     "FROM documents WHERE namespace=? AND doc_id=?",
                     (document_id.namespace, document_id.doc_id),
-                ).fetchone()
+                )
                 artifacts = cast(dict[str, str], load_json(row[1])) if row and row[1] else {}
                 if name not in artifacts:
                     raise InvalidQuery("document has no artifact with this name")
                 lease.callback(self._artifacts.pin(artifacts[name]).release)
                 path = self._artifacts.path(artifacts[name])
+            assert row is not None
             return ArtifactHandle(path.open("rb"), str(row[0]), lease.close)
         except BaseException:
             lease.close()
@@ -1092,9 +1125,7 @@ class MFS:
                 self._catalog.set_references(
                     "target", identity.namespace, identity.doc_id, references
                 )
-            for (name,) in self._catalog.connection.execute(
-                "SELECT DISTINCT path FROM artifact_refs"
-            ):
+            for (name,) in self._catalog.query("SELECT DISTINCT path FROM artifact_refs"):
                 path = self._artifacts.path(name)
                 if not path.is_file():
                     raise CorruptState(f"missing or unsafe managed artifact {name!r}")
@@ -1225,19 +1256,23 @@ class MFS:
             previous = self._tasks.namespaces[namespace]
             if paused is not None and not isinstance(_runtime(paused), bool):
                 raise InvalidConfiguration("paused must be a boolean")
-            mode = previous["indexing"] if indexing is None else indexing
-            changes = dict(indexing=mode, paused=previous["paused"] if paused is None else paused)
-            if mode != previous["indexing"]:
-                binding = self._runtime.binding(namespace)
+            building = previous.get("building")
+            effective = building or previous
+            mode = effective["indexing"] if indexing is None else indexing
+            if mode != effective["indexing"]:
+                binding = (
+                    self._runtime.build_bindings.get((namespace, building["generation"]))
+                    if building
+                    else self._runtime.bindings.get(namespace)
+                )
+                if binding is None:
+                    raise CapabilityUnavailable("configuration requires bound adapters")
                 desired = NamespaceBinding.build(
                     binding.processors, binding.chunker, binding.embedder, mode
                 )
                 self._configuration.request(namespace, desired, mode)
-                if paused is not None:
-                    record = dict(self._tasks.namespaces[namespace], paused=paused)
-                    self._tasks.configure(namespace, record)
-            else:
-                record = dict(previous, **changes)
+            if paused is not None:
+                record = dict(self._tasks.namespaces[namespace], paused=paused)
                 self._tasks.configure(namespace, record)
             self._condition.notify_all()
 

@@ -33,6 +33,7 @@ from ._work import (
 from .errors import (
     CapabilityUnavailable,
     Closed,
+    ExecutionTimeout,
     IdempotencyConflict,
     InvalidConfiguration,
     InvalidQuery,
@@ -71,8 +72,11 @@ class Lifecycle:
     holds it; its commit must validate the current revision and execution token.
     """
 
-    def __init__(self, catalog: Catalog, condition: threading.Condition) -> None:
+    def __init__(
+        self, catalog: Catalog, condition: threading.Condition, *, stage_timeout: float = 300.0
+    ) -> None:
         self.catalog, self.condition = catalog, condition
+        self.stage_timeout = stage_timeout
         self.stopping = False
         self.boot_paused = False
         self.active_scopes: tuple[UnderPath, ...] = ()
@@ -102,9 +106,9 @@ class Lifecycle:
         self.storage_error: StorageFailed | None = None
         self.namespaces = dict(catalog.list_namespaces())
         with catalog.transaction():
-            for ns, doc, encoded in catalog.connection.execute(
+            for ns, doc, encoded in catalog.query(
                 "SELECT namespace,doc_id,value FROM build_targets"
-            ).fetchall():
+            ):
                 job = catalog.decode(encoded)
                 if job["state"] in ("running", "blocked"):
                     job.update(state="pending", next_run=0)
@@ -125,9 +129,7 @@ class Lifecycle:
                     job.update(state="pending", next_run=0)
                     catalog.put_target(ns, doc, job)
                 self.targets[DocumentId(ns, doc)] = job
-            for ns, doc, encoded in catalog.connection.execute(
-                "SELECT namespace,doc_id,value FROM active_runs"
-            ).fetchall():
+            for ns, doc, encoded in catalog.query("SELECT namespace,doc_id,value FROM active_runs"):
                 identity = DocumentId(ns, doc)
                 active = catalog.decode(encoded)
                 target = self.work_target(identity, active)
@@ -182,10 +184,7 @@ class Lifecycle:
                     n.get("building") or n.get("retiring_generations")
                     for n in self.namespaces.values()
                 )
-                and self.catalog.connection.execute(
-                    "SELECT 1 FROM index_cleanup LIMIT 1"
-                ).fetchone()
-                is None
+                and self.catalog.one("SELECT 1 FROM index_cleanup LIMIT 1") is None
             )
 
     def work_target(self, identity: DocumentId, job: dict[str, Any]) -> dict[str, Any] | None:
@@ -230,7 +229,7 @@ class Lifecycle:
                 self.targets = targets
                 self.build_targets = {
                     DocumentId(ns, doc): self.catalog.decode(value)
-                    for ns, doc, value in self.catalog.connection.execute(
+                    for ns, doc, value in self.catalog.query(
                         "SELECT namespace,doc_id,value FROM build_targets"
                     )
                 }
@@ -338,6 +337,42 @@ class Lifecycle:
             for cancellation in self.cancellations.values():
                 cancellation._cancel("close")
             self.condition.notify_all()
+
+    def watch_deadlines(self) -> None:
+        with self.condition:
+            while not self.stopping:
+                try:
+                    now = time.monotonic()
+                    for execution, cancellation in tuple(self.cancellations.items()):
+                        job = self.execution_records[execution]
+                        if (
+                            cancellation._deadline is not None
+                            and now >= cancellation._deadline
+                            and self.current(execution[0], job)
+                        ):
+                            error = ExecutionTimeout(
+                                f"{job['stage']} exceeded {self.stage_timeout}s"
+                            )
+                            current = self.work_target(execution[0], job)
+                            assert current is not None
+                            self.persist(
+                                execution[0],
+                                dict(
+                                    current,
+                                    state="failed",
+                                    error=str(error),
+                                    error_code=error.code,
+                                    retryable=False,
+                                    next_run=0,
+                                    attempt_token=uuid.uuid4().hex,
+                                ),
+                            )
+                            cancellation._cancel("timeout")
+                except Exception as error:
+                    self.storage_error = StorageFailed(f"deadline could not persist: {error}")
+                    self.stop()
+                    return
+                self.condition.wait(0.05)
 
     @staticmethod
     def in_scope(identity: DocumentId, scope: UnderPath) -> bool:
@@ -793,7 +828,7 @@ class Lifecycle:
             if not self.current(identity, job):
                 return
             with self.catalog.transaction():
-                self.catalog.connection.execute(
+                self.catalog.execute(
                     "INSERT INTO prepared VALUES(?,?) ON CONFLICT(revision) "
                     "DO UPDATE SET path=excluded.path",
                     (job["revision"], artifact),
@@ -865,7 +900,7 @@ class Lifecycle:
                         self.condition.wait(0.25)
                         break
                     token = str(job["attempt_token"])
-                    cancellation = Cancellation()
+                    cancellation = Cancellation(self.stage_timeout)
                     self.queued_at.pop(identity, None)
                     self.executing.add((identity, token))
                     self.execution_records[(identity, token)] = copy.deepcopy(job)
@@ -902,6 +937,11 @@ class Lifecycle:
     ) -> bool:
         """Called only after the adapter stack has exited; retain its lease until durable."""
         with self.condition:
+            if error is None:
+                try:
+                    permit.cancellation.check()
+                except BaseException as stopped:
+                    error = stopped
             for attempt in range(3):
                 try:
                     committed = False
@@ -1175,7 +1215,7 @@ class Lifecycle:
                 for key, debt in self.catalog.cleanup_rows(document_id.namespace):
                     if debt["doc_id"] == document_id.doc_id:
                         debt.update(failures=0, next_run=0, error=None)
-                        self.catalog.connection.execute(
+                        self.catalog.execute(
                             "UPDATE index_cleanup SET value=? WHERE key=?",
                             (compact_json(debt), key),
                         )
@@ -1539,6 +1579,7 @@ class Lifecycle:
         with self.condition:
             if not self.current(identity, job) or self.stopping:
                 raise _ProcessingStopped()
+            self.cancellations[(identity, job["attempt_token"])].check()
 
     def retarget_root(self, namespace: str, root: str) -> tuple[DocumentId, ...]:
         with self.condition:

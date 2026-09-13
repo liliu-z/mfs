@@ -82,9 +82,7 @@ class ArtifactStore:
 
     def pin(self, relative: str) -> ResourceLease:
         with self.lifecycle.condition:
-            row = self.catalog.connection.execute(
-                "SELECT state FROM artifacts WHERE path=?", (relative,)
-            ).fetchone()
+            row = self.catalog.one("SELECT state FROM artifacts WHERE path=?", (relative,))
             if row and row[0] == "deleting":
                 raise SourceUnavailable("artifact is already being retired")
             self._pins[relative] = self._pins.get(relative, 0) + 1
@@ -169,11 +167,11 @@ class ArtifactStore:
 
     def _cached(self, key: str) -> Any | None:
         catalog = self.catalog
-        row = catalog.connection.execute(
+        row = catalog.one(
             "SELECT cache.path,cache.digest FROM cache JOIN artifacts USING(path) "
             "WHERE key=? AND state='live'",
             (key,),
-        ).fetchone()
+        )
         if row is None:
             return None
         try:
@@ -189,14 +187,14 @@ class ArtifactStore:
             return value
         except (CorruptState, SourceUnavailable, OSError, ValueError):
             with catalog.transaction():
-                catalog.connection.execute("DELETE FROM cache WHERE key=?", (key,))
+                catalog.execute("DELETE FROM cache WHERE key=?", (key,))
             return None
 
     def cache(self, key: str, path: str) -> None:
         catalog = self.catalog
         digest = blake3.blake3((self.root / path).read_bytes()).hexdigest()
         with catalog.transaction():
-            catalog.connection.execute(
+            catalog.execute(
                 "INSERT INTO cache VALUES(?,?,?) ON CONFLICT(key) "
                 "DO UPDATE SET path=excluded.path,digest=excluded.digest",
                 (key, path, digest),
@@ -284,36 +282,30 @@ class ArtifactStore:
                     ):
                         return GCReport(deleted, skipped, busy=True)
                     catalog = self.catalog
-                    catalog.connection.execute("PRAGMA busy_timeout=0")
-                    try:
-                        with catalog.transaction():
-                            excluded = (
-                                " AND path NOT IN (" + ",".join("?" for _ in deferred) + ")"
-                                if deferred
-                                else ""
+                    with catalog.transaction(blocking=False):
+                        excluded = (
+                            " AND path NOT IN (" + ",".join("?" for _ in deferred) + ")"
+                            if deferred
+                            else ""
+                        )
+                        row = catalog.one(
+                            "SELECT path FROM artifacts WHERE (state='deleting' "
+                            "OR (state='live' AND unreferenced_at<=?)) "
+                            "AND NOT EXISTS(SELECT 1 FROM artifact_refs "
+                            "WHERE artifact_refs.path=artifacts.path) "
+                            + excluded
+                            + " ORDER BY state,path LIMIT 1",
+                            (time.time() - policy.grace_seconds, *deferred),
+                        )
+                        if row:
+                            path = str(row[0])
+                            if any(path == p or path.startswith(p + "/") for p in self._pins):
+                                deferred.add(path)
+                                continue
+                            catalog.execute(
+                                "UPDATE artifacts SET state='deleting' WHERE path=?", (path,)
                             )
-                            row = catalog.connection.execute(
-                                "SELECT path FROM artifacts WHERE (state='deleting' "
-                                "OR (state='live' AND unreferenced_at<=?)) "
-                                "AND NOT EXISTS(SELECT 1 FROM artifact_refs "
-                                "WHERE artifact_refs.path=artifacts.path) "
-                                + excluded
-                                + " ORDER BY state,path LIMIT 1",
-                                (time.time() - policy.grace_seconds, *deferred),
-                            ).fetchone()
-                            if row:
-                                path = str(row[0])
-                                if any(path == p or path.startswith(p + "/") for p in self._pins):
-                                    deferred.add(path)
-                                    continue
-                                catalog.connection.execute(
-                                    "UPDATE artifacts SET state='deleting' WHERE path=?", (path,)
-                                )
-                                catalog.connection.execute(
-                                    "DELETE FROM cache WHERE path=?", (path,)
-                                )
-                    finally:
-                        catalog.connection.execute("PRAGMA busy_timeout=30000")
+                            catalog.execute("DELETE FROM cache WHERE path=?", (path,))
                 finally:
                     lifecycle.condition.release()
                 if not row:
@@ -340,7 +332,7 @@ class ArtifactStore:
                                 target.chmod(0o600, follow_symlinks=False)
                             target.unlink()
                     with catalog.transaction():
-                        catalog.connection.execute(
+                        catalog.execute(
                             "DELETE FROM artifacts WHERE path=? AND state='deleting'", (path,)
                         )
                     deleted += 1
@@ -350,7 +342,7 @@ class ArtifactStore:
                     # monopolize a zero-grace manual cycle; let inventory advance.
                     deferred.add(path)
                     with catalog.transaction():
-                        catalog.connection.execute(
+                        catalog.execute(
                             "UPDATE artifacts SET state='live',unreferenced_at=? WHERE path=?",
                             (time.time(), path),
                         )

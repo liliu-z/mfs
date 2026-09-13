@@ -281,7 +281,10 @@ def test_gc_pins_open_artifacts_and_retains_cancelled_checkpoints(tmp_path: Path
         handle = mfs.open_artifact(identity, "transcript")
         try:
             mfs.wait(mfs.remove("n", "a.txt"), 10)
-            assert mfs.collect_garbage().busy
+            pinned = Path(str(handle.stream.name))
+            for _ in range(4):
+                assert mfs.collect_garbage().error is None
+            assert pinned.is_file()
             assert handle.read() == b'{"complete":true}'
         finally:
             handle.close()
@@ -292,8 +295,9 @@ def test_gc_pins_open_artifacts_and_retains_cancelled_checkpoints(tmp_path: Path
             assert report.error is None
             remaining = [
                 p
-                for folder in ("objects", "artifacts", "work")
-                for p in (tmp_path / "state" / folder).iterdir()
+                for folder in ("objects", "artifacts", "work", "namespaces")
+                for p in (tmp_path / "state" / folder).rglob("*")
+                if p.is_file()
             ]
             if not remaining:
                 break
@@ -517,9 +521,8 @@ def test_corrupt_weak_cache_recomputes_and_path_dependent_adapters_do_not_share(
     try:
         mfs.create_namespace("n", "internal", processors=[processor])
         mfs.wait(mfs.upsert("n", "a.txt", b"cache"), 10)
-        row = mfs._catalog.connection.execute(
-            "SELECT path FROM cache WHERE key LIKE 'process:%'"
-        ).fetchone()
+        row = mfs._catalog.one("SELECT path FROM cache WHERE key LIKE 'process:%'")
+        assert row is not None
         (mfs._path / row[0]).write_text('{"text":"tampered"}')
         mfs.wait(mfs.upsert("n", "b.txt", b"cache"), 10)
         assert processor.calls == 2

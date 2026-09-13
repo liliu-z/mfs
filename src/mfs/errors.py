@@ -82,6 +82,10 @@ class EmbeddingFailed(MFSError):
     code = "EmbeddingFailed"
 
 
+class ExecutionTimeout(MFSError):
+    code = "ExecutionTimeout"
+
+
 class StorageFailed(MFSError):
     code = "StorageFailed"
 

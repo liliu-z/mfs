@@ -2,6 +2,14 @@
 
 唯一设计依据：[MFS 设计](design.md)。这里只记录差距和验证结果，不重复设计正文。
 
+## 当前边界
+
+- [x] **LIVENESS-005** External root 的 resolve/stat 在生命周期锁外完成；慢根观察不阻塞其他 namespace 的状态和 quiesce。
+- [x] **CONFIG-005** 索引开关以最新候选为准，连续切换及重开收敛到最后请求；过时执行在阶段/协作检查点退出，实际退出前保留占用。
+- [x] **STORAGE-005** SQLite 最多 8 个连接，按查询/事务借用；调用线程退出无需宿主回收，流式读取不跨调用方处理持有连接。
+- [x] **TIMEOUT-005** 后台阶段默认 300 秒，到期失败并拒绝迟到提交；close 默认等待 30 秒，超时后继续清理并保留实例锁。进程内不可中断调用由宿主终止 daemon 回收。
+- [ ] **BACKEND-005** Milvus Lite 3.2.1 的 BM25 按 segment 计算 IDF/avgdl，排名受 flush 边界影响；等待上游修复，不在 MFS 自建 BM25。确定性后端一致性测试保留为严格 xfail，升级后必须重新验收。
+
 ## 本轮实现
 
 - [x] **EXT-001** External 零复制；引用式文字输入/输出；SQLite 和恢复文件不重复保存正文；GC 只处理受管理文件。
@@ -121,4 +129,4 @@ StashBase 本身未作修改。INTEGRATION-001、实际冻结打包、真实 OCR
 
 修复前专项稳定复现缺陷；修复后 25 项相关回归通过。独立 agent 对四项原触发机制重新注入均通过，详见 [独立复审](review-2026-09-13-independent.md)。3000 个已接收、处理暂停文件的本机测量：新配置接收 0.00148 秒，接收及其后 0.2 秒内 52 次状态采样的最大耗时 0.01406 秒；这是合成数据测量，不能外推百万文件晋升或网络文件系统。
 
-最终全量回归：**186 passed、3 skipped**，474.71 秒；3 项跳过需要原生 Windows 句柄，7 条 PDF SWIG 弃用警告。`ruff check`、`ruff format --check`、strict `pyright`、`git diff --check` 与本地 Markdown 链接检查通过。StashBase 仍未修改；daemon/RPC、真实格式 Processor、跨进程共享额度、宿主事务/迁移与打包验收仍属于 INTEGRATION-001。
+当前全量回归：23 个测试模块分配到 4 个独立进程，各模块执行一次，合计 **196 passed、3 skipped、1 xfailed**。3 项跳过需要原生 Windows 句柄；严格 xfail 对应 BACKEND-005；7 条 PDF SWIG 弃用警告。`ruff check`、`ruff format --check`、strict `pyright`、`git diff --check` 与本地 Markdown 链接检查通过。StashBase 仍未修改；daemon/RPC、真实格式 Processor、跨进程共享额度、宿主事务/迁移与打包验收仍属于 INTEGRATION-001。

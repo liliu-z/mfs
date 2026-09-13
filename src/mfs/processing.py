@@ -13,6 +13,7 @@ from types import MappingProxyType
 from typing import Any, cast
 
 from ._json import JSONValue, copy_json
+from .errors import ExecutionTimeout
 from .types import DocumentId
 
 
@@ -39,11 +40,12 @@ class _ProcessingYielded(BaseException):
 class Cancellation:
     """Cooperative cancellation; managed subprocesses are also retired by MFS."""
 
-    def __init__(self) -> None:
+    def __init__(self, timeout: float | None = None) -> None:
         self._event = threading.Event()
         self._reason: str | None = None
         self._yield_requested = False
         self._started_at = time.monotonic()
+        self._deadline = None if timeout is None else self._started_at + timeout
 
     @property
     def reason(self) -> str | None:
@@ -54,10 +56,17 @@ class Cancellation:
         self._event.set()
 
     def check(self) -> None:
+        if self._deadline is not None and time.monotonic() >= self._deadline:
+            raise ExecutionTimeout("background stage exceeded its timeout")
         if self._event.is_set():
             raise _ProcessingStopped(self._reason)
         if self._yield_requested:
             raise _ProcessingYielded()
+
+    def remaining(self) -> float | None:
+        """Remaining stage budget, suitable for the adapter's HTTP/model timeout."""
+        self.check()
+        return None if self._deadline is None else max(0.0, self._deadline - time.monotonic())
 
     def wait(self, timeout: float | None = None) -> bool:
         return self._event.wait(timeout)

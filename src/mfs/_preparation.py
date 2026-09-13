@@ -220,9 +220,7 @@ class Preparation:
     def prepare_snapshot(
         self, job: dict[str, Any], binding: NamespaceBinding | None
     ) -> tuple[str, dict[str, Any]]:
-        saved = self.catalog.connection.execute(
-            "SELECT path FROM prepared WHERE revision=?", (job["revision"],)
-        ).fetchone()
+        saved = self.catalog.one("SELECT path FROM prepared WHERE revision=?", (job["revision"],))
         artifact = str(saved[0]) if saved else "artifacts/" + job["revision"] + "-snapshot.json"
         if (self.root / artifact).exists():
             cached: object = self.artifacts.read(artifact)

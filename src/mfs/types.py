@@ -397,6 +397,11 @@ class SearchResult[T]:
 
 @runtime_checkable
 class LegacyProcessor(Protocol):
+    """Keep per-file state in process locals; sniff must be fast and stateless.
+
+    sniff may run concurrently with process, outside its resource/concurrency grant.
+    """
+
     id: str
     version: str
     options: JSONValue
@@ -410,6 +415,11 @@ class LegacyProcessor(Protocol):
 
 @runtime_checkable
 class ContextProcessor(Protocol):
+    """Keep per-file state in context/work_dir; sniff must be fast and stateless.
+
+    sniff may run concurrently with process, outside its resource/concurrency grant.
+    """
+
     id: str
     version: str
     options: JSONValue

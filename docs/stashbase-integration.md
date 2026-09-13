@@ -1,6 +1,6 @@
 # StashBase 对接
 
-MFS 合同统一见 [设计](design.md)，完成情况见 [backlog](backlog.md)。StashBase checkout 本轮未修改；这里记录接入方式，不能视为应用已迁移。
+MFS 合同统一见 [设计](design.md)，完成情况见 [backlog](backlog.md)。这里描述接入合同；StashBase 的现有 daemon 尚未迁移。
 
 ## 实例与源身份
 
@@ -24,7 +24,7 @@ External 只记录原件指针，拒绝 upsert/remove；应用已有派生文件
 | 自行判断 MFS 文字是否可用，必要时 grep fallback | grep、read、search、已有逐文档状态 |
 | sibling/派生文件关系和旧规则导入 | namespace 有序规则及统一准入/读取资格 |
 
-搜原视频时，播放副本通过规则排除，Processor 提供原视频的转录文字。搜生成视频时，应用负责生成输入随原源更新/删除，再 sync。MFS 不自动推断两个独立文件的业务关系。
+例如 StashBase 将原视频转为可观看的视频，只想搜索后者：规则排除原视频，生成完成后 sync，MFS 的 Processor 从所接收的视频提取文字用于搜索。应用负责该生成视频随原源更新/删除。也可选择直接搜索原视频；输入选择由宿主决定。播放、展示 JSON 等应用产物不因存在就交给 MFS；ProcessedDocument.artifacts 是可选接口，仅在宿主需要 MFS 管理搜索相关附属文件时使用。
 
 ## Processor 适配
 
@@ -38,7 +38,9 @@ HTML 可以保留原 HTML grep、提取后索引。SourceMap 描述提取文字�
 
 以 Folder 中的 report.pdf 为例：MFS 的 sync 发现文件，worker 调用 StashBase 提供的 StashPdfProcessor.process(path, media_type, context)，这个方法执行 StashBase 的 PDF 提取并返回 ProcessedDocument；MFS 随后切片、embedding、发布。提取就在 process 里完成，没有调用完 Processor 以后再提取一次的步骤。
 
-Processor interface 与 ProcessingContext 已足够对接，item 9 不构成 MFS 待修复。StashBase 如何复用 Python 脚本或 Node 函数属于它自己的 Processor 实现；只有需要跨进程时才使用 context.run_process，不强制额外 helper。播放转码、Viewer 和应用调度的改接属于 INTEGRATION-001。
+Processor 与 ProcessingContext 承接搜索文字提取。StashBase 如何复用 Python 脚本或 Node 函数属于它自己的 Processor 实现；只有需要跨进程时才使用 context.run_process，不强制额外 helper。播放转码、Viewer 和应用调度的改接属于 INTEGRATION-001。
+
+Processor 不在实例字段保存当前文件的可变状态，使用局部变量或独立的 context/work_dir；sniff 必须快速、无状态且可与 process 并发。共享模型是否能并发调用另由 Adapter.concurrency 声明。
 
 Context 的取消、report_progress 和 checkpoint 都可选。应用 Processor 若按页/音频单元处理，可保存自己的中间文件，并从 resume_state/resume_files 继续；整体提取调用可以从头重跑。MFS 不自动拆 PDF/音频，也不要求先实现分段恢复才能接入。
 
@@ -64,7 +66,9 @@ JSON/HTML 要提供明确 Processor，内置 UTF-8 只声明 .md/.txt。旧 8 Mi
 
 search/grep 都有总等待期限；应用 RPC 预算还必须覆盖发送到 Python 前的排队。grep 与排名搜索执行槽独立，可在向量调用占满容量时继续精确检索。grep.failures 是逐文件不可读/暂时不可用的结构化信息，伴随 truncated=True；界面和 MCP 应展示部分结果，不能当成完整空结果。超时抛 WaitTimeout；调用方退出不代表 Adapter 已退出，资源和关闭仍须跟踪实际执行。
 
-当前 StashBase daemon 的同步 stdin handler 不能直接承载慢 sync/wait/search 与控制操作；迁移时按 request ID 做有界并发，串行写 stdout，并给状态、取消和宿主 grant 回调保留执行通路。全 Library fan-out 共用一次用户请求的 deadline，并明确部分失败和重叠 Folder 去重。
+现有 Node 调用可以并发发请求，但 Python daemon 按 stdin 顺序执行 handler；这个接入层的串行等待由应用改接处理，MFS 的搜索池无需再增加一层。迁移时按 request ID 做有界并发，串行写 stdout，并给状态、取消和宿主 grant 回调保留执行通路。全 Library fan-out 共用一次用户请求的 deadline，并明确部分失败和重叠 Folder 去重。
+
+daemon 退出时先调用 `close(timeout=...)`；返回成功才表示实际清理完毕。收到 WaitTimeout 后，宿主可在退出预算内继续等，或终止 daemon，重开执行现有恢复流程。后台阶段默认 300 秒，可通过 ExecutionPolicy.stage_timeout 调整；Processor 用 context.cancellation.remaining() 约束内部 I/O，Embedder 自身也应设置网络/模型调用超时。ExecutionTimeout 可显示为文件失败并允许重试；MFS 不在旧调用还活着时重复发起同文件执行。
 
 ## 规则与状态
 
