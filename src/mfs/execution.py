@@ -13,7 +13,8 @@ from .errors import InvalidConfiguration
 class ExecutionPolicy:
     """Bound stage concurrency and each of the ranked-search and grep pools.
 
-    Resource names may be shared with a host; adapter limits span both query pools.
+    Processor/Chunker resources may be shared with a host. Embedder calls use
+    only the worker/query pool capacities, without additional adapter limits.
     """
 
     workers: int = 4

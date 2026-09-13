@@ -727,9 +727,10 @@ class Lifecycle:
                 return False
             if namespace.get("processing_paused"):
                 return False
+            indexing = job["indexing"] if build else namespace["indexing"]
             if job["stage"] != "process" and (
                 "pending_manifest" in namespace
-                or (namespace["paused"] and namespace["indexing"] != "off")
+                or (namespace["paused"] and indexing != "off")
                 or (not build and identity.namespace in self.unavailable)
             ):
                 return False

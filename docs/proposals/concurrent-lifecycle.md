@@ -80,9 +80,9 @@ V2 的 Processor 抛异常后，在 finally 中退休实际调用。若最新目
 4. 阶段结束，私有产物落盘；短事务记录结果、后继阶段或错误。
 5. 归还线程和资源，保留该文件 active run，直到链完成或安全退休。
 
-等资源不能占着工作线程排队，也不能持 SQLite/Lifecycle/后端锁。查询 embedding 同样计入该模型的额度。Adapter 默认串行使用，明确声明线程安全和容量后才并行；本地模型内部线程、native 子进程也必须计入预算。
+等资源不能占着工作线程排队，也不能持 SQLite/Lifecycle/后端锁。Processor/Chunker 默认串行使用，明确声明线程安全和容量后才并行；本地处理的内部线程、native 子进程也必须计入预算。Embedder 不使用对象或资源额度，后台与查询各受自己的执行池限制，具体实现负责线程安全和服务约束。
 
-StashBase 当前 light=2、heavy=1，另外 classifier=4；这些是任务容量，不等于固定 OS 线程数。接入后播放、转录和 MFS 的本地模型由同一个容量所有者仲裁，不能 Node 和 Python 各自认为还有一个空闲 heavy。
+StashBase 当前 light=2、heavy=1，另外 classifier=4；这些是任务容量，不等于固定 OS 线程数。接入后播放、转录和 MFS Processor 的本地处理由同一个容量所有者仲裁，不能 Node 和 Python 各自认为还有一个空闲 heavy。
 
 推荐先沿用宿主的共享资源所有权：MFS 的本地 Admission Adapter 可替换为宿主 RPC Adapter。宿主可以请求转录暂时让出 heavy；这属于调度暂停，不设置用户取消门。实际调用退出或子进程确认终止后才归还额度，再执行播放。RPC 断开或等待超时不证明远端执行已停止，不能立即重发同一额度。
 

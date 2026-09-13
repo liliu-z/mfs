@@ -447,6 +447,13 @@ class Chunker(Protocol):
 
 @runtime_checkable
 class Embedder(Protocol):
+    """A concurrently callable embedding space shared by indexing and queries.
+
+    MFS bounds calls with its worker and query pools, without per-object or
+    resource admission for embedding. Implementations own thread safety and
+    any provider-specific rate limits or local model constraints.
+    """
+
     embedding_space: str
     dimension: int
 

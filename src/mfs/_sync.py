@@ -4,12 +4,14 @@ from __future__ import annotations
 import os
 import stat
 import unicodedata
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from ._platform import validate_windows_relative, windows_files
 from ._validation import suffix_for, validate_external_path
 from .errors import (
+    Closed,
     InvalidPath,
     MFSError,
     RootOverlap,
@@ -32,11 +34,15 @@ def _same(left: os.stat_result, right: os.stat_result) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
 
 
-def _case_sensitive(root: Path, descriptor: int) -> bool:
+def _case_sensitive(root: Path, descriptor: int, check: Callable[[], None]) -> bool:
     # Observe actual filesystem lookup, rather than lowercasing paths on every POSIX volume.
     with files.scandir(descriptor) as iterator:
-        names = [e.name for e in iterator]
+        names: list[str] = []
+        for entry in iterator:
+            check()
+            names.append(entry.name)
     for name in names:
+        check()
         swapped = name.swapcase()
         if swapped == name:
             continue
@@ -73,7 +79,7 @@ def _open_canonical(root_fd: int, relative: str) -> int:
         raise
 
 
-def _open_relative(root_fd: int, relative: str) -> tuple[int, str]:
+def _open_relative(root_fd: int, relative: str, check: Callable[[], None]) -> tuple[int, str]:
     current = os.dup(root_fd)
     actual: list[str] = []
     try:
@@ -81,8 +87,12 @@ def _open_relative(root_fd: int, relative: str) -> tuple[int, str]:
             return current, "."
         parts = relative.split("/")
         for index, name in enumerate(parts):
+            check()
             with files.scandir(current) as iterator:
-                entries = list(iterator)
+                entries: list[os.DirEntry[str]] = []
+                for entry in iterator:
+                    check()
+                    entries.append(entry)
             chosen = next((e.name for e in entries if e.name == name), None)
             if chosen is None:
                 try:
@@ -136,6 +146,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
     uncertain: set[str] = set()
     complete = True
     root_fd: int | None = None
+    check = mfs._calls.check
 
     def fail(relative: str, error: Exception) -> None:
         nonlocal complete
@@ -161,12 +172,14 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
         )
 
     try:
+        check()
         root = info.root.resolve(strict=True)
         if root == mfs._path or root in mfs._path.parents or mfs._path in root.parents:
             raise RootOverlap("external root and mfs_path overlap")
         root_fd = files.open(root, os.O_RDONLY | DIRECTORY | NOFOLLOW)
         root_identity = os.fstat(root_fd)
-        case_sensitive = _case_sensitive(root, root_fd)
+        case_sensitive = _case_sensitive(root, root_fd, check)
+        check()
 
         def key(value: str) -> str:
             return value if case_sensitive else unicodedata.normalize("NFD", value).casefold()
@@ -188,6 +201,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
         if not root_stable():
             raise SourceChanged("root changed before observation")
         with mfs._condition:
+            check()
             ns = dict(mfs._tasks.namespaces.get(namespace, {}))
             if ns.get("incarnation") != initial["incarnation"] or ns.get("root") != initial["root"]:
                 raise SourceChanged("namespace was replaced while opening its root")
@@ -203,6 +217,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
             }
 
         def validate_observation() -> None:
+            check()
             current = mfs._tasks.namespaces.get(namespace, {})
             if current.get("building", {}).get("generation") != ns.get("building", {}).get(
                 "generation"
@@ -215,6 +230,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
                 )
 
         def file(descriptor: int, relative: str, *, exact: bool) -> None:
+            check()
             if os.name == "nt" and not files.path(descriptor).is_relative_to(root):
                 fail(relative, SourceChanged("opened file moved outside the root"))
                 return
@@ -265,16 +281,18 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
                     None,
                     head=os.read(descriptor, 64 * 1024),
                 )
+                check()
                 staged = mfs._stage_descriptor(descriptor, root / relative)
+                check()
                 if not root_stable():
                     raise SourceChanged("root changed during observation")
                 # Reopen the canonical relative identity without following parent symlinks.
-                check = _open_canonical(root_fd, relative)
+                reopened = _open_canonical(root_fd, relative)
                 try:
-                    if not _same(os.fstat(check), os.fstat(descriptor)):
+                    if not _same(os.fstat(reopened), os.fstat(descriptor)):
                         raise SourceChanged("file identity changed during observation")
                 finally:
-                    os.close(check)
+                    os.close(reopened)
                 with mfs._condition:
                     validate_observation()
                     report = mfs._admit(identity, staged, selection=selection, force=force)
@@ -283,6 +301,8 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
             except UnsupportedMediaType:
                 nonmembers.add(relative)
                 skip(relative, "unsupported_media_type")
+            except Closed:
+                raise
             except Exception as error:
                 fail(relative, error)
             finally:
@@ -290,6 +310,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
                     mfs._remove_staging(staged.directory)
 
         def link(relative: str) -> None:
+            check()
             nonmembers.add(relative)
             try:
                 real = (root / relative).resolve(strict=True)
@@ -303,7 +324,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
                     return
                 if canonical in seen:
                     return
-                descriptor, actual = _open_relative(root_fd, canonical)
+                descriptor, actual = _open_relative(root_fd, canonical, check)
                 try:
                     if stat.S_ISREG(os.fstat(descriptor).st_mode):
                         file(descriptor, actual, exact=True)
@@ -320,13 +341,19 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
             )
 
         def walk(descriptor: int, relative_dir: str) -> None:
+            check()
             try:
                 if os.name == "nt" and not files.path(descriptor).is_relative_to(root):
                     raise SourceChanged("opened directory moved outside the root")
                 with files.scandir(descriptor) as iterator:
-                    entries = sorted(iterator, key=lambda e: e.name.encode())
+                    entries: list[os.DirEntry[str]] = []
+                    for entry in iterator:
+                        check()
+                        entries.append(entry)
+                entries.sort(key=lambda e: e.name.encode())
                 observed_directories.add(relative_dir)
                 for entry in entries:
+                    check()
                     relative = (
                         entry.name if relative_dir == "." else relative_dir + "/" + entry.name
                     )
@@ -378,7 +405,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
             elif requested != "." and candidate.is_symlink():
                 link(requested)
             else:
-                descriptor, actual_requested = _open_relative(root_fd, requested)
+                descriptor, actual_requested = _open_relative(root_fd, requested, check)
                 try:
                     metadata = os.fstat(descriptor)
                     if requested != "." and prune(actual_requested, stat.S_ISDIR(metadata.st_mode)):
@@ -399,6 +426,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
             nonmembers.add(actual_requested)
         except OSError as error:
             fail(requested, error)
+        check()
         if not root_stable():
             fail(".", SourceChanged("root changed during observation"))
         with mfs._condition:
@@ -414,6 +442,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
         nonmember_keys = {key(s) for s in nonmembers}
         protected_keys = {key(s) for s in protected}
         for identity in existing:
+            check()
             relative = identity.doc_id
             # Check path ancestors instead of scanning every observed directory
             # for every file in a large tree.

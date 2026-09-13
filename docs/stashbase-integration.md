@@ -102,7 +102,7 @@ MFS 单元/集成测试不能替代这些应用验收。
 
 StashBase 当前允许切换 embedding 来源：OpenAI、OpenRouter、账户服务；所查配置中的前两者使用固定默认模型 text-embedding-3-small，并没有据此发现任意模型选择器。首次配置 embedding 会触发 backfill；同一模型换 API key 不应重新计算已有向量（shared/embedding.ts 已明确此区别）。
 
-MFS 已有 configure_namespace(namespace, embedder=..., indexing="hybrid")，可以显式换模型/维度；open_namespace 的不匹配拒绝是防止重开时静默混用旧向量，不代表不允许更换。接入时按 embedding_space、dimension 和 Chunker 配置判断是否重建，不把凭据轮换或同空间的 API 路由切换算成新模型。全局设置改变时由 StashBase 为各 Folder 请求重建；文字提取仍有效，不重新 OCR/转录，索引重建期间继续使用有效活动代；strong 等待候选代，文字就绪后也可走 grep fallback。
+MFS 已有 configure_namespace(namespace, embedder=..., indexing="hybrid")，可以显式换模型/维度；open_namespace 的不匹配拒绝是防止重开时静默混用旧向量，不代表不允许更换。接入时按 embedding_space、dimension 和 Chunker 配置判断是否重建，不把凭据轮换或同空间的 API 路由切换算成新模型。全局设置改变时由 StashBase 为各 Folder 请求重建，新的配置请求自动替换旧候选，无需显式 cancel；文字提取仍有效，不重新 OCR/转录，索引重建期间继续使用有效活动代；strong 等待候选代，文字就绪后也可走 grep fallback。
 
 RECEIPT-002 已改为按当前目标等待，永久历史等待表已删除；源文字以前成功过，补向量尚未完成时 wait(sync(...)) 仍等待当前构建。StashBase daemon 尚未改接新库，其调用和结果映射仍为 INTEGRATION-001 的待实施工作。
 
@@ -120,7 +120,7 @@ SYNC-002 已修复：首次或 content sync 列目录后，文件 hash 校验使
 
 [多 Worker 与资源准入](design.md#多-worker-与资源准入)已启用：StashBase 的 Processor 可以在完成音频/页单元后调用 context.checkpoint；应用用 set_active_scopes 标出当前目录。MFS 先持久保存中间数据，等旧调用和子进程退出，再运行更紧急的可运行目标；恢复时提供 resume_state/resume_files。StashBase 的十分钟音频单元表示音频长度，不是执行耗时上限。
 
-MFS 默认 4 个文件 Worker、2 light/1 heavy 资源额度，Adapter 默认串行，具体实现类显式声明 concurrency 后才并发。宿主需通过 Admission 共享播放/转录/模型容量；Node 和 Python 各建一份 heavy=1 不构成共享。已发布文字的 grep 和已有索引的 eventual search 独立运行。重建/drop 等已经获准的查询真实退出后才破坏旧 collection，包括调用方已超时而 embedding 仍在运行的情况。
+MFS 默认 4 个文件 Worker，排名搜索和 grep 各有 4 个查询槽。Processor/Chunker 使用 2 light/1 heavy 资源额度，对象默认串行，具体实现类显式声明 concurrency 后才并发。宿主可通过 Admission 共享播放/转录的处理容量；Node 和 Python 各建一份 heavy=1 不构成共享。Embedder 不经过 MFS 的对象并发门或资源准入，由后台和查询各自的执行池限制调用数，实现负责线程安全和服务限流。已发布文字的 grep 和已有索引的 eventual search 独立运行。重建/drop 等已经获准的查询真实退出后才破坏旧 collection，包括调用方已超时而 embedding 仍在运行的情况。
 
 ## 过渡与查询等待
 

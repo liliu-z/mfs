@@ -87,7 +87,8 @@ class NamespaceRuntime:
             elif job["stage"] == "chunk":
                 adapter = binding.chunker
             elif job["stage"] == "embed":
-                adapter = binding.embedder
+                # Embedding is bounded by the worker pool, independently of queries.
+                return ResourceGrant(lambda: None)
         return self.acquire_adapter(adapter)
 
     def close(self) -> None:
@@ -208,13 +209,6 @@ class NamespaceRuntime:
     def embed_query(
         self, embedder: Embedder, text: str, deadline: SearchDeadline | None = None
     ) -> list[float]:
-        with self.lifecycle.condition:
-            while (lease := self.acquire_adapter(embedder)) is None:
-                if self.lifecycle.stopping:
-                    raise Closed("MFS instance is closing")
-                if deadline is not None:
-                    deadline.check()
-                self.lifecycle.condition.wait(0.05)
         try:
             if deadline is not None:
                 deadline.check()
@@ -223,8 +217,6 @@ class NamespaceRuntime:
             raise
         except Exception as error:
             raise EmbeddingFailed(f"query embedding failed: {error}") from error
-        finally:
-            lease.release()
 
     @staticmethod
     def matching_embedder(

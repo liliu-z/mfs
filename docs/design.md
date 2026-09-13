@@ -40,7 +40,7 @@ mfs-state/
 
 相同 dimension 不等于相同向量空间。声明与已保存清单或实际 collection schema 不一致时，绑定立即报错并指出差异；不能自动覆盖配置或暗中重建。实际向量输出继续检查数量、维度、有限数值。
 
-调用方可以显式向两个 namespace 传同一个对象；持久身份、规则和索引仍独立。模型调用不持有 MFS 状态锁；同一 Adapter 对象的 process/chunk/embedding 默认串行，额度覆盖后台和查询。只有具体实现类显式声明 concurrency 才允许并发；子类不继承父类的线程安全承诺。 Processor 的单文件可变状态放在局部变量或每次独立的 ProcessingContext/work_dir 中；共享模型和缓存自行保证线程安全。sniff 是快速、无状态的头部识别，不占 process 的资源/并发额度，可能与同对象的 process 同时调用。
+调用方可以显式向两个 namespace 传同一个对象；持久身份、规则和索引仍独立。模型调用不持有 MFS 状态锁。Embedder 允许后台与查询并发调用，不使用额外的对象并发门或资源准入；实现自行保证线程安全及具体模型/服务的限制。同一 Processor/Chunker 对象默认串行，只有具体实现类显式声明 concurrency 才允许并发，子类不继承此承诺。Processor 的单文件可变状态放在局部变量或每次独立的 ProcessingContext/work_dir 中；共享模型和缓存自行保证线程安全。sniff 是快速、无状态的头部识别，不占 process 的资源/并发额度，可能与同对象的 process 同时调用。
 
 有意更换 Processor/Chunker/Embedder 使用 configure_namespace 一次提交。reprocess_namespace 返回 ConfigurationReport，是强制处理的兼容入口；reindex 是阻塞等待的索引修复入口，两者走相同的候选代发布协议。configure_index 保留暂停和索引模式控制。源内容未变的索引重建保留有效文字；源已替换则不能恢复旧文字。迁移要有持久状态，失败可重试，不能把半完成配置作为活动配置。
 
@@ -112,7 +112,7 @@ wait(DocumentId)、wait(namespace, path=...) 和 wait(report) 跟随最新文件
 
 strong search 等目标配置及当前索引就绪，strong grep 只等当前文字；已删除文件的后台清理不会阻塞 strong。wait(report) 则包括物理清理，二者完成条件不同。派生文件、执行中的临时文件和读句柄有精确引用/pin，GC 可与不相关文件的处理并行，不删除 External 原件或借用文件。
 
-sync 只在成功观察的范围内确认缺失。root 不可访问不是完整空目录，不能据此批量删除。父子 namespace 独立；drop 父 namespace 不删外部目录，也不删除子 namespace。
+sync 只在成功观察的范围内确认缺失。root 不可访问不是完整空目录，不能据此批量删除。close 开始后，扫描在目录项、文件及哈希分块之间协作退出，返回 complete=False 和 Closed 失败；保留已接收变化，跳过剩余缺失推断，未观察文件留待下次完整 sync。已经阻塞的单次系统 I/O 仍须等待返回。父子 namespace 独立；drop 父 namespace 不删外部目录，也不删除子 namespace。
 
 ## 7. Namespace 规则与索引控制
 
@@ -136,7 +136,7 @@ namespace_configuration(namespace) 返回只读配置副本：namespace/kind/roo
 | hybrid | 构建 BM25 和 dense，必须绑定相容 Embedder |
 | paused | 暂停新增索引工作；源观察、必要文字处理、逻辑失效和旧代清理继续 |
 
-search(namespace, text, mode="bm25") 只选择这次查询通道，不会关闭后台 embedding。取消单文件也不等于 namespace 暂停。
+paused 按任务实际使用的索引模式生效，包括从 off 开启的候选代；off 的完成与清理不受索引暂停阻塞。search(namespace, text, mode="bm25") 只选择这次查询通道，不会关闭后台 embedding。cancel(DocumentId) 用于文件当前任务，不取消 namespace 配置；更换 Embedder 由 configure_namespace 自动使旧候选失效，无需先 cancel。取消单文件也不等于 namespace 暂停。
 
 ## 8. 搜索与读取
 
@@ -168,6 +168,8 @@ hybrid 在指定 namespace 的同一 collection 内对 BM25/dense 使用 RRF。R
 
 慢调用在状态锁外，提交在短事务内统一核验。执行模块不各自维护另一套目标或互相归并队列。
 
+处理缓存在生命周期锁内定位并 pin 元数据文件，文件读取、校验和 JSON 解析在锁外完成。返回前重新核对缓存条目及其引用文件的存续状态，再为引用取得覆盖本次处理的 pin；并发替换或 GC 使缓存失效时重新计算，旧读取失败不能删除后来替换的缓存条目。
+
 SQLite 使用最多 8 个连接的实例内池，查询/事务结束即归还，不绑定调用方线程寿命。嵌套事务复用当前租约，最外层提交或回滚；事务中不得调用适配器、访问外部文件或反向申请生命周期锁。文档枚举按 128 行键集分页，每页释放连接，读取方逐条复核版本与资格；不持数据库游标跨越 grep/Chunker 等用户代码。
 
 SQLite catalog schema 8 保存上述状态；元数据表结构可升级，但旧 namespace 需要调用方使用 migrate_namespace 显式提供适配器和索引模式。迁移撤销旧处理文字和索引，再从 Internal 原件或 External 原路径处理，不回放旧正文缓存。缺少可用原件或处理实现时明确报错。旧布局中的受管理文件在引用释放后由 GC 回收。
@@ -182,7 +184,7 @@ MFS 测试不等于 StashBase 已迁移。对接实际转换器、检索效果�
 
 ## 11. 内部职责与状态迁移
 
-Lifecycle 独占接收、领取、阶段提交、取消和资格状态；多个 Worker 共享这一份状态，执行模块不维护第二套队列。Preparation 负责算子和产物；Indexing 负责索引阶段；Configuration 负责候选代成员、切换和退休；IndexCleanup 负责版本精确的清理债务。NamespaceRuntime 统一模型/资源准入与 collection 路由。Reader 通过 ReadView 读取资格；ArtifactStore 管理引用与 GC。
+Lifecycle 独占接收、领取、阶段提交、取消和资格状态；多个 Worker 共享这一份状态，执行模块不维护第二套队列。Preparation 负责算子和产物；Indexing 负责索引阶段；Configuration 负责候选代成员、切换和退休；IndexCleanup 负责版本精确的清理债务。NamespaceRuntime 管理 Adapter 绑定、Processor/Chunker 资源准入与 collection 路由。Reader 通过 ReadView 读取资格；ArtifactStore 管理引用与 GC。
 
 ExecutionPermit 包含文件/namespace 身份、输入版本、配置代、active_run_id、attempt_token、取消信号和资源租约。Prepared/Chunked/Embedded/Published 等结果只交回 Lifecycle；统一的 finish_execution 在真实调用退出后提交或丢弃结果，最后退休租约。
 
@@ -222,7 +224,9 @@ POSIX run_process 由独立监督进程启动命令进程组，用管道 EOF 检
 
 ExecutionPolicy 默认 workers=4、queries=4、resources={"heavy":1,"light":2}；另有一个索引/配置维护线程和一个可关闭的 GC 线程。容量不是固定 OS 线程总数：Milvus/native 库还可能有自己的线程。调度先非阻塞申请完整资源，再持久领取阶段；等资源不占文件执行或 Worker。
 
-Adapter 可声明 workload="heavy"/"light"，或 resources 映射；未声明的外部算子默认 heavy=1。内置文本、DOCX、Chunker 使用 light，PDF 使用 heavy。远程服务可以显式 resources={}；同一对象的 concurrency 限制仍生效，默认 1。内置无状态文本/Chunker 允许并发，子类需重新声明。查询 embedding 和 grep Chunker 也使用相同 Adapter/资源额度。
+Processor/Chunker 可声明 workload="heavy"/"light"，或 resources 映射；未声明时默认 heavy=1。内置文本、DOCX、Chunker 使用 light，PDF 使用 heavy。远程处理可以显式 resources={}；同一对象的 concurrency 限制仍生效，默认 1。内置无状态文本/Chunker 允许并发，子类需重新声明。grep Chunker 与后台使用相同对象/资源额度。
+
+Embedder 的后台调用受 workers 限制，前台调用受排名搜索池 queries 限制；两者不共享额外额度，MFS 不读取 Embedder 的 concurrency、workload 或 resources 声明。共享 Embedder 对象或其他处理占满 heavy 资源不会因此阻塞查询 embedding。具体模型的串行要求、线程安全和服务限流由实现或宿主负责；查询超时后，实际调用仍保留查询槽和 collection 租约直到返回。
 
 LocalAdmission 可被同进程宿主共享；Admission.try_acquire(resources) 可由宿主替换，但必须非阻塞、一次全部获得。跨进程实现应通过预取/异步通知更新本地 grant，不能持 Lifecycle 锁做 RPC。归还发生在实际调用退出后，超时、断连、取消接收都不允许宿主重复发放仍在使用的额度。
 

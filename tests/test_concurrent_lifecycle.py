@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
@@ -23,7 +23,6 @@ from mfs import (
     TextMatch,
     UnderPath,
     Utf8TextProcessor,
-    WaitTimeout,
 )
 
 
@@ -209,23 +208,6 @@ def test_reopen_can_bind_active_and_candidate_independently(tmp_path: Path) -> N
         mfs.retry(DocumentId("n", "a.txt"))
         mfs.wait("n", 10)
         assert mfs.search("n", "persistent", mode="hybrid").items
-
-
-def test_query_model_capacity_wait_respects_caller_deadline(tmp_path: Path) -> None:
-    model = Model("shared")
-    with closing(MFS.open(tmp_path / "state")) as mfs:
-        mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()], embedder=model)
-        mfs.wait(mfs.upsert("n", "a.txt", b"existing"), 10)
-        model.entered.clear()
-        model.release.clear()
-        try:
-            mfs.upsert("n", "b.txt", b"pending")
-            assert model.entered.wait(5)
-            with pytest.raises(WaitTimeout):
-                mfs.search("n", "existing", mode="hybrid", timeout=0.05)
-        finally:
-            model.release.set()
-        mfs.wait("n", 10)
 
 
 def test_strong_grep_uses_candidate_text_without_waiting_for_embedding(tmp_path: Path) -> None:
@@ -456,11 +438,11 @@ def test_scan_opening_old_root_cannot_retarget_recreated_namespace(
         mfs.create_namespace("n", "external", old, processors=[Utf8TextProcessor()])
         original = _sync._case_sensitive
 
-        def delayed(root: Path, descriptor: int) -> bool:
+        def delayed(root: Path, descriptor: int, check: Callable[[], None]) -> bool:
             if root == old:
                 entered.set()
                 assert release.wait(10)
-            return original(root, descriptor)
+            return original(root, descriptor, check)
 
         monkeypatch.setattr(_sync, "_case_sensitive", delayed)
         scan = pool.submit(mfs.sync, "n")

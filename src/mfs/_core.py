@@ -1292,12 +1292,18 @@ class MFS:
 
     def _stage_descriptor(self, descriptor: int, source: Path) -> _Staged:
         for _ in range(2):
+            self._calls.check()
             before = os.fstat(descriptor)
             before_change = descriptor_change_time(descriptor)
             os.lseek(descriptor, 0, os.SEEK_SET)
             digest = blake3.blake3()
-            while block := os.read(descriptor, 1024 * 1024):
+            while True:
+                self._calls.check()
+                block = os.read(descriptor, 1024 * 1024)
+                if not block:
+                    break
                 digest.update(block)
+            self._calls.check()
             after = os.fstat(descriptor)
             if (before.st_size, before.st_mtime_ns, before_change) == (
                 after.st_size,

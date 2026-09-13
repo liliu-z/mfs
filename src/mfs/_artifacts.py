@@ -162,33 +162,43 @@ class ArtifactStore:
         return kind + ":" + blake3.blake3(canonical_json(value)).hexdigest()
 
     def cached(self, key: str) -> Any | None:
-        with self.lifecycle.condition:
-            return self._cached(key)
-
-    def _cached(self, key: str) -> Any | None:
         catalog = self.catalog
-        row = catalog.one(
+        query = (
             "SELECT cache.path,cache.digest FROM cache JOIN artifacts USING(path) "
-            "WHERE key=? AND state='live'",
-            (key,),
+            "WHERE key=? AND state='live'"
         )
-        if row is None:
-            return None
+        with self.lifecycle.condition:
+            row = catalog.one(query, (key,))
+            if row is None:
+                return None
+            lease = self.pin(str(row[0]))
         try:
-            self.protect(str(row[0]))
             path = self.path(str(row[0]))
             data = path.read_bytes()
             if blake3.blake3(data).hexdigest() != row[1]:
                 raise CorruptState("cached artifact checksum mismatch")
             value = load_json(data.decode("utf-8"))
-            if isinstance(value, dict):
-                for reference in self.catalog.references(value):
+            references: set[str] = catalog.references(value) if isinstance(value, dict) else set()
+            with self.lifecycle.condition:
+                # The cache may have been replaced, or its payload files collected,
+                # while the immutable metadata was being read outside the lock.
+                if catalog.one(query, (key,)) != row:
+                    return None
+                for reference in references:
+                    state = catalog.one("SELECT state FROM artifacts WHERE path=?", (reference,))
+                    if state is None or state[0] != "live":
+                        raise SourceUnavailable("cached artifact is no longer live")
+                for reference in references:
                     self.protect(reference)
             return value
         except (CorruptState, SourceUnavailable, OSError, ValueError):
             with catalog.transaction():
-                catalog.execute("DELETE FROM cache WHERE key=?", (key,))
+                catalog.execute(
+                    "DELETE FROM cache WHERE key=? AND path=? AND digest=?", (key, *row)
+                )
             return None
+        finally:
+            lease.release()
 
     def cache(self, key: str, path: str) -> None:
         catalog = self.catalog

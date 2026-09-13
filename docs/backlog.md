@@ -9,6 +9,10 @@
 - [x] **STORAGE-005** SQLite 最多 8 个连接，按查询/事务借用；调用线程退出无需宿主回收，流式读取不跨调用方处理持有连接。
 - [x] **TIMEOUT-005** 后台阶段默认 300 秒，到期失败并拒绝迟到提交；close 默认等待 30 秒，超时后继续清理并保留实例锁。进程内不可中断调用由宿主终止 daemon 回收。
 - [ ] **BACKEND-005** Milvus Lite 3.2.1 的 BM25 按 segment 计算 IDF/avgdl，排名受 flush 边界影响；等待上游修复，不在 MFS 自建 BM25。确定性后端一致性测试保留为严格 xfail，升级后必须重新验收。
+- [x] **CACHE-006** 处理缓存 I/O 移出生命周期锁；返回前复核条目与引用并取得 pin，GC/替换竞争退回重算。
+- [x] **PAUSE-006** 候选索引按实际模式遵守暂停；off → bm25/hybrid 等待恢复，关闭索引仍可清理完成。
+- [x] **SCAN-006** sync 在目录项和 hash 分块间响应 close，返回 incomplete，保留未观察文件。
+- [x] **EMBED-006** Embedder 移除对象并发门与资源准入；后台和查询各自受执行池限制，实现负责线程安全及服务约束。
 
 ## 本轮实现
 
@@ -104,7 +108,7 @@ StashBase 本身未作修改。INTEGRATION-001、实际冻结打包、真实 OCR
 用户确认全部实施，并明确保留字段。当前 MFS 库侧实现：
 
 - [x] **STATE-004 / item 1、4** latest target 合并与持久 active_runs；保留 active_run_id、stage/state、attempts、attempt_token。旧调用退出后执行最新目标，旧算子失败不污染新版本；同文件顺序，不同文件并行。
-- [x] **EXECUTION-004** 默认 4 Worker、4 查询槽，heavy=1/light=2；先原子申请资源再领取阶段。Adapter 默认串行，具体实现类声明 concurrency 后并发；查询与后台共用额度。非阻塞 Admission 支持宿主共享容量，超时不释放实际调用的资源。
+- [x] **EXECUTION-004** 默认 4 Worker、4 查询槽，heavy=1/light=2；Processor/Chunker 先原子申请资源再领取阶段，对象默认串行，具体实现类声明 concurrency 后并发。非阻塞 Admission 支持宿主共享容量，超时不释放实际调用的资源。Embedder 仅受执行池限制，见 EMBED-006。
 - [x] **ADMISSION-004 / item 1** Internal 完整落盘再提交 SQLite；复制/待提交文件有 GC pin，原件 rename/fsync 在生命周期锁外。新建父目录同步，后来的 upsert/remove/reprocess 不被旧复制覆盖，丢确认按持久目标核对。External 不保存历史 bytes，不将新内容按旧 hash 缓存。
 - [x] **CONFIG-004 / item 2** configure_namespace 一次合并 Processor/Chunker/Embedder/模式变化；有效文字与兼容切片可复用。G0 服务、G1 全员完成后切换；失败/取消保留旧配置。重启可分别绑定两套实现，连续变更只保留最新候选，退休代有界。旧查询捕获匹配的模型与 publication，真实退出后才清理；后台 collection 创建/退休也参与 namespace 执行屏障。
 - [x] **SYNC-005 / item 3** protected/nonmember 集合与有限祖先查询消除剩余 O(N²) 检查；使用已有 SQLite namespace/path 索引，不维护第二份完整树。同 namespace 扫描串行，跨 namespace 并行；遍历/hash 不持全局 mutation 锁，提交复核 incarnation、root、绑定、规则与候选代，旧扫描不删除后来接收的目标。

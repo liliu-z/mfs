@@ -5,7 +5,7 @@ import threading
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import ClassVar, Literal
+from typing import Literal
 
 import pytest
 from test_lifecycle import GateEmbedder
@@ -118,14 +118,10 @@ def test_timeout_during_backend_does_not_start_next_hybrid_channel(
             mfs.close()
 
 
-def test_timed_out_adapters_keep_concurrency_slots_and_admission_has_same_deadline(
+def test_timed_out_queries_keep_pool_slots_and_admission_has_same_deadline(
     tmp_path: Path,
 ) -> None:
-    class ParallelQuery(SlowQuery):
-        concurrency = 4
-        resources: ClassVar[dict[str, int]] = {}
-
-    embedder = ParallelQuery()
+    embedder = SlowQuery()
     mfs = MFS.open(tmp_path / "state")
     with ThreadPoolExecutor(max_workers=4) as pool:
         try:
