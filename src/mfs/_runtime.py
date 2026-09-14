@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import copy
 import math
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from ._backend_deadlines import BackendDeadlines, MaintenanceDeadline
 from ._index import ChunkIndex
 from ._lifecycle import Lifecycle
 from ._namespace import NamespaceBinding
@@ -37,13 +38,27 @@ class NamespaceRuntime:
         self.lifecycle = lifecycle
         self.bindings: dict[str, NamespaceBinding] = {}
         self.build_bindings: dict[tuple[str, str], NamespaceBinding] = {}
+        lifecycle.bound = self.bindings
         lifecycle.generation_bindings = self.build_bindings
         lifecycle.state_reconciled = self.reconcile_bindings
         self.collections: dict[str, ChunkIndex] = {}
         self.index_errors: set[str] = set()
+        lifecycle.unavailable = self.index_errors
         self.legacy_index = ChunkIndex(path / "milvus.db")
+        self.deadlines = BackendDeadlines(
+            lifecycle.condition, lifecycle.stage_timeout, lambda: lifecycle.stopping
+        )
+        lifecycle.maintenance_expiry = self.deadlines.expire
         self.admission = admission or LocalAdmission((policy or ExecutionPolicy()).resources)
         self._adapter_used: dict[int, int] = {}
+
+    @contextmanager
+    def maintenance(self, expired: Callable[[], None]) -> Generator[MaintenanceDeadline]:
+        with (
+            self.deadlines.operation(expired) as deadline,
+            self.legacy_index.client.deadline(deadline),
+        ):
+            yield deadline
 
     def acquire_adapter(self, adapter: object | None) -> ResourceLease | None:
         """Called under Lifecycle.condition; neither adapter nor host may block here."""

@@ -426,7 +426,10 @@ def test_rebuild_supersession_and_lost_ack_activate_only_latest_manifest(
                 nonlocal ack_lost
                 with transaction():
                     yield
-                if threading.current_thread().name == "mfs-configurations" and not ack_lost:
+                if (
+                    threading.current_thread().name.startswith("mfs-configurations-")
+                    and not ack_lost
+                ):
                     record = mfs._catalog.get_namespace("n")
                     if record and record["manifest"]["index"]["dense"]["dimension"] == 4:
                         ack_lost = True

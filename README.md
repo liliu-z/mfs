@@ -100,8 +100,12 @@ mfs.wait(change, timeout=30)
 
 重启后通过 `namespace_configuration` 读取 `active_revision/pending_revision` 和两份清单，分别用 `open_namespace(..., configuration_revision=...)` 绑定。绑定验证期间若发生配置切换，会报 `NamespaceCompatibilityError`，重新读取当前配置后再绑定。配置成员在后台分批补齐；`pending_error/pending_failures/pending_retry_at` 描述候选配置的维护故障，达到 5 次后停止自动重试，重新提交相同配置可恢复。取消不会删除源；普通 sync 即使发现新内容也保持取消，只有显式 retry/reprocess 恢复。
 
-`grep(..., consistency="strong", timeout=5)` 只等待文字准备，embedding 失败不会阻止已准备文字。删除接收后 strong 查询立即过滤；`wait(删除报告)` 仍等待后台物理清理。`DocumentStatus` 保留 `active_run_id`、`attempt_token`、`attempts`、`stage/state` 和 `cleanup_pending`。
+`grep(..., consistency="strong", timeout=5)` 只等待文字准备，embedding 失败不会阻止已准备文字。删除接收后 strong 查询立即过滤；`wait(删除报告)` 仍等待后台物理清理。`DocumentStatus` 保留 `active_run_id`、`attempt_token`、`attempts`、`stage/state` 和 `cleanup_pending`；`blocking_reason` 区分缺绑定、暂停、资源等待和旧执行退出等原因。缺 Adapter 绑定的 wait 明确报 blocked，补 open_namespace 后可继续。
 
 grep 的 timeout 同样覆盖排队、读取、匹配、来源定位和 Chunker 的总等待；超时抛 `WaitTimeout`。grep 与排名搜索各有独立的有界执行池，容量均由 `ExecutionPolicy.queries` 控制；已超时但未退出的调用仍占用其池和实际资源。单个文件丢失、被替换为链接/特殊文件或暂时 quiesce 时，grep 返回其他命中，并设置 `truncated=True` 和 `failures: tuple[GrepFailure, ...]`；调用方应展示部分结果，不能解释为完整无结果。已知文件的 read 仍直接报告读取错误。
 
 宿主有未完成的磁盘事务时，可用 `MFS.open(state, start_paused=True)` 禁止后台执行及 GC；读取宿主持久日志、恢复磁盘操作、确认相关 sync 完整接收后调用 `resume_background()`。启动门不替代宿主日志，不能在 quiesce 内等待索引。详见 [并发与恢复合同](docs/design.md)。
+
+配置切换支持部分发布：成功文件使用新模型的索引，失败和取消文件保留状态，显式 retry 可补齐；不同模型的向量不会混用。若新代没有任何成功文件，已有可用索引继续服务。部分发布时整个 namespace 的 wait/strong 仍会报告失败，eventual 可使用已成功文件。
+
+索引维护使用两个有界线程，同一 namespace 的管理操作串行，不同 collection 可并行。collection 调用锁与维护执行在实际后端退出前保留；stage_timeout 也覆盖 collection 创建、加载、退休和独立清理。首次初始化中断可凭自有标记重开恢复，未知非空目录仍会被拒绝。

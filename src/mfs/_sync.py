@@ -160,6 +160,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
 
     def result() -> SyncReport:
         removed.difference_update(changed)
+        affected = seen | {i.doc_id for i in changed | removed}
         return SyncReport(
             namespace,
             report_path,
@@ -169,6 +170,15 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
             tuple(failures[k] for k in sorted(failures)),
             tuple(skipped[k] for k in sorted(skipped)),
             mfs._is_ready(),
+            tuple(
+                sorted(
+                    p
+                    for p in affected
+                    if report_path != "."
+                    and p != report_path
+                    and not p.startswith(report_path + "/")
+                )
+            ),
         )
 
     try:
@@ -208,6 +218,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
             if ns.get("root_actual") != str(root):
                 removed.update(mfs._tasks.retarget_root(namespace, str(root)))
                 requested = "."  # A new root target changes membership for the whole namespace.
+                report_path = "."
                 ns = dict(mfs._tasks.namespaces[namespace])
             baseline = {
                 doc: revision
@@ -310,6 +321,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
                     mfs._remove_staging(staged.directory)
 
         def link(relative: str) -> None:
+            nonlocal report_path
             check()
             nonmembers.add(relative)
             try:
@@ -325,6 +337,8 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
                 if canonical in seen:
                     return
                 descriptor, actual = _open_relative(root_fd, canonical, check)
+                if relative == requested:
+                    report_path = actual
                 try:
                     if stat.S_ISREG(os.fstat(descriptor).st_mode):
                         file(descriptor, actual, exact=True)
@@ -406,6 +420,7 @@ def sync_namespace(mfs: MFS, namespace: str, path: str, *, verify: str, force: b
                 link(requested)
             else:
                 descriptor, actual_requested = _open_relative(root_fd, requested, check)
+                report_path = actual_requested
                 try:
                     metadata = os.fstat(descriptor)
                     if requested != "." and prune(actual_requested, stat.S_ISDIR(metadata.st_mode)):

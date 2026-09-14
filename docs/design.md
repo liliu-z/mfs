@@ -24,6 +24,8 @@ mfs-state/
       work/            临时工作文件
 ```
 
+首次初始化在创建锁文件和 catalog 前持久建立 `.mfs-initializing` 标记，schema 提交后移除。初始化被异常或进程终止打断时，重开可恢复带标记的自有空状态；已有无关文件或不认识的 SQLite schema 仍报 CorruptState，不自动删除用户内容。
+
 打开已有实例不自动创建外部模型。每个 namespace 成功绑定执行器后，其需要执行器的任务才能继续；状态读取、删除和读取有效已保存文字不需要模型。一个 namespace 绑定失败不改变其他 namespace。
 
 ## 2. 外部实现与兼容性
@@ -100,13 +102,13 @@ External 不保存历史 bytes。处理可能碰到更新后的原路径；Sourc
 
 每个阶段完成都更新 SQLite。可重试故障按阶段指数退避，最多 5 次；永久失败直接 failed，缺能力为 blocked。 ExecutionPolicy.stage_timeout 默认 300 秒（有限正数），从阶段领取开始计时，覆盖 process/chunk/embed 及 Worker 的后端阶段。独立期限线程将超时目标持久标记为 failed / ExecutionTimeout，撤销 attempt 的提交资格；协作检查点和 run_process 同时检查期限。超时不自动重试，显式 retry 仍须等待旧调用真实退出；崩溃恢复保留已持久失败。准备、embedding、写入及完成边界再次检查，丢弃迟到结果。相同内容的 sync 不重试失败；新内容是新目标，有自己的失败预算。状态包含当前阶段、attempts、实际 executing、active_run_id/attempt_token、错误及 cleanup_pending。当前状态可轮询，不要求用户确认回执，也不保存每次调用的历史队列。
 
-wait(DocumentId)、wait(namespace, path=...) 和 wait(report) 跟随最新文件/范围，包含配置构建和物理清理。ConfigurationReport 同样可等待；它不是历史完成凭证。failed/blocked/cancelled 抛 OperationFailed，不完整扫描报告观察失败，存储无法核对立即抛 StorageFailed，超时只终止等待。显式 idempotency_key 仍去重接收，不覆盖后来文件状态。
+wait(DocumentId)、wait(namespace, path=...) 和 wait(report) 跟随最新文件/范围，包含配置构建和物理清理。ConfigurationReport 同样可等待；它不是历史完成凭证。failed/blocked/cancelled 抛 OperationFailed，不完整扫描报告观察失败，存储无法核对立即抛 StorageFailed，超时只终止等待。显式 idempotency_key 仍去重接收，不覆盖后来文件状态。SyncReport.path 使用实际 canonical 范围，wait_paths 补充经文件别名观察到的范围外目标；即使内容未变化，wait(report) 也等待这些当前目标。root 重定向导致全量观察时，报告范围同步扩大到 `.`。
 
 ## 6. 替换、删除与可见性
 
 源替换、删除或规则排除在接收事务中撤销旧文字及索引资格。新源处理失败不回退旧 PDF。后台先写特定 collection/snapshot 的完整行，再由 SQLite 校验输入版本、namespace incarnation、配置代、active run 和 attempt 后发布。后端写完但发布未提交的行不可见，恢复可按稳定行 ID 重放。
 
-删除责任独立于最新文件目标，按 incarnation、collection generation、DocumentId、snapshot 精确记录。旧清理失败不会把新源任务标成失败，也不能宽范围删除新版本。清理失败有独立退避/错误；retry(DocumentId) 可重启关联清理。namespace 退休清理失败另记在 namespace_configuration，文件处理继续；资源上限可能暂缓再建下一代。
+删除责任独立于最新文件目标，按 incarnation、collection generation、DocumentId、snapshot 精确记录。旧清理失败不会把新源任务标成失败，也不能宽范围删除新版本。清理失败有独立退避/错误；retry(DocumentId) 可重启关联清理。collection 删除成功且旧调用实际退出后，在退休/删除完成事务中结清对应 incarnation/generation 的全部 snapshot 清理责任，包括重试耗尽的记录；重开补齐旧版本已经成功 drop 的收尾。同名新 namespace 的文件等待和 cleanup_pending 不继承旧 incarnation 的责任，显式 DropReport 仍等待旧删除工作。namespace 退休清理失败另记在 namespace_configuration，文件处理继续；资源上限可能暂缓再建下一代。
 
 查询捕获活动 collection、相应 Embedder 和 publication/input_version。返回前核对输入仍是当前成员，删除/规则排除立即过滤；同输入的配置切换不让已经开始的旧查询混用新模型。真实查询退出前保留原 collection，调用方超时不是退出。过滤失效结果后在候选预算内补取。
 
@@ -148,11 +150,11 @@ grep 的 timeout 同样是总等待预算，包含排队、文字就绪、读取
 
 search 默认 consistency="eventual"、timeout=5.0 秒。eventual 查询当前有效索引，允许结果尚未补齐，但不能返回已失效旧源。显式 strong 目前等待指定的这一个 namespace 的索引工作。timeout 是调用方搜索的总等待预算，包含查询执行容量等待、一致性等待、query embedding、Milvus 调用、候选扩充及合并。到期抛 WaitTimeout；None 不设期限，0 立即超时。grepping 文字不需要等待 embedding。目录级 strong 尚未实现，讨论方案见下文。
 
-SearchExecution 使用单调时钟建立一个 deadline；等待和阶段边界复用它，取得串行后端锁后重新核对并向 Milvus 传递剩余时间。排名搜索和 grep 各使用独立的有界执行池，容量分别为 ExecutionPolicy.queries（默认各 4），并与后台文件 Worker 池分开；向量查询占满槽位不占用 grep 的执行槽。超时调用返回后，尚未退出的 Adapter 继续占用容量及资源租约，返回后丢弃结果，不执行后续阶段，避免连续超时无限增加线程或任务。close(timeout=30) 立即关闭请求准入，由唯一清理线程取消执行、等待实际调用/读句柄退出，再关闭存储。调用方等待超时抛 WaitTimeout，清理继续，实例锁和资源在真实退出前不释放；再次 close 等同等待同一次清理，timeout=None 可无限等待。不能强杀不响应取消的 Python Adapter；需要硬退出时由宿主终止 MFS 进程。
+SearchExecution 使用单调时钟建立一个 deadline；等待和阶段边界复用它，等待 collection 调用锁和进入/退出后端时重新核对期限。当前固定版本 Milvus Lite 的进程内 gRPC handler 不响应取消，所以不使用会先于实际 handler 退出的 RPC timeout；MFS 的调用方 deadline 独立结束等待，后端调用实际返回后才释放 collection 锁与查询租约。排名搜索和 grep 各使用独立的有界执行池，容量分别为 ExecutionPolicy.queries（默认各 4），并与后台文件 Worker 池分开；向量查询占满槽位不占用 grep 的执行槽。超时调用返回后，尚未退出的 Adapter 继续占用容量及资源租约，返回后丢弃结果，不执行后续阶段，避免连续超时无限增加线程或任务。close(timeout=30) 立即关闭请求准入，由唯一清理线程取消执行、等待实际调用/读句柄退出，再关闭存储。调用方等待超时抛 WaitTimeout，清理继续，实例锁和资源在真实退出前不释放；再次 close 等同等待同一次清理，timeout=None 可无限等待。不能强杀不响应取消的 Python Adapter；需要硬退出时由宿主终止 MFS 进程。
 
 hybrid 在指定 namespace 的同一 collection 内对 BM25/dense 使用 RRF。Reader 只打开该 namespace 的检索路由，一次查询只计算一次 query embedding；不提供跨 namespace 路由、分数比较或结果合并。宿主若有多个 Folder 的产品入口，由宿主明确组织各自范围和结果，MFS 不赋予它们统一排名。
 
-使用 document_status、list_document_statuses、scope_status 读取当前状态。StashBase 自行判断文字是否可用并选择自己的 grep fallback；不新增 ready 订阅或额外范围就绪系统。
+使用 document_status、list_document_statuses、scope_status 读取当前状态。DocumentStatus.blocking_reason 在不改变持久任务 state 的前提下说明当前阻塞：binding、background_paused、processing_paused、indexing_paused、resources、retiring、quiescence、configuration、index_unavailable、retry_backoff；正常执行或完成时为空。resources 表示最近一次调度准入未取得 Adapter/资源额度。活动代缺绑定时，普通 wait 与 strong 文字等待都报 OperationFailed(state="blocked")，补 open_namespace 后自然恢复；暂停和可自行解除的排队继续按调用方预算等待。StashBase 自行判断文字是否可用并选择自己的 grep fallback；不新增 ready 订阅或额外范围就绪系统。
 
 ## 9. 内部职责与迁移
 
@@ -226,7 +228,7 @@ POSIX run_process 由独立监督进程启动命令进程组，用管道 EOF 检
 
 ### 多 Worker 与资源准入
 
-ExecutionPolicy 默认 workers=4、queries=4、resources={"heavy":1,"light":2}；另有一个索引/配置维护线程和一个可关闭的 GC 线程。容量不是固定 OS 线程总数：Milvus/native 库还可能有自己的线程。调度先非阻塞申请完整资源，再持久领取阶段；等资源不占文件执行或 Worker。
+ExecutionPolicy 默认 workers=4、queries=4、resources={"heavy":1,"light":2}；另有两个索引/配置维护线程和一个可关闭的 GC 线程。维护按 namespace 公平选择，同一 namespace 同时只有一个维护所有者；不同 collection 的 Milvus 调用可并行，同一 collection 的调用继续互斥，以满足 Milvus Lite 3.2.1 的单 writer 约束。配置创建/加载、旧代销毁及 snapshot 清理均受 stage_timeout 监督，超时公开故障并停止自动重试，实际退出前保留维护槽和 namespace 占用，迟到创建不能晋升。状态锁仅保护领取、版本复核和提交。容量不是固定 OS 线程总数：Milvus/native 库还可能有自己的线程。调度先非阻塞申请完整资源，再持久领取阶段；等资源不占文件执行或 Worker。
 
 Processor/Chunker 可声明 workload="heavy"/"light"，或 resources 映射；未声明时默认 heavy=1。内置文本、DOCX、Chunker 使用 light，PDF 使用 heavy。远程处理可以显式 resources={}；同一对象的 concurrency 限制仍生效，默认 1。内置无状态文本/Chunker 允许并发，子类需重新声明。grep Chunker 与后台使用相同对象/资源额度。
 
@@ -236,7 +238,7 @@ LocalAdmission 可被同进程宿主共享；Admission.try_acquire(resources) �
 
 checkpoint 仍持久保存恢复数据，并可在当前目录更紧急的任务到达时协作让出。set_active_scopes 和等待老化决定优先级，后台老化最多提升到 active-folder，不能超过显式交互任务；阶段结束归还资源。长任务应在有界单元后 checkpoint。普通 Python/native 调用不能强杀；需要协作取消或 run_process 的进程监督。
 
-### 配置一次接收、候选代完整切换
+### 配置一次接收、候选代原子切换与部分发布
 
 configure_namespace(namespace, processors=..., chunker=..., embedder=..., indexing=...) 原子接收目标清单，返回 ConfigurationReport。比较兼容描述与模式，相同配置只换绑定。仅 Embedder 变动复用文字和兼容切片；Chunker 变动重切片；Processor 变化只重做受影响格式。reprocess_namespace 强制重处理，reindex 强制重建索引，两者复用同一协议。
 
@@ -246,7 +248,7 @@ configure_namespace(namespace, processors=..., chunker=..., embedder=..., indexi
 
 grep_path 与内存索引文字并用时，已发布后的临时文字可释放。重开或配置变更需要该文字时，先退休 chunk/embed 阶段，再以 process 阶段重新申请 Processor/concurrency/资源额度；不能在切片或 embedding 的租约内直接运行 Processor。临时文字释放与同文件下一次执行领取受同一生命周期锁保护。
 
-G0 继续服务，G1 保存私有文字/索引。源变动更新两代的期望成员；同文件仍顺序执行。当前可用成员在 G1 成功后切换；已取消且两代均无有效准备文字的输入可以保持 cancelled 随新配置切换，不阻止其他文件获得新索引能力。存在准备文字的取消成员以及失败成员仍阻止切换，保留 G0。用户取消门始终保留，按文件/范围的 wait 仍报告取消，显式 retry 才恢复该输入。strong grep 可读取 G1 已完成的文字，不依赖其向量成功；eventual grep 留在 G0。
+G0 继续服务，G1 保存私有文字/索引。源变动更新两代的期望成员；同文件仍顺序执行。所有当前成员到达 succeeded/failed/blocked/cancelled 且实际执行退出后，原子切换到 G1，只发布成功成员；失败和取消成员保留阶段、错误、准备文字及取消门，显式 retry 在新活动代补齐。不同模型/维度的向量不跨 collection 混合。首次启用新能力不被单个坏文件卡住；替换已有可用索引时，若 G1 没有任何成功成员，则保留 G0，等待用户修复或重试；关闭索引不受这一保护阻塞。部分发布不等于整个 namespace Ready，按文件/范围的 wait 和 strong 仍报告所选失败或取消，eventual 可使用成功成员。strong grep 可读取 G1 已完成的文字，不依赖其向量成功；eventual grep 留在 G0。
 
 configure_index 比较最新候选（无候选时比较 active），只改 paused 不覆盖候选模式；关闭后再开启同样以最后请求为准。开启自动追赶已接收输入，不触发 External sync；关闭保留准备文字，排名索引异步清理。再次改配置时只保留最新候选；过时调用在阶段边界和协作检查点提前退出；旧在途调用真实退出后才继续同文件。最多一个 active、一个 building，以及有界的 retiring generations；两代尚不能退休时暂停新 collection 创建。切换事务同时更新配置、collection 和 publication；提交后确认丢失也必须采用已持久配置对应的绑定。
 

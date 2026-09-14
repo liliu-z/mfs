@@ -18,6 +18,18 @@ type TaskStage = Literal["process", "chunk", "embed", "publish", "delete", "drop
 type TaskState = Literal[
     "pending", "running", "retry_wait", "failed", "blocked", "cancelled", "succeeded"
 ]
+type BlockingReason = Literal[
+    "binding",
+    "background_paused",
+    "processing_paused",
+    "indexing_paused",
+    "resources",
+    "retiring",
+    "quiescence",
+    "configuration",
+    "index_unavailable",
+    "retry_backoff",
+]
 type SnapshotId = str
 type SyncSkipReason = Literal[
     "excluded", "too_large", "symlink", "special_file", "unsupported_media_type"
@@ -153,6 +165,7 @@ class SyncReport:
     failed: tuple[SyncFailure, ...]
     skipped: tuple[SyncSkipped, ...]
     index_ready: bool
+    wait_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +205,7 @@ class DocumentStatus:
     attempt_token: str | None = None
     cleanup_pending: bool = False
     configuration_revision: str | None = None
+    blocking_reason: BlockingReason | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -5,14 +5,17 @@ from __future__ import annotations
 import json
 import math
 import threading
-from collections.abc import Iterable, Sequence
+from collections.abc import Generator, Iterable, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal, NotRequired, TypedDict
+from weakref import WeakValueDictionary
 
 import blake3
 from milvus_lite.server_manager import server_manager_instance
 from pymilvus import DataType, Function, FunctionType, MilvusClient
 
+from ._backend_deadlines import Deadline
 from ._search_execution import SearchDeadline
 from .errors import IndexFailed
 from .types import DocumentId
@@ -87,11 +90,52 @@ def index_config(chunker: dict[str, object], dense: dict[str, object] | None) ->
 
 
 class _SerializedClient:
-    """Serialize native backend calls without holding Lifecycle or model capacity."""
+    """Serialize calls per collection while independent collections overlap.
+
+    Milvus Lite 3.2.1 adapter/grpc/server.py requires single-writer use per
+    collection. Protect reads too, including lazy collection opening. Connection
+    closure drains all calls across collection handles.
+    """
 
     def __init__(self, client: Any) -> None:
         self._client = client
         self._lock = threading.RLock()
+        self._owner = self
+        self._condition = threading.Condition()
+        self._locks: WeakValueDictionary[str, Any] = WeakValueDictionary()
+        self._locks[COLLECTION] = self._lock
+        self._local = threading.local()
+        self._active = 0
+        self._closed = False
+
+    def collection(self, name: str) -> _SerializedClient:
+        handle = object.__new__(_SerializedClient)
+        handle._client = self._client
+        handle._owner = self._owner
+        with self._owner._condition:
+            lock = self._owner._locks.get(name)
+            if lock is None:
+                lock = threading.RLock()
+                self._owner._locks[name] = lock
+            handle._lock = lock
+        return handle
+
+    @contextmanager
+    def deadline(self, deadline: Deadline) -> Generator[None]:
+        local = self._owner._local
+        previous = getattr(local, "deadline", None)
+        local.deadline = deadline
+        try:
+            yield
+        finally:
+            local.deadline = previous
+
+    def close(self) -> None:
+        owner = self._owner
+        with owner._condition:
+            owner._closed = True
+            owner._condition.wait_for(lambda: owner._active == 0)
+        owner._client.close()
 
     def __getattr__(self, name: str) -> Any:
         attribute = getattr(self._client, name)
@@ -99,17 +143,36 @@ class _SerializedClient:
             return attribute
 
         def invoke(*args: Any, **kwargs: Any) -> Any:
-            deadline: SearchDeadline | None = kwargs.pop("_deadline", None)
-            if deadline is None:
-                with self._lock:
-                    return attribute(*args, **kwargs)
-            while not self._lock.acquire(timeout=0.05):
-                deadline.check()
+            deadline: Deadline | None = kwargs.pop("_deadline", None) or getattr(
+                self._owner._local, "deadline", None
+            )
+            owner = self._owner
+            with owner._condition:
+                if owner._closed:
+                    raise IndexFailed("backend client is closed")
+                owner._active += 1
             try:
-                kwargs["timeout"] = deadline.remaining()
-                return attribute(*args, **kwargs)
+                while not self._lock.acquire(timeout=0.05):
+                    if deadline is not None:
+                        deadline.check()
+                try:
+                    if deadline is not None:
+                        deadline.check()
+                        # Lite's in-process gRPC handlers ignore cancellation. A wire
+                        # timeout would release this lock while the server still writes.
+                        # The caller/watchdog has its own deadline; retain this actual
+                        # call until the handler returns, then reject late results.
+                        kwargs["timeout"] = None
+                    result = attribute(*args, **kwargs)
+                    if deadline is not None:
+                        deadline.check()
+                    return result
+                finally:
+                    self._lock.release()
             finally:
-                self._lock.release()
+                with owner._condition:
+                    owner._active -= 1
+                    owner._condition.notify_all()
 
         return invoke
 
@@ -127,7 +190,7 @@ class ChunkIndex:
     def collection(self, name: str) -> ChunkIndex:
         handle = object.__new__(ChunkIndex)
         handle._path = self._path
-        handle.client = self.client
+        handle.client = self.client.collection(name)
         handle.collection_name = name
         handle._owns_client = False
         return handle

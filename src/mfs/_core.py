@@ -25,6 +25,7 @@ from ._indexing import Indexing
 from ._json import JSONValue, copy_json, load_json
 from ._lifecycle import Lifecycle, ReadView
 from ._locks import CallGate
+from ._maintenance import Maintenance
 from ._namespace import NamespaceBinding
 from ._platform import ProcessOwner, descriptor_change_time
 from ._preparation import Preparation
@@ -185,19 +186,20 @@ class MFS:
         self._search_execution = SearchExecution(policy.queries)
         self._grep_execution = SearchExecution(policy.queries)
         try:
-            self._path.mkdir(parents=True, exist_ok=True)
-            initialize = not any(self._path.iterdir())
-            if not initialize and not (self._path / "catalog.sqlite").is_file():
-                raise CorruptState("non-empty mfs_path has no recognizable catalog")
+            from . import _bootstrap
+
+            _bootstrap.prepare(self._path)
             self._instance_lock = FileLock(self._path / "LOCK", thread_local=False)
             try:
                 self._instance_lock.acquire(timeout=0)
             except Timeout as error:
                 raise InstanceLocked(f"MFS instance is already open: {self._path}") from error
             self._process_owner = ProcessOwner(self._path / "PROCESS_LOCK")
-            for name in ("objects", "artifacts", "staging", "work", "namespaces"):
+            initialize = (self._path / _bootstrap.MARKER).is_dir()
+            for name in _bootstrap.DIRECTORIES:
                 (self._path / name).mkdir(exist_ok=True)
             self._catalog = Catalog(self._path / "catalog.sqlite", initialize=initialize)
+            _bootstrap.finish(self._path)
             self._tasks = Lifecycle(
                 self._catalog, self._condition, stage_timeout=policy.stage_timeout
             )
@@ -206,6 +208,7 @@ class MFS:
             self._runtime = NamespaceRuntime(self._path, self._tasks, policy, admission)
             self._configuration = Configuration(self._tasks, self._runtime)
             self._index_cleanup = IndexCleanup(self._tasks, self._runtime)
+            self._maintenance = Maintenance(self._tasks, self._configuration, self._index_cleanup)
             self._preparation = Preparation(
                 self._path,
                 self._catalog,
@@ -237,11 +240,12 @@ class MFS:
                 worker = threading.Thread(target=self._worker.run, name=f"mfs-worker-{number}")
                 worker.start()
                 self._workers.append(worker)
-            configurations = threading.Thread(
-                target=self._maintain_configurations, name="mfs-configurations"
-            )
-            configurations.start()
-            self._workers.append(configurations)
+            for number in range(2):
+                configurations = threading.Thread(
+                    target=self._maintenance.run, name=f"mfs-configurations-{number}"
+                )
+                configurations.start()
+                self._workers.append(configurations)
             if self._gc_policy.enabled:
                 maintenance = threading.Thread(
                     target=self._artifacts.maintain, name="mfs-maintenance"
@@ -286,35 +290,6 @@ class MFS:
                 raise InvalidConfiguration("exclude_globs must be non-empty POSIX patterns")
             _glob_match(pattern, "")
         return SyncPolicy(tuple(policy.exclude_globs), maximum)
-
-    def _maintain_configurations(self) -> None:
-        while True:
-            with self._condition:
-                if self._tasks.stopping:
-                    return
-                if self._tasks.boot_paused:
-                    self._condition.wait(0.05)
-                    continue
-            try:
-                self._index_cleanup.maintain()
-                self._configuration.maintain()
-            except StorageFailed as error:
-                with self._condition:
-                    self._tasks.storage_error = error
-                    self._tasks.stop()
-                return
-            except Exception as error:
-                with self._condition:
-                    for namespace, record in list(self._tasks.namespaces.items()):
-                        building = record.get("building")
-                        if building and not building["initialized"]:
-                            updated = dict(record, building=dict(building, error=str(error)))
-                            try:
-                                self._tasks.configure(namespace, updated)
-                            except StorageFailed:
-                                return
-            with self._condition:
-                self._condition.wait(0.05)
 
     def _is_ready(self) -> bool:
         return self._state == "ready" and self._tasks.is_ready()
@@ -404,9 +379,11 @@ class MFS:
         """
         self._validate_timeout(timeout)
         dropping = isinstance(target, DropReport)
+        wait_paths: tuple[str, ...] = ()
         if isinstance(target, SyncReport):
             if not target.complete:
                 raise OperationFailed("sync observation was incomplete", state="incomplete")
+            wait_paths = target.wait_paths
             target, path = target.namespace, target.path
         elif isinstance(target, MutationReport):
             target = target.id
@@ -425,7 +402,12 @@ class MFS:
                 ):
                     raise NamespaceNotFound(f"namespace {namespace!r} does not exist")
             self._tasks.wait(
-                namespace, target if isinstance(target, DocumentId) else None, path, timeout
+                namespace,
+                target if isinstance(target, DocumentId) else None,
+                path,
+                timeout,
+                additional_paths=wait_paths,
+                dropping=dropping,
             )
 
     def index_configuration(self, namespace: str) -> JSONValue:
@@ -865,9 +847,12 @@ class MFS:
                 tuple(job.get("artifacts", {})),
                 self._tasks.active.get(document_id, {}).get("active_run_id"),
                 self._tasks.active.get(document_id, {}).get("attempt_token"),
-                self._catalog.cleanup_pending(document_id.namespace, document_id.doc_id),
+                self._catalog.cleanup_pending(
+                    document_id.namespace, document_id.doc_id, job.get("incarnation")
+                ),
                 job.get("build_generation")
                 or self._tasks.namespaces.get(document_id.namespace, {}).get("index_epoch"),
+                self._tasks.blocking_reason(document_id, job),
             )
 
     def list_document_statuses(

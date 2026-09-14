@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import random
+from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import version
 from pathlib import Path
 
@@ -9,6 +10,57 @@ import pytest
 
 from mfs import DocumentId
 from mfs._index import ChunkIndex, IndexRow
+
+
+@pytest.mark.conformance
+def test_independent_collections_and_same_collection_writers_survive_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "parallel.db"
+    index = ChunkIndex(path)
+    handles = [index.collection(f"parallel_{i}") for i in range(4)]
+
+    def create(handle: ChunkIndex) -> None:
+        handle.recreate(dense_dimension=None)
+
+    def write(batch: int) -> None:
+        handle = handles[batch % len(handles)]
+        for iteration in range(3):
+            text = f"needle batch {batch} iteration {iteration}"
+            handle.insert(
+                [
+                    IndexRow(
+                        namespace="n",
+                        doc_id=f"{batch}-{iteration}",
+                        ordinal=0,
+                        text=text,
+                        text_start=0,
+                        text_end=len(text),
+                        dense_vector=[],
+                    )
+                ]
+            )
+            handle.flush()
+            hits, _ = handle.search("needle", mode="bm25", limit=100)
+            assert hits
+
+    try:
+        with ThreadPoolExecutor(8) as workers:
+            list(workers.map(create, handles))
+            list(workers.map(write, range(8)))
+        for handle in handles:
+            assert len(handle.scan()) == 6
+    finally:
+        index.close()
+    reopened = ChunkIndex(path)
+    try:
+        for i in range(4):
+            handle = reopened.collection(f"parallel_{i}")
+            assert handle.has_valid_collection(dense_dimension=None)
+            handle.load()
+            assert {row["doc_id"] for row in handle.scan()} == {
+                f"{batch}-{iteration}" for batch in (i, i + 4) for iteration in range(3)
+            }
+    finally:
+        reopened.close()
 
 
 @pytest.mark.conformance

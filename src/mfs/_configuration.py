@@ -263,12 +263,14 @@ class Configuration:
         else:
             self.lifecycle.remember(identity, job)
 
-    def maintain(self) -> None:
-        """One maintenance owner; a failed namespace does not stall other builds."""
+    def maintain(self, namespace: str) -> None:
+        """The maintenance pool grants one owner per namespace."""
         lifecycle = self.lifecycle
         with lifecycle.condition:
             records = [
-                (name, copy.deepcopy(record)) for name, record in lifecycle.namespaces.items()
+                (name, copy.deepcopy(record))
+                for name, record in lifecycle.namespaces.items()
+                if name == namespace
             ]
         for namespace, record in records:
             try:
@@ -337,6 +339,30 @@ class Configuration:
                     lifecycle.namespaces[namespace] = updated
                     lifecycle.condition.notify_all()
 
+    def timed_out(self, namespace: str, incarnation: str, generation: str | None) -> None:
+        # Called under Lifecycle.condition, including while the backend is still running.
+        current = self.lifecycle.namespaces.get(namespace, {})
+        if current.get("incarnation") != incarnation:
+            return
+        updated = copy.deepcopy(current)
+        if generation is not None:
+            if current.get("building", {}).get("generation") != generation:
+                return
+            updated["building"].update(
+                error="configuration initialization exceeded its stage timeout",
+                failures=5,
+                next_run=0,
+            )
+        else:
+            updated.update(
+                retirement_error="collection retirement exceeded its stage timeout",
+                retirement_failures=5,
+                retirement_retry=0,
+            )
+        with self.lifecycle.state_transaction():
+            self.catalog.put_namespace(namespace, updated)
+        self.lifecycle.namespaces[namespace] = updated
+
     def initialize(self, namespace: str, record: dict[str, Any]) -> None:
         lifecycle = self.lifecycle
         building = record.get("building")
@@ -364,40 +390,45 @@ class Configuration:
                 lifecycle.namespace_executions.get(incarnation, 0) + 1
             )
         try:
-            index = self.runtime.index(namespace, record["incarnation"], generation)
-            dense = building["manifest"]["index"]["dense"]
-            dimension = int(dense["dimension"]) if dense else None
-            recreated = not index.has_valid_collection(dense_dimension=dimension)
-            if recreated:
-                index.recreate(dense_dimension=dimension)
-            else:
-                index.load()
-            with lifecycle.condition:
-                current = lifecycle.namespaces.get(namespace, {})
-                if current.get("building", {}).get("generation") != generation:
-                    return
-                updated = copy.deepcopy(current)
-                updated["building"]["initialized"] = True
-                updated["building"].pop("error", None)
-                with lifecycle.state_transaction():
-                    self.catalog.put_namespace(namespace, updated)
-                    if recreated:
-                        for identity, old in list(lifecycle.build_targets.items()):
-                            if identity.namespace != namespace or old["stage"] == "process":
-                                continue
-                            target = dict(
-                                old,
-                                stage="chunk",
-                                completed_batches=0,
-                                plan=[],
-                                state="cancelled"
-                                if self.catalog.cancelled(namespace, identity.doc_id)
-                                else "pending",
-                            )
-                            self.catalog.put_build(namespace, identity.doc_id, target)
-                            lifecycle.build_targets[identity] = target
-                lifecycle.namespaces[namespace] = updated
-                lifecycle.condition.notify_all()
+            with self.runtime.maintenance(
+                lambda: self.timed_out(namespace, incarnation, generation)
+            ) as deadline:
+                index = self.runtime.index(namespace, record["incarnation"], generation)
+                dense = building["manifest"]["index"]["dense"]
+                dimension = int(dense["dimension"]) if dense else None
+                recreated = not index.has_valid_collection(dense_dimension=dimension)
+                if recreated:
+                    index.recreate(dense_dimension=dimension)
+                else:
+                    index.load()
+                with lifecycle.condition:
+                    deadline.check()
+                    current = lifecycle.namespaces.get(namespace, {})
+                    if current.get("building", {}).get("generation") != generation:
+                        return
+                    updated = copy.deepcopy(current)
+                    updated["building"]["initialized"] = True
+                    updated["building"].pop("error", None)
+                    with lifecycle.state_transaction():
+                        self.catalog.put_namespace(namespace, updated)
+                        if recreated:
+                            for identity, old in list(lifecycle.build_targets.items()):
+                                if identity.namespace != namespace or old["stage"] == "process":
+                                    continue
+                                target = dict(
+                                    old,
+                                    stage="chunk",
+                                    completed_batches=0,
+                                    plan=[],
+                                    state="cancelled"
+                                    if self.catalog.cancelled(namespace, identity.doc_id)
+                                    else "pending",
+                                )
+                                self.catalog.put_build(namespace, identity.doc_id, target)
+                                lifecycle.build_targets[identity] = target
+                    lifecycle.namespaces[namespace] = updated
+                    deadline.committed = True
+                    lifecycle.condition.notify_all()
         finally:
             with lifecycle.condition:
                 self.creating.discard(generation)
@@ -429,16 +460,18 @@ class Configuration:
             candidate = lifecycle.build_targets.get(identity, {})
             if candidate.get("source_revision") != desired["revision"]:
                 return
-            if candidate.get("state") == "succeeded":
-                continue
-            if (
-                candidate.get("state") != "cancelled"
-                or self.catalog.get_document(namespace, identity.doc_id) is not None
-                or self.catalog.get_build(namespace, identity.doc_id, document=True) is not None
-            ):
+            if candidate.get("state") not in ("succeeded", "failed", "cancelled", "blocked"):
                 return
-            # A stopped input with no prepared text has no result to preserve in G0.
-            # Carry its cancellation into G1 without blocking the usable members.
+            # Publish only this generation's successful snapshots. Terminal members
+            # keep their error/cancellation and can be repaired in the active generation.
+        if (
+            members
+            and building["indexing"] != "off"
+            and not any(lifecycle.build_targets[i]["state"] == "succeeded" for i in members)
+            and any(i.namespace == namespace for i in lifecycle.visible)
+        ):
+            # Replacing a usable index with zero successful members adds no capability.
+            return
         if any(i.namespace == namespace for i, _ in lifecycle.executing):
             return
         updated = copy.deepcopy(previous)
@@ -461,6 +494,10 @@ class Configuration:
                 prepared = self.catalog.get_build(namespace, identity.doc_id, document=True)
                 if prepared is not None:
                     self.catalog.put_document(namespace, identity.doc_id, prepared)
+                else:
+                    # A changed Processor may have failed before producing new text.
+                    # Never attach the old Processor's document to its new revision.
+                    self.catalog.delete_document(namespace, identity.doc_id)
                 self.catalog.put_target(namespace, identity.doc_id, target)
                 self.catalog.put_build(namespace, identity.doc_id, None, retire=False)
                 self.catalog.put_build(namespace, identity.doc_id, None, document=True)
@@ -511,23 +548,29 @@ class Configuration:
                     lifecycle.namespace_executions.get(incarnation, 0) + 1
                 )
             try:
-                index = self.runtime.index(namespace, incarnation, generation)
-                if index.client.has_collection(index.collection_name):
-                    index.drop()
-                with lifecycle.condition:
-                    current = lifecycle.namespaces.get(namespace, {})
-                    if current.get("incarnation") != incarnation:
-                        return
-                    updated = copy.deepcopy(current)
-                    updated["retiring_generations"].remove(generation)
-                    updated.pop("retirement_error", None)
-                    updated.pop("retirement_failures", None)
-                    updated.pop("retirement_retry", None)
-                    with lifecycle.state_transaction():
-                        self.catalog.put_namespace(namespace, updated)
-                    lifecycle.namespaces[namespace] = updated
-                    self.runtime.build_bindings.pop((namespace, generation), None)
-                    self.runtime.collections.pop(index.collection_name, None)
+                with self.runtime.maintenance(
+                    lambda: self.timed_out(namespace, incarnation, None)
+                ) as deadline:
+                    index = self.runtime.index(namespace, incarnation, generation)
+                    if index.client.has_collection(index.collection_name):
+                        index.drop()
+                    with lifecycle.condition:
+                        deadline.check()
+                        current = lifecycle.namespaces.get(namespace, {})
+                        if current.get("incarnation") != incarnation:
+                            return
+                        updated = copy.deepcopy(current)
+                        updated["retiring_generations"].remove(generation)
+                        updated.pop("retirement_error", None)
+                        updated.pop("retirement_failures", None)
+                        updated.pop("retirement_retry", None)
+                        with lifecycle.state_transaction():
+                            self.catalog.settle_collection(incarnation, generation)
+                            self.catalog.put_namespace(namespace, updated)
+                        lifecycle.namespaces[namespace] = updated
+                        self.runtime.build_bindings.pop((namespace, generation), None)
+                        self.runtime.collections.pop(index.collection_name, None)
+                        deadline.committed = True
             finally:
                 with lifecycle.condition:
                     lifecycle.namespace_executions[incarnation] -= 1

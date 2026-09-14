@@ -38,9 +38,15 @@ class Catalog:
         version = int(self.query("PRAGMA user_version")[0][0])
         if version > 8:
             raise SchemaVersionUnsupported(f"catalog schema version {version} is unsupported")
-        if not initialize and version not in (1, 2, 3, 4, 5, 6, 7, 8):
+        if version not in (1, 2, 3, 4, 5, 6, 7, 8) and not (initialize and version == 0):
             raise CorruptState("catalog schema is missing or unrecognized")
-        if initialize or version < 8:
+        if (
+            initialize
+            and version == 0
+            and self.one("SELECT 1 FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' LIMIT 1")
+        ):
+            raise CorruptState("bootstrap catalog contains an unrecognized schema")
+        if version < 8:
             self._initialize()
             self.migrated = version == 1
         expected = {
@@ -455,14 +461,24 @@ class Catalog:
         key = compact_json([namespace, doc_id, value["incarnation"], value["generation"], snapshot])
         self.execute("INSERT OR IGNORE INTO index_cleanup VALUES(?,?)", (key, compact_json(value)))
 
-    def cleanup_pending(self, namespace: str, doc_id: str) -> bool:
+    def cleanup_pending(self, namespace: str, doc_id: str, incarnation: str | None = None) -> bool:
         return (
             self.one(
                 "SELECT 1 FROM index_cleanup WHERE json_extract(value,'$.namespace')=? "
-                "AND json_extract(value,'$.doc_id')=? LIMIT 1",
-                (namespace, doc_id),
+                "AND json_extract(value,'$.doc_id')=? "
+                + ("AND json_extract(value,'$.incarnation')=? " if incarnation else "")
+                + "LIMIT 1",
+                (namespace, doc_id, incarnation) if incarnation else (namespace, doc_id),
             )
             is not None
+        )
+
+    def settle_collection(self, incarnation: str, generation: str | None) -> None:
+        """Call in the retirement transaction, after this exact collection is gone."""
+        self.execute(
+            "DELETE FROM index_cleanup WHERE json_extract(value,'$.incarnation')=? "
+            "AND json_extract(value,'$.generation') IS ?",
+            (incarnation, generation),
         )
 
     def cleanup_rows(self, namespace: str | None = None) -> list[tuple[str, dict[str, Any]]]:

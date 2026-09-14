@@ -47,7 +47,7 @@ _Avoid_: Milvus Snapshot、数据库备份。
 **Accepted（已接收）**：MFS 已持久记录请求并承担后续工作的责任；External 请求只保存引用，不保证输入稍后仍存在或未变。
 _Avoid_: Indexed、Ready。
 
-**Published（已发布）**：某一完整索引代已经可检索；BM25 与 dense 一起完成。
+**Published（已发布）**：某个文件在当前索引代的完整索引结果已经可检索；该文件的 BM25 与 dense 一起完成。配置代可原子发布成功文件的集合，其他失败或取消文件保持可诊断状态；部分发布不代表整个 Namespace 已 Ready。
 
 **Index Build（索引构建）**：从已接收输入生成文本、Chunk 和检索向量的工作；产物生成不代表已经可搜索。
 

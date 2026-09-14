@@ -52,6 +52,7 @@ from .errors import (
 from .execution import ResourceLease
 from .processing import Cancellation, _ProcessingStopped, _ProcessingYielded
 from .types import (
+    BlockingReason,
     DocumentId,
     DropReport,
     IgnoreRule,
@@ -86,6 +87,7 @@ class Lifecycle:
         self.targets: dict[DocumentId, dict[str, Any]] = {}
         self.build_targets: dict[DocumentId, dict[str, Any]] = {}
         self.state_reconciled: Callable[[], None] | None = None
+        self.maintenance_expiry: Callable[[], None] | None = None
         self.pin_artifact: Callable[[str], ResourceLease] | None = None
         self.pending: dict[DocumentId, str] = {}
         self.visible: dict[DocumentId, str] = {}
@@ -104,6 +106,7 @@ class Lifecycle:
         self.generation_bindings: Mapping[tuple[str, str], NamespaceBinding] = {}
         self.unavailable: Container[str] = ()
         self.storage_error: StorageFailed | None = None
+        self.resource_waiters: dict[DocumentId, tuple[str, str | None, str]] = {}
         self.claim_failures = 0
         self.claim_retry_at = 0.0
         self.namespaces = dict(catalog.list_namespaces())
@@ -145,6 +148,8 @@ class Lifecycle:
                     job.update(state="pending", next_run=0)
                     catalog.put_target(ns, doc, job)
                 self.targets[DocumentId(ns, doc)] = job
+                if job["kind"] == "drop" and job["state"] == "succeeded":
+                    self.settle_drop(job)
             for ns, doc, encoded in catalog.query("SELECT namespace,doc_id,value FROM active_runs"):
                 identity = DocumentId(ns, doc)
                 active = catalog.decode(encoded)
@@ -183,6 +188,11 @@ class Lifecycle:
             )
 
     def refresh_pending(self) -> None:
+        self.resource_waiters = {
+            identity: reason
+            for identity, reason in self.resource_waiters.items()
+            if identity in self.targets or identity in self.build_targets
+        }
         self.pending = {
             identity: str(job["revision"])
             for identity, job in self.targets.items()
@@ -292,6 +302,7 @@ class Lifecycle:
         path: str = ".",
         *,
         readiness: bool = False,
+        dropping: bool = False,
     ) -> bool:
         """The shared completion/terminal-failure predicate for current and strong waits."""
         if self.storage_error is not None:
@@ -303,6 +314,9 @@ class Lifecycle:
             for _, debt in self.catalog.cleanup_rows():
                 if namespaces is not None and debt["namespace"] not in namespaces:
                     continue
+                record = self.namespaces.get(debt["namespace"])
+                if not dropping and record and record["incarnation"] != debt["incarnation"]:
+                    continue
                 if identity is not None and (
                     debt["namespace"] != identity.namespace or debt["doc_id"] != identity.doc_id
                 ):
@@ -313,7 +327,13 @@ class Lifecycle:
                     and not debt["doc_id"].startswith(path + "/")
                 ):
                     continue
-                if debt["failures"] >= 5:
+                drop = self.targets.get(DocumentId(debt["namespace"], ""), {})
+                covered = (
+                    drop.get("kind") == "drop"
+                    and drop.get("state") != "succeeded"
+                    and debt["incarnation"] in drop.get("incarnations", [])
+                )
+                if debt["failures"] >= 5 and not covered:
                     raise OperationFailed(debt["error"] or "index cleanup failed", state="failed")
                 pending = True
         for namespace, record in self.namespaces.items():
@@ -335,6 +355,10 @@ class Lifecycle:
         for current, job in [*self.targets.items(), *self.build_targets.items()]:
             if namespaces is not None and current.namespace not in namespaces:
                 continue
+            if not dropping and job["kind"] == "drop":
+                record = self.namespaces.get(current.namespace)
+                if record and record["incarnation"] not in job.get("incarnations", []):
+                    continue
             if job.get("build_generation") and self.current_candidate(current) is not job:
                 continue
             if (
@@ -356,6 +380,13 @@ class Lifecycle:
             if readiness and job["kind"] in ("delete", "drop"):
                 continue
             state = job["state"]
+            if self.blocking_reason(current, job) == "binding":
+                raise OperationFailed(
+                    f"{current}: adapter binding required; call open_namespace",
+                    revision=job["revision"],
+                    state="blocked",
+                    error_code="CapabilityUnavailable",
+                )
             if state in ("failed", "blocked", "cancelled"):
                 raise OperationFailed(
                     job.get("error") or f"{current}: current target is {state}",
@@ -379,6 +410,8 @@ class Lifecycle:
             while not self.stopping:
                 try:
                     now = time.monotonic()
+                    if self.maintenance_expiry is not None:
+                        self.maintenance_expiry()
                     for execution, cancellation in tuple(self.cancellations.items()):
                         job = self.execution_records[execution]
                         if (
@@ -551,16 +584,25 @@ class Lifecycle:
         identity: DocumentId | None,
         path: str,
         timeout: float | None,
+        *,
+        additional_paths: tuple[str, ...] = (),
+        dropping: bool = False,
     ) -> None:
         deadline = None if timeout is None else time.monotonic() + timeout
         with self.condition:
-            while self.unfinished({namespace}, identity, path):
+            while any(
+                [
+                    self.unfinished({namespace}, identity, scope, dropping=dropping)
+                    for scope in (path, *additional_paths)
+                ]
+            ):
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     raise WaitTimeout("current file/scope work has not completed")
                 self.condition.wait(remaining)
 
     def remember(self, identity: DocumentId, job: dict[str, Any]) -> None:
+        self.resource_waiters.pop(identity, None)
         if job.get("build_generation"):
             self.build_targets[identity] = copy.deepcopy(job)
             active = self.active.get(identity, {})
@@ -721,10 +763,87 @@ class Lifecycle:
             else 2
         )
 
+    def needs_prepared_member(self, identity: DocumentId, job: dict[str, Any]) -> bool:
+        """Let maintenance adopt G0 text before a compatible G1 can process it again."""
+        desired = self.targets.get(identity, {})
+        building = self.namespaces.get(identity.namespace, {}).get("building", {})
+        return bool(
+            job.get("build_generation")
+            and job["stage"] == "process"
+            and not job.get("refresh_text")
+            and not building.get("force_process")
+            and job.get("processor") == desired.get("processor")
+            and self.catalog.get_document_revision(identity.namespace, identity.doc_id)
+            == desired.get("revision")
+        )
+
+    def blocking_reason(self, identity: DocumentId, job: dict[str, Any]) -> BlockingReason | None:
+        if any(
+            i == identity
+            and (
+                active.get("revision") != job["revision"]
+                or active.get("attempt_token") != job.get("attempt_token")
+                or job["state"] != "running"
+            )
+            for (i, _), active in self.execution_records.items()
+        ):
+            return "retiring"
+        if job["state"] not in ("pending", "retry_wait"):
+            return None
+        if self.boot_paused:
+            return "background_paused"
+        if self.held(identity, job):
+            return "quiescence"
+        if job["kind"] in ("drop", "rebuild") and any(
+            self.queries.get(inc, 0)
+            or self.namespace_executions.get(inc, 0)
+            or any(j.get("incarnation") == inc for j in self.execution_records.values())
+            for inc in (
+                job.get("incarnation"),
+                *job.get("incarnations", []),
+                *job.get("retired_incarnations", []),
+            )
+            if inc is not None
+        ):
+            return "retiring"
+        if job["kind"] == "upsert" and not job.get("cleanup"):
+            ns = self.namespaces.get(identity.namespace, {})
+            generation = job.get("build_generation")
+            if (
+                (identity.namespace, generation) not in self.generation_bindings
+                if generation
+                else identity.namespace not in self.bound
+            ):
+                return "binding"
+            if ns.get("processing_paused"):
+                return "processing_paused"
+            if self.needs_prepared_member(identity, job):
+                return "configuration"
+            if job["stage"] != "process":
+                if ns.get("paused") and job["indexing"] != "off":
+                    return "indexing_paused"
+                if "pending_manifest" in ns or (
+                    generation and not ns.get("building", {}).get("initialized")
+                ):
+                    return "configuration"
+                if not generation and identity.namespace in self.unavailable:
+                    return "index_unavailable"
+        if float(job.get("next_run", 0)) > time.time():
+            return "retry_backoff"
+        if self.resource_waiters.get(identity) == (
+            job["revision"],
+            job.get("build_generation"),
+            job["stage"],
+        ):
+            return "resources"
+        return None
+
     def runnable(self, identity: DocumentId, job: dict[str, Any]) -> bool:
         if self.boot_paused:
             return False
         if job.get("build_generation") and self.current_candidate(identity) is not job:
+            return False
+        if self.needs_prepared_member(identity, job):
             return False
         if self.held(identity, job):
             return False
@@ -761,6 +880,9 @@ class Lifecycle:
                 and (
                     self.queries.get(incarnation, 0)
                     or self.namespace_executions.get(incarnation, 0)
+                    or any(
+                        j.get("incarnation") == incarnation for j in self.execution_records.values()
+                    )
                 )
                 for incarnation in incarnations
             ):
@@ -925,6 +1047,11 @@ class Lifecycle:
                         self.active.pop(identity, None)
                         continue
                     if admission is not None and lease is None:
+                        self.resource_waiters[identity] = (
+                            job["revision"],
+                            job.get("build_generation"),
+                            job["stage"],
+                        )
                         continue
                     if job.get("cleanup"):
                         job["cleanup_restore_state"] = (
@@ -1189,10 +1316,19 @@ class Lifecycle:
                 )
                 for field in ("plan", "snapshot", "chunks", "vectors"):
                     job.pop(field, None)
-                self.persist(identity, job)
+                with self.catalog.transaction():
+                    if job["kind"] == "drop":
+                        self.settle_drop(job)
+                    self.persist(identity, job)
             else:
                 self.finish_rebuild(identity, job)
             return True
+
+    def settle_drop(self, job: dict[str, Any]) -> None:
+        for collection in job.get("collections", []):
+            self.catalog.settle_collection(collection["incarnation"], collection["generation"])
+        for incarnation in job.get("incarnations", []):
+            self.catalog.settle_collection(incarnation, None)
 
     def finish_rebuild(self, identity: DocumentId, job: dict[str, Any]) -> None:
         record = dict(
@@ -1841,11 +1977,8 @@ class ReadView:
                         revision=job["revision"],
                         state=job["state"],
                     )
-                if (
-                    job.get("build_generation")
-                    and (namespace, job["build_generation"]) not in lifecycle.generation_bindings
-                ):
-                    raise OperationFailed("candidate processor needs binding", state="blocked")
+                if lifecycle.blocking_reason(identity, job) == "binding":
+                    raise OperationFailed("processor needs adapter binding", state="blocked")
                 pending = True
             return not pending
 

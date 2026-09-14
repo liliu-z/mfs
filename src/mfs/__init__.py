@@ -43,6 +43,7 @@ from .execution import Admission, ExecutionPolicy, LocalAdmission, ResourceLease
 from .processing import Cancellation, ProcessingContext, run_process_supervisor
 from .types import (
     AnyOf,
+    BlockingReason,
     ByDocumentId,
     ByExtension,
     ByMediaType,
@@ -111,6 +112,7 @@ __all__ = [
     "Admission",
     "AnyOf",
     "ArtifactHandle",
+    "BlockingReason",
     "ByDocumentId",
     "ByExtension",
     "ByMediaType",

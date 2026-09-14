@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from mfs import MFS, CapabilityUnavailable, Utf8TextProcessor, WaitTimeout
+from mfs import MFS, CapabilityUnavailable, OperationFailed, Utf8TextProcessor
 
 
 class TinyEmbedder:
@@ -56,8 +56,9 @@ def test_dense_and_hybrid_then_open_without_embedder(tmp_path: Path) -> None:
         with pytest.raises(CapabilityUnavailable):
             without.search("n", "cat", mode="vector", timeout=10)
         receipt = without.upsert("n", "cat.txt", b"changed cat")
-        with pytest.raises(WaitTimeout):
+        with pytest.raises(OperationFailed) as blocked:
             without.wait(receipt, 0.1)
+        assert blocked.value.state == "blocked"
         assert not without.search("n", "cat", mode="bm25", consistency="eventual").items
         without.open_namespace("n", processors=[Utf8TextProcessor()], embedder=TinyEmbedder())
         without.wait(receipt, 10)

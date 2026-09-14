@@ -141,7 +141,11 @@ def test_retained_old_snapshot_cannot_mask_current_hit(
     with closing(MFS.open(tmp_path / "state")) as mfs:
         mfs.create_namespace("n", "internal", processors=[Utf8TextProcessor()], embedder=Model("s"))
         mfs.wait(mfs.upsert("n", "a.txt", b"old needle"), 10)
-        monkeypatch.setattr(mfs._index_cleanup, "maintain", lambda: None)
+
+        def retain_snapshots(namespace: str) -> None:
+            pass
+
+        monkeypatch.setattr(mfs._index_cleanup, "maintain", retain_snapshots)
         mfs.upsert("n", "a.txt", b"new needle")
         result = mfs.search("n", "needle", mode="vector", consistency="strong", timeout=10)
         status = mfs.document_status(DocumentId("n", "a.txt"))

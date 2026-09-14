@@ -4,6 +4,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -70,8 +71,11 @@ raise AssertionError("crash boundary was not reached")
         mfs.wait_ready(10)
         if boundary == "before_accept_commit":
             assert not mfs.grep("n").items
-            for _ in range(3):
+            deadline = time.monotonic() + 5
+            while list((state / "namespaces").glob("*/originals/*")):
                 assert mfs.collect_garbage().error is None
+                assert time.monotonic() < deadline, "unaccepted original was not reclaimed"
+                time.sleep(0.01)
             assert not list((state / "namespaces").glob("*/originals/*"))
         else:
             assert mfs.grep("n", select="doc").items[0].value.text == "durable needle"
