@@ -13,7 +13,7 @@ def test_utf8_text_processor_preserves_text_and_maps_lines(tmp_path: Path) -> No
 
     processed = Utf8TextProcessor().process(source, "text/markdown")
 
-    assert processed.text == "first\r\n二"
+    assert processed.text == "first\r\n\u4e8c"
     assert [(span.text_start, span.text_end) for span in processed.source_map.spans] == [
         (0, 7),
         (7, 10),
@@ -27,7 +27,7 @@ def test_utf8_text_processor_preserves_text_and_maps_lines(tmp_path: Path) -> No
         "",
         "a" * 4096,
         "a" * 5000,
-        "界" * 2000,
+        "\u754c" * 2000,
         ("paragraph words\n\n" * 400),
     ],
 )

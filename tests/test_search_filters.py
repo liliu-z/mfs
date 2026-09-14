@@ -61,7 +61,7 @@ def test_ranked_affixes_and_source_types_push_down_before_topk_with_no_sqlite(
         mfs.open_namespace(
             registered.namespace, processors=[SourceProcessor()], embedder=GateEmbedder()
         )
-    special = '目录/rare"\\%_Résumé.PDF'
+    special = '\u76ee\u5f55/rare"\\%_Résumé.PDF'
     try:
         mfs.create_namespace(
             "n", "internal", processors=[SourceProcessor()], embedder=GateEmbedder()
@@ -111,7 +111,7 @@ def test_ranked_affixes_and_source_types_push_down_before_topk_with_no_sqlite(
         groups: list[list[Filter]] = [
             [ByExtension("pdf")],
             [ByMediaType("application/pdf")],
-            [PathPrefix('目录/rare"\\%_')],
+            [PathPrefix('\u76ee\u5f55/rare"\\%_')],
             [PathSuffix('"\\%_Résumé.PDF')],
             [NamePrefix('rare"\\%_')],
             [NameSuffix("Résumé.PDF")],
@@ -202,7 +202,11 @@ def test_grep_unicode_word_smart_case_cross_chunk_and_empty_regex_validation(
         with pytest.raises(InvalidPattern):
             mfs.grep("n", [TextMatch("[", regex=True)])
         # A failing Chunker must not prevent document-level grep of Unicode text.
-        mfs.upsert("n", "a.txt", "café caféine CAFÉ _café café2\n中文 中文字\ncross\nline".encode())
+        mfs.upsert(
+            "n",
+            "a.txt",
+            "café caféine CAFÉ _café café2\n\u4e2d\u6587 \u4e2d\u6587\u5b57\ncross\nline".encode(),
+        )
         with mfs._condition:
             assert mfs._condition.wait_for(
                 lambda: mfs._tasks.targets[DocumentId("n", "a.txt")]["stage"] != "process", 5
@@ -219,7 +223,9 @@ def test_grep_unicode_word_smart_case_cross_chunk_and_empty_regex_validation(
             )
             == 1
         )
-        assert len(mfs.grep("n", [TextMatch("中文", whole_word=True)]).items[0].matches) == 1
+        assert (
+            len(mfs.grep("n", [TextMatch("\u4e2d\u6587", whole_word=True)]).items[0].matches) == 1
+        )
         assert mfs.grep("n", [TextMatch("cross\nline")]).items
         assert mfs.grep("n", [TextMatch("cross\\s+line", regex=True)], limit=1).items
     finally:

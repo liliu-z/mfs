@@ -26,7 +26,7 @@ def test_crlf_text_keeps_utf8_offsets_through_read_grep_search_reindex_and_reope
     kind: Literal["internal", "external"],
     suffix: str,
 ) -> None:
-    text = "header\r\n二 needle\r\nlast\r\n"
+    text = "header\r\n\u4e8c needle\r\nlast\r\n"
     source = tmp_path / "source"
     source.mkdir()
     name = "a." + suffix
@@ -49,7 +49,7 @@ def test_crlf_text_keeps_utf8_offsets_through_read_grep_search_reindex_and_reope
             assert result.items[0].value.text == text
             match = result.items[0].matches[0]
             assert text.encode()[match.text_start : match.text_end] == b"needle"
-            assert match.text_start == len("header\r\n二 ".encode())
+            assert match.text_start == len("header\r\n\u4e8c ".encode())
             assert match.source_location.sources == ({"kind": "lines", "start": 2, "end": 2},)
             hit = mfs.search("n", "needle", mode="bm25").items[0].value
             assert hit.text == text.encode()[hit.text_start : hit.text_end].decode()

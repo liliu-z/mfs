@@ -1,83 +1,55 @@
-# MFS
+# MFS domain language
 
-MFS 接收或观察源文件，将其处理成可检索的文档，并负责处理与索引工作的生命周期。
-这里统一领域用语；唯一设计正文见 `docs/design.md`，实现进度见 `docs/backlog.md`。
+MFS accepts or observes source files, prepares searchable documents, and owns the lifecycle of processing and indexing work. This glossary defines shared terms. The current contract is in [docs/design.md](docs/design.md); remaining work is in [docs/backlog.md](docs/backlog.md).
 
-## Language
+## Identity, ownership, and text
 
-**Source（源文件）**：提供文档内容的原始输入。External Source 由用户拥有，MFS 只引用、不复制、不修改，通过 sync 观察变化；Internal Source 由 MFS 接收、保存和删除。
-_Avoid_: 用“文档更新”同时指源文件更新和搜索结果更新。
+| Term | Meaning |
+| --- | --- |
+| **Source** | Original input. An External Source is user-owned, observed through sync, and never copied/modified by MFS. An Internal Source is accepted, stored, and deleted by MFS. Distinguish source updates from updates to search results. |
+| **Document** | Logical retrieval object identified by Namespace and Document ID. Content changes do not change its identity. |
+| **Namespace** | A set of documents with stable identity, source ownership, and its own processing/retrieval configuration. Shared physical storage does not merge document identity. It is neither an independent database nor an authorization tenant. |
+| **Namespace Incarnation** | Private, non-reusable identity for one creation of a Namespace. Recreating the same public name creates a different incarnation. |
+| **Adapter Manifest** | Persistent compatibility requirements for processing, chunking, and embedding implementations. It is not a runtime object, model factory, or credential store. |
+| **Source Policy** | One Namespace's ordered input rules, without global inheritance. Excluded input cannot reappear through another MFS retrieval method. |
+| **Search Scope** | One explicitly selected Namespace, optionally narrowed by paths or document identities. Current-work waits separately select a document or namespace/path. |
+| **Source Revision** | An accepted target version. It does not imply text/index readiness and is not a retry counter. Private input versions identify source observations independently of configuration generations. |
+| **Document Target** | The latest desired processed version, or deletion intent, for a Document. Repeated notifications coalesce; it is not a historical event queue. |
+| **Snapshot** | Identity and source-location data for a processing result. It is not a source backup, a Milvus snapshot, or an immutable External file; historical version reads are not provided. |
+| **Search Text** | Text used for retrieval, read directly from textual sources or produced by necessary extraction. Grep and ranked search can use different views. Artifacts do not automatically become Search Text. |
+| **Search Text File** | File containing Search Text: an original, managed extraction, or borrowed application output. A reference implies neither ownership nor that indexing has caught up with external changes. |
+| **SourceMap** | Maps half-open UTF-8 byte ranges in processed Search Text to source pages, lines, or time ranges. It describes processed text, not original binary offsets or chunking. |
+| **Chunk** | A contiguous range selected by a Chunker, with document identity, ordinal, and source location. Ranges may overlap; equal text at different positions still represents distinct occurrences. |
+| **Artifact** | An immutable attachment published with prepared text and opened through `open_artifact`. A read lease protects its lifetime. |
+| **Computation Reuse** | Reuse of compatible processing/vector results to avoid recomputation. It does not merge Documents, discard repeated occurrences, or restore stale visibility. |
 
-**Document（文档）**：以 Namespace 与 Document ID 唯一确定的逻辑检索对象；内容变化不改变其身份。
+## Retrieval and completion
 
-**Namespace（命名空间）**：一组具有稳定身份、源所有权和有效处理/检索配置的文档；不同 Namespace 不因物理存储共享而合并文档身份。
-_Avoid_: 独立数据库、权限租户。
+| Term | Meaning |
+| --- | --- |
+| **Grep** | Literal/regex text matching or structured source path/name matching. Direct External text is read from disk; binary sources require prepared text; metadata-only filtering needs no body. It is independent of ranked-index readiness. |
+| **Indexed Search** | BM25, vector, or hybrid ranking within one Namespace. Its readiness is distinct from text being available to Grep. |
+| **Accepted** | MFS has durably recorded the request and owns its remaining work. External acceptance stores references without guaranteeing later availability. Accepted does not mean Indexed or Ready. |
+| **Published** | A file's complete index result is eligible in the active generation; BM25 and dense complete together where required. Configuration promotion can publish successful members together while retaining unsuccessful member status. Partial publication does not imply Namespace readiness. |
+| **Index Build** | Work producing prepared text, Chunks, and index vectors from accepted input. Producing outputs alone does not make them searchable. |
+| **Ready** | The declared text or indexing target has completed. Text readiness does not imply index readiness or reflect external changes not yet observed. |
+| **Strong** | Retrieval that waits for relevant current targets to become Ready. Updates can occur after admission; this is not query snapshot isolation. Strong Grep waits for text, strong Indexed Search for the selected Namespace's index. |
+| **Eventual** | Retrieval from currently eligible text/publications without waiting for completion. Results may be incomplete; invalidated sources are never entitled to remain visible. |
+| **Mutation / Sync Report** | Acceptance/observation outcome of a call, not a permanent completion receipt. `wait(report)` follows current file/scope work, including subsequent accepted updates. |
+| **Current Work Wait** | Checks current file/scope targets and relevant Namespace control work until completion or error. It does not look up historical success. An idempotency key deduplicates acceptance, not readiness. |
 
-**Adapter Manifest（适配器兼容清单）**：一个 Namespace 对外部处理、切片和向量实现的兼容要求，用来核对后来传入的实现是否相容；它不是可重新创建模型的运行对象或凭据。
+## Execution and recovery
 
-**Source Policy（源参与规则）**：一个 Namespace 自己拥有的有序输入规则，没有全局继承；被排除的输入不通过另一个检索入口重新出现。
-
-**Search Scope（检索范围）**：一次检索必须显式指定一个 Namespace；子路径及具体身份只能缩小其内的文档集合。当前工作等待另按文件或 namespace/path 指定范围。
-
-**Source Revision（源版本）**：MFS 已经确认接收的处理目标版本；内部 input_version 独立标识输入观察，配置代独立标识模型/算子清单；例如，同一份 PDF 修改前、修改后是两个源版本。它不代表文字提取或索引已经完成，也不是一次重试的编号。
-
-**Document Target（文档当前目标）**：某个文档现在应被处理到哪一版，或应从检索中删除。重复通知可以归并到这个目标；它不是必须逐个执行的历史事件列表。
-
-**Deletion Work（删除工作）**：撤销文档的检索资格并清理其已有投影/受管理产物的工作；即使文档已不再列出，未完成的清理责任仍存在。它不删除 External 原件。
-
-**Snapshot（处理快照）**：某次处理结果的版本身份与来源定位。它不承诺持有 External 原文副本，也不使外部指针指向的文件不可变；不提供历史版本读取。
-_Avoid_: Milvus Snapshot、数据库备份。
-
-**Search Text（搜索文字）**：检索使用的文字，可以直接读取文本源，也可以来自必要的抽取。按格式和应用约定，Grep 与排名索引可以使用不同文字视图；附属文件不自动成为搜索文字。
-
-**Search Text File（搜索文字文件）**：检索文字所在的文件；可以直接是 External 文本源，也可以是确有转换需要时生成的文字产物。引用它不意味着 MFS 拥有它，也不意味着索引已追上当前外部内容。
-
-**SourceMap（来源映射）**：记录搜索文字的某个 UTF-8 字节范围来自源文件的哪一页、哪几行或哪个时间段。它解释处理后的文字，不是源二进制偏移，也不是切片结果。
-
-**Chunk（文字片段）**：独立 Chunker 从一份搜索文字选出的连续范围，片段之间可以重叠；每次出现具有所属文档、序号和来源位置。两个片段文字相同不表示它们是同一次出现。
-
-**Computation Reuse（计算复用）**：输入与实现相容时使用已有处理或向量结果，减少重复计算；它不合并源文档，也不丢掉相同文字在不同位置的出现。
-
-**Index Generation（索引代）**：用某次读取/处理得到的文字和某套索引配置构建的一版检索数据。外部文件可在其后变化，索引代不冻结源文件。
-
-**Grep（精确匹配）**：对文字或源路径执行字面/正则匹配；External 直接文本读取外部文件，二进制正文需提取文字，路径匹配只需元数据。它不依赖排名索引，不保证与旧索引属于同一版外部内容。
-
-**Indexed Search（索引检索）**：单 Namespace 内的 BM25、向量或 hybrid 排序检索；它的就绪与文字是否已可 Grep 分开判断。
-
-**Accepted（已接收）**：MFS 已持久记录请求并承担后续工作的责任；External 请求只保存引用，不保证输入稍后仍存在或未变。
-_Avoid_: Indexed、Ready。
-
-**Published（已发布）**：某个文件在当前索引代的完整索引结果已经可检索；该文件的 BM25 与 dense 一起完成。配置代可原子发布成功文件的集合，其他失败或取消文件保持可诊断状态；部分发布不代表整个 Namespace 已 Ready。
-
-**Index Build（索引构建）**：从已接收输入生成文本、Chunk 和检索向量的工作；产物生成不代表已经可搜索。
-
-**Ready（已追上）**：所声明的处理或索引目标已经完成；文字就绪不代表索引就绪，也不承诺尚未观察的外部变化已经反映。
-
-**Strong（强一致搜索）**：等待相应目标 Ready 后放行的索引检索；放行后允许并发更新，不提供一次搜索的快照隔离。
-
-**Eventual（最终一致搜索）**：不等待相应目标 Ready，直接查询当前有效索引；允许缺失结果及并发更新的中间态，不赋予已失效源继续可见的资格。
-_Avoid_: 用 final 表示终止状态或已全部完成。
-
-**Processing Attempt（准备执行）**：一个 revision 的一次执行，拥有独立 work_dir 和取消信号；
-checkpoint 可让下一次执行从持久边界恢复。attempt token 阻止旧执行提交。
-
-**Mutation / Sync Report（接收/观察结果）**：本次调用是否接受变化、涉及哪些文件；不产生永久历史等待记录。wait(report) 按报告中的文件或 namespace/path 等待当前工作，后续新目标也计入。
-
-**Current Work Wait（当前工作等待）**：核对文件或范围内的当前目标及关联 namespace 控制任务，直到完成或报错；不查询历史成功。显式 idempotency_key 只去重写入请求，不用于历史就绪判断。
-
-**Artifact（附属产物）**：随文本快照发布的不可变文件，经 open_artifact 读取；读取租约保护其生命周期。
-
-**User Cancellation Gate（用户取消门）**：跨自动源更新保留的取消意图，retry/reprocess 显式解除。
-内部 supersede/drop/close 的执行停止不创建此门。
-
-**Scope Lease（范围租约）**：临时禁止指定 namespace 创建代及路径内的新执行和源文字读取，并等待既有执行/读取真实退出；释放只解除自身限制，不修改用户取消意图。应用用它保护自己拥有的源文件操作，磁盘操作和 sync 的互斥仍由应用负责。
-
-**Processing Pause（处理暂停）**：namespace 持久保存的准备及新增索引准入门；与只暂停新增索引的 paused 分开。它可用于迁移恢复用户意图，关闭/重开不自动解除；不阻止清理，也不以暂停确认代替实际执行退休。
-
-**Active Run（当前处理链）**：文件的持久逻辑执行占用，以 active_run_id 区分；捕获输入/配置、stage/state 和恢复数据。一次阶段调用结束会释放资源，但处理链可继续存在。attempt_token 区分实际调用，失去提交资格不等于调用已退出。
-
-**Configuration Generation（配置代）**：一份处理/索引兼容清单及其私有文字和 collection。active 正在服务，building 追赶当前成员，retiring 等实际读写退出后清理。仅配置变化不撤销仍有效的旧输入。
-
-**Cleanup Debt（清理责任）**：按 namespace incarnation、collection generation、DocumentId、snapshot 保存的物理删除责任，独立于最新目标的成功/失败；取消及目标合并不能遗失它。
-
-**Startup Gate（启动恢复门）**：宿主通过 start_paused 在执行启动前安装的进程内门。恢复宿主持久磁盘日志后 resume_background；不是持久事务日志或用户取消门。
+| Term | Meaning |
+| --- | --- |
+| **Processing Attempt** | One actual invocation with its own work directory, cancellation signal, and attempt token. Checkpoints can let a later invocation resume from a durable boundary. The token prevents stale commits. |
+| **Active Run** | A file's durable logical processing chain, identified by `active_run_id`, capturing input/configuration, stage/state, and resume data. It can outlive a stage invocation. Losing commit authority does not mean the invocation has exited. |
+| **Configuration Generation** | One processing/index manifest with its private text and collection. Active serves queries; building catches up current membership; retiring waits for actual readers/writers before cleanup. A configuration change alone does not invalidate unchanged sources. |
+| **Index Generation** | Retrieval data built from observed/prepared text under an index configuration. It does not freeze the external source bytes. |
+| **Deletion Work** | Revokes search eligibility and removes projections/managed outputs. Responsibility survives disappearance from document listings. External originals are never deleted. |
+| **Cleanup Debt** | Durable physical deletion responsibility keyed by Namespace incarnation, collection generation, DocumentId, and snapshot, independent of current target success/failure. Cancellation and coalescing cannot discard it. |
+| **User Cancellation Gate** | Persistent user intent to stop a file, retained across ordinary source observations. Explicit retry/reprocess clears it; internal supersession, drop, quiescence, and close do not create it. |
+| **Scope Lease** | Temporary restriction on execution and source reads for explicit incarnation/path scopes, acquired after existing users actually retire. Releasing it removes only its own restriction. Host disk operations and sync still require host serialization. |
+| **Processing Pause** | Persistent Namespace admission gate for preparation and new indexing, distinct from index-only pause. It survives reopen, allows cleanup, and does not prove active executions have retired. |
+| **Startup Gate** | Process-local gate installed with `start_paused` before background execution. The host recovers its persistent disk journal before `resume_background`; the gate is not the journal or a user cancellation. |
+| **Blocking Reason** | Computed explanation of why work cannot currently run, such as binding, pause, resources, quiescence, or retirement. It complements task state without creating another readiness state machine. |

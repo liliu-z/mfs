@@ -1,53 +1,60 @@
-# 设计决定
+# Design decisions
 
-具体合同统一在 [design.md](design.md)，术语见 [CONTEXT.md](../CONTEXT.md)。本文件只保留决定和理由，不再维护逐轮替代方案。
+The current contract is in [design.md](design.md); terms are in [CONTEXT.md](../CONTEXT.md). This log records accepted choices and reasons. The [proposal](proposals/concurrent-lifecycle.md) and dated reviews retain earlier alternatives; superseded choices are explicitly identified here.
 
-| 决定 | 理由 |
+## Core choices
+
+| Decision | Rationale |
 | --- | --- |
-| 保留薄 MFS 实例，业务配置归 namespace | 统一数据库/线程生命周期，同时允许各 namespace 的模型、规则和索引策略独立 |
-| SQLite 共享 catalog；Milvus 每 namespace 一个 collection | 元数据结构相同，向量维度和模型可不同 |
-| External 原件只存指针，Internal 保存原件 | 文件所有权决定复制、删除和恢复责任 |
-| 只有必要转换才产生新文字文件 | 直接文本不复制，StashBase 已有产物也可借用 |
-| 源替换立即失效，物理清理异步 | 新 PDF 处理失败不能让旧 PDF 继续被搜索 |
-| 有界文件 Worker 池，GC 独立 | 文件间可并行，同一文件实际执行保持顺序 |
-| 最新目标可覆盖，旧代清理责任必须保留 | 反复修改只处理最新内容，删除后重建仍能正确清理 |
-| search/grep 显式单 namespace，移除 ByNamespace 与跨 namespace 合并 | namespace 有独立处理和索引配置，库不定义跨集合的排序或路由 |
-| grep/read 与排名 search 分开，移除 query | 精确文字/路径匹配与 BM25/向量的合同不同 |
-| 不新增 ready 系统 | 应用已有状态判断和 grep fallback，避免扩大 MFS 职责 |
-| 播放转换、输入选择和产品可见性由 StashBase 负责 | MFS 提供文件搜索库，不接管应用业务 |
-| 允许不同 namespace 的 External 根相同或嵌套 | StashBase 各 Library Folder 独立登记和配置；只有 External root 与 MFS 状态目录的重叠需要拒绝 |
-| 当前文件任务替代永久操作历史 | StashBase 需要最新文件状态；无变化 sync 不应永久增加回执，删除责任由文件 tombstone 保存 |
-| 同内容观察更新源 stat，阶段提交合并最新目标 | 只改 mtime 后恢复 stat 快速路径，执行中的旧副本不能覆盖新观察 |
-| Lifecycle 集中状态事务，执行模块返回类型化结果 | 清晰核验 revision/attempt，防止迟到工作覆盖新目标 |
-| search 默认 eventual，timeout 默认 5 秒并限制总等待 | 交互搜索读取当前有效结果，调用方可按预算退出；超时检查贯穿搜索阶段 |
-| checkpoint 协作让出，统一完成与退休 | 先持久保存，再等调用真实退出；取消、替换和重建不能复活旧目标 |
-| 查询租约覆盖 embedding 至后端退出 | 超时只结束调用方等待，重建/drop 仍须等待旧 collection 的使用者退出 |
-| 有界完整向量缓存独立于索引行 | 删除旧路径后仍可复用同内容；容量限制、校验和与索引代隔离保证可回收和正确性 |
-| 状态命令统一核对不确定提交结果 | 持久目标与内存许可必须一致；不能确认时停止发布并等待重开恢复 |
-| 借用源在 checkpoint 和结果发布前验证 | 零复制仍需阻止执行期间源变化污染恢复数据与内容缓存；不承诺外部写入的原子快照 |
-| POSIX 独立监督器持有进程退休锁 | 宿主强杀后继续清理 native 进程组，后代未退出前不能开始新实例恢复 |
-| 临时范围租约独立于持久用户取消 | 宿主文件操作需要等实际源使用者退出，并在失败回滚后保留原用户意图 |
-| 迁移先持久暂停处理，再恢复失败/取消状态 | 重开不能在迁移完成前抢先 OCR/转录；导入重放不能覆盖后来的显式操作 |
+| Keep one MFS instance with namespace-owned business configuration | Share database/thread lifetime while allowing independent models, rules, and indexing policies. |
+| Share the SQLite catalog; isolate Milvus collections by namespace and configuration generation | Metadata has one shape, but namespaces can use different embedding dimensions/spaces. |
+| Borrow External originals; own Internal originals | Ownership determines copying, deletion, and recovery responsibility. |
+| Create derived text only when conversion requires it | Direct text needs no copy; applications may already own usable extraction files. |
+| Revoke old source eligibility on acceptance; clean physically in the background | A replacement PDF that fails processing must not expose the old PDF as current. |
+| Keep only the latest desired file target and a durable active run | Coalesce repeated updates without losing actual execution identity or precise cleanup responsibility. |
+| Separate grep/read from ranked search; remove public query | Text/path matching, known-document reading, and BM25/vector ranking have different contracts. |
+| Require one explicit namespace for grep/search | The library does not define routing, authorization, deduplication, or ranking across independently configured collections. |
+| Allow equal or nested External roots across namespaces | Stable host Folder identities can overlap physically while remaining independent; only state/source overlap is rejected. |
+| Use current file/scope waits instead of permanent operation history | Hosts need latest work state; unchanged sync should not accumulate receipts. Explicit idempotency still deduplicates acceptance. |
+| Keep existing status interfaces instead of adding another readiness system | Hosts can inspect document/configuration state and choose fallback without duplicating the lifecycle model. |
+| Leave playback, source operations, product visibility, and permissions with the host | MFS supplies file search, not application policy or a filesystem transaction manager. |
 
-历史设计保留在版本控制中；已经撤回的 External 稳定副本、全局模型继承、每阶段独立队列和 SQLite 全文方案不再作为当前设计。
+## Execution, recovery, and queries
 
-2026-09-13：
+| Decision | Rationale |
+| --- | --- |
+| Lifecycle owns state transactions; execution modules return typed results | Central revision/attempt checks prevent late work from overwriting newer intent. |
+| Same-content observation refreshes stat; callbacks merge current target state | Avoid repeated hashing after mtime changes and prevent old execution copies from erasing new observations. |
+| Default queries to eventual with a five-second total caller budget | Interactive callers can use valid current results and bound queueing/execution wait. |
+| Checkpoint yield requires durable resume data and actual invocation retirement | Cancellation, replacement, and priority changes cannot authorize overlapping same-file work. |
+| Query leases span embedding through backend exit | A caller timeout is not evidence that a collection can be destroyed. |
+| Cache complete validated vectors separately from search rows, under a bounded LRU | Renames can reuse calculations while old document visibility is revoked and physical rows are cleaned. |
+| Reconcile uncertain commits against durable state | Memory authorization must follow SQLite; stop publication when the outcome cannot be established. |
+| Validate borrowed source identity around checkpoints and results | Zero-copy must not populate old content caches with changed input; it still does not provide an atomic external snapshot. |
+| Keep a POSIX supervisor holding process ownership through descendant retirement | Hard host termination must not let reopened work overlap old native execution and source users. |
+| Separate temporary ScopeLease from persistent user cancellation | Host file operations need retirement without changing user intent. |
+| Persist processing pause before importing legacy cancellation/failure | Restart must not start expensive preparation before migration finishes; import replay must not undo later explicit retry. |
 
-- 保留 active_run_id、stage/state、attempts 和 attempt_token，不通过减少字段削弱身份校验。
-- 使用有界共享 Worker 池；Processor/Chunker 先申请资源再领取阶段，同一 Chunker 的后台与查询共享额度。Embedder 仅受各执行池容量限制，避免对象并发门或 heavy 额度让后台索引阻塞前台查询。
-- 配置变更统一接收，候选代原子切换；成功成员可部分发布，失败和取消成员保留诊断并可在新代重试，不混合模型。替换已有索引且新代零成功时继续保留旧配置。
-- 输入版本独立于处理配置代，旧查询可在相同输入的配置切换后完成，但源删除立即过滤。
-- 精确物理清理是独立持久责任；strong 就绪不等待删除清理，当前范围 wait 保留清理语义。
-- 启动恢复门支持宿主先恢复磁盘事务再执行；宿主事务日志与 StashBase 运行链迁移仍由应用负责。
-- grep 与排名搜索分别限制执行容量并共享总期限语义；单文件不可读返回结构化部分结果，原生调用的实际退休仍保留租约。
-- 候选声明与分批生成成员分开，重复维护可恢复缺失任务和丢失的提交确认；配置故障公开且相同请求可重试。
-- 检索命中保留 snapshot 身份至可见性过滤，GC 的 SQLite 忙竞争返回 busy，不混淆为持久存储故障。
+## Concurrent lifecycle decisions: 2026-09-13
 
-2026-09-13 边界修复：
+- Preserve `active_run_id`, `stage/state`, `attempts`, and `attempt_token`; reducing fields must not weaken identity checks.
+- Use a bounded file-worker pool with atomic Processor/Chunker resource admission. Grep chunking shares that adapter's admission. Embedder calls use worker/query capacities only; implementations own thread safety and service limits.
+- Accept configuration changes together and build a private candidate while the active generation serves valid sources. The original all-members-success promotion rule was superseded by the September 14 partial-publication decision below.
+- Separate source input identity from configuration generation. A captured old-generation query may finish after a same-input configuration change, while source deletion is filtered immediately.
+- Keep physical cleanup as exact durable debt. Strong readiness does not wait for already deleted sources' physical cleanup; current-work waits do.
+- Install a startup gate before execution/GC so the host can recover its own disk journal. The gate does not replace that journal.
+- Give grep and ranked search separate bounded pools and total deadlines. Per-file read failures become explicit partial grep results.
+- Separate candidate declaration from bounded member reconciliation. Repeated maintenance recovers missing members and lost commit acknowledgements; the same configuration request can retry maintenance failure.
+- Preserve snapshot identity until visibility filtering and report normal SQLite GC contention as busy.
 
-- 初始化所有权标记先于锁/catalog，schema 提交后移除；只恢复自有 bootstrap，不接管无关目录或 schema。
-- collection 删除与对应清理责任结清共用完成事务，等待按 namespace 创建代隔离。
-- 两个维护所有者按 namespace 调度；Milvus 的调用锁按 collection 隔离，保留固定版本的单 writer 约束。
-- Lite handler 不协作取消，RPC timeout 不能用来证明实际退出；由 MFS 的查询/维护期限监督调用方等待与发布资格，保留实际占用。
-- sync 报告记录 canonical 范围及别名涉及的附加范围，继续等待当前目标，不恢复历史回执。
-- blocking_reason 描述运行准入原因，不增加另一套 ready 状态。
+## Boundary decisions: 2026-09-14
+
+- Persist bootstrap ownership before lock/catalog creation, remove it after schema commit, and recover only recognized owned initialization state.
+- Settle collection deletion and its exact cleanup debt together; file waits remain isolated by namespace incarnation.
+- Use two maintenance owners, one per namespace at a time, and serialize backend calls per collection. This retains the pinned backend's single-writer requirement while allowing independent collections to overlap.
+- Do not infer Milvus handler retirement from an RPC timeout. The pinned Lite handler ignores cancellation; outer query/maintenance deadlines end waits or revoke commit authority while the real call retains ownership.
+- Preserve canonical sync scope and additional alias targets in reports; do not reintroduce historical wait receipts.
+- Publish successful candidate members atomically after all current members are terminal and execution retires. Retain failure/cancellation and permit explicit repair in the new generation. If a nonempty candidate has zero successes and the active generation has publications, keep the active generation unless disabling indexing. Never mix embedding spaces. This replaces the earlier all-members-success rule and its limited no-text cancellation exception.
+- Explain admission with computed `blocking_reason`, including actionable missing-binding failures, without another task/readiness state machine.
+
+Rejected or superseded proposals include External stable copies, global model inheritance, per-stage independent queues, SQLite document bodies, single-worker-only execution, and mandatory host-issued resource grants. Historical operation receipt interfaces were discussed but not selected. Host admission sharing remains optional.

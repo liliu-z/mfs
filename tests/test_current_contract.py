@@ -34,7 +34,7 @@ def test_docx_extraction_uses_one_derived_text_and_paragraph_locations(tmp_path:
         archive.writestr(
             "word/document.xml",
             '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
-            "<w:body><w:p><w:r><w:t>文档 needle</w:t></w:r></w:p>"
+            "<w:body><w:p><w:r><w:t>\u6587\u6863 needle</w:t></w:r></w:p>"
             "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>table content</w:t></w:r></w:p>"
             "</w:tc></w:tr></w:tbl></w:body></w:document>",
         )
@@ -43,7 +43,7 @@ def test_docx_extraction_uses_one_derived_text_and_paragraph_locations(tmp_path:
         mfs.create_namespace("n", "internal", processors=[DocxProcessor()])
         mfs.wait(mfs.upsert("n", "a.docx", source.getvalue()), 10)
         hit = mfs.search("n", "needle", mode="bm25").items[0].value
-        assert hit.text == "文档 needle\ntable content\n"
+        assert hit.text == "\u6587\u6863 needle\ntable content\n"
         assert hit.source_location.sources[0]["kind"] == "paragraphs"
         assert len(list((tmp_path / "state/namespaces").glob("*/derived/*.md"))) == 1
     finally:
