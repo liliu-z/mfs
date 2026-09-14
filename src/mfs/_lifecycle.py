@@ -44,6 +44,7 @@ from .errors import (
     ProcessingFailed,
     RetryableError,
     RuleConflict,
+    SourceExcluded,
     StorageFailed,
     Superseded,
     WaitTimeout,
@@ -84,7 +85,6 @@ class Lifecycle:
         self.last_activity = time.monotonic()
         self.targets: dict[DocumentId, dict[str, Any]] = {}
         self.build_targets: dict[DocumentId, dict[str, Any]] = {}
-        self.target_changed: Callable[[DocumentId], None] | None = None
         self.state_reconciled: Callable[[], None] | None = None
         self.pin_artifact: Callable[[str], ResourceLease] | None = None
         self.pending: dict[DocumentId, str] = {}
@@ -104,6 +104,8 @@ class Lifecycle:
         self.generation_bindings: Mapping[tuple[str, str], NamespaceBinding] = {}
         self.unavailable: Container[str] = ()
         self.storage_error: StorageFailed | None = None
+        self.claim_failures = 0
+        self.claim_retry_at = 0.0
         self.namespaces = dict(catalog.list_namespaces())
         with catalog.transaction():
             for ns, doc, encoded in catalog.query(
@@ -121,10 +123,24 @@ class Lifecycle:
                 catalog.put_namespace(name, record)
             for ns, doc, job in catalog.list_targets():
                 job.setdefault("identity", asdict(DocumentId(ns, doc)))
+                record = self.namespaces.get(ns, {})
                 # A legacy instance-wide rebuild is replaced by explicit namespace migrations.
                 if not ns:
                     job.update(state="succeeded")
                     catalog.put_target(ns, doc, job)
+                elif job["kind"] == "upsert" and excluded(
+                    tuple(IgnoreRule(**r) for r in record.get("rules", [])), doc
+                ):
+                    # Older versions could accept an input after its exclusion committed.
+                    # Recover the durable rule intent before restoring any execution.
+                    job = dict(
+                        self.delete_job(), incarnation=job["incarnation"], identity=job["identity"]
+                    )
+                    catalog.delete_document(ns, doc)
+                    catalog.put_target(ns, doc, job)
+                    catalog.put_build(ns, doc, None)
+                    catalog.put_build(ns, doc, None, document=True)
+                    self.build_targets.pop(DocumentId(ns, doc), None)
                 elif job["state"] in ("running", "blocked"):
                     job.update(state="pending", next_run=0)
                     catalog.put_target(ns, doc, job)
@@ -189,6 +205,24 @@ class Lifecycle:
 
     def work_target(self, identity: DocumentId, job: dict[str, Any]) -> dict[str, Any] | None:
         return (self.build_targets if job.get("build_generation") else self.targets).get(identity)
+
+    def current_candidate(self, identity: DocumentId) -> dict[str, Any] | None:
+        candidate = self.build_targets.get(identity)
+        desired = self.targets.get(identity, {})
+        generation = (
+            self.namespaces.get(identity.namespace, {}).get("building", {}).get("generation")
+        )
+        if (
+            candidate is not None
+            and desired.get("kind") == "upsert"
+            and candidate.get("build_generation") == generation
+            and candidate.get("source_revision") == desired.get("revision")
+        ):
+            return candidate
+        return None
+
+    def document_target(self, identity: DocumentId) -> dict[str, Any] | None:
+        return self.current_candidate(identity) or self.targets.get(identity)
 
     def load_work(self, identity: DocumentId, job: dict[str, Any]) -> dict[str, Any] | None:
         if job.get("build_generation"):
@@ -300,6 +334,8 @@ class Lifecycle:
                     )
         for current, job in [*self.targets.items(), *self.build_targets.items()]:
             if namespaces is not None and current.namespace not in namespaces:
+                continue
+            if job.get("build_generation") and self.current_candidate(current) is not job:
                 continue
             if (
                 not job.get("build_generation")
@@ -557,13 +593,13 @@ class Lifecycle:
         else:
             self.pending[identity] = str(job["revision"])
         self.track_queue(identity, job)
-        if self.target_changed is not None:
-            self.target_changed(identity)
         self.condition.notify_all()
 
     def persist(self, identity: DocumentId, job: dict[str, Any]) -> None:
         try:
             with self.catalog.transaction():
+                if self.load_work(identity, job) != self.work_target(identity, job):
+                    raise Superseded("durable task changed before this update")
                 self.store_work(identity, job)
                 if job.get("active_run_id"):
                     self.catalog.put_active(identity.namespace, identity.doc_id, job)
@@ -587,6 +623,16 @@ class Lifecycle:
             and current.get("build_generation") == job.get("build_generation")
             and (current["state"] != "cancelled" or bool(job.get("cleanup")))
             and current.get("attempt_token") == job.get("attempt_token")
+            and (
+                not job.get("build_generation")
+                or (
+                    self.current_candidate(identity) is current
+                    and (
+                        bool(job.get("cleanup"))
+                        or not self.catalog.cancelled(identity.namespace, identity.doc_id)
+                    )
+                )
+            )
             and (
                 job["kind"] != "upsert"
                 or job["stage"] == "process"
@@ -678,6 +724,8 @@ class Lifecycle:
     def runnable(self, identity: DocumentId, job: dict[str, Any]) -> bool:
         if self.boot_paused:
             return False
+        if job.get("build_generation") and self.current_candidate(identity) is not job:
+            return False
         if self.held(identity, job):
             return False
         if any(i == identity for i, _ in self.executing):
@@ -691,11 +739,13 @@ class Lifecycle:
                 and target.get("active_run_id") == active.get("active_run_id")
                 and target.get("build_generation") == active.get("build_generation")
                 and target["state"] in ("pending", "running", "retry_wait")
+                and (
+                    not active.get("build_generation") or self.current_candidate(identity) is target
+                )
             ):
                 return False
-            with self.catalog.transaction():
-                self.catalog.put_active(identity.namespace, identity.doc_id, None)
-            self.active.pop(identity, None)
+            # The next successful claim replaces stale active metadata atomically.
+            # Eligibility and queue hints must never perform durable writes.
         if job["state"] not in ("pending", "retry_wait") and not (
             job.get("cleanup") and job["state"] == "cancelled"
         ):
@@ -847,6 +897,11 @@ class Lifecycle:
         with self.condition:
             self.bound, self.unavailable = bound, unavailable
             while not self.stopping:
+                retry_in = self.claim_retry_at - time.monotonic()
+                if retry_in > 0:
+                    # All workers share the deadline; notifications cannot shorten backoff.
+                    self.condition.wait(retry_in)
+                    continue
                 now = time.time()
                 candidates, due_at = self.candidates()
                 for identity, current in candidates:
@@ -895,11 +950,44 @@ class Lifecycle:
                     job.setdefault("identity", asdict(identity))
                     try:
                         self.persist(identity, job)
-                    except Exception:
+                    except Superseded:
                         if lease is not None:
                             lease.release()
-                        self.condition.wait(0.25)
+                        try:
+                            durable = self.load_work(identity, job)
+                            if durable is not None:
+                                self.remember(identity, durable)
+                            elif job.get("build_generation"):
+                                self.build_targets.pop(identity, None)
+                            else:
+                                self.targets.pop(identity, None)
+                                self.pending.pop(identity, None)
+                                self.visible.pop(identity, None)
+                            self.queued_at.pop(identity, None)
+                            self.condition.notify_all()
+                        except Exception as error:
+                            self.storage_error = StorageFailed(
+                                f"cannot reconcile task claim: {error}"
+                            )
+                            self.stop()
+                            return None
                         break
+                    except Exception as error:
+                        if lease is not None:
+                            lease.release()
+                        self.claim_failures += 1
+                        if self.claim_failures >= 3:
+                            self.storage_error = StorageFailed(
+                                f"task claim could not persist after 3 attempts: {error}"
+                            )
+                            self.stop()
+                            return None
+                        self.claim_retry_at = time.monotonic() + 0.25 * 2 ** (
+                            self.claim_failures - 1
+                        )
+                        break
+                    self.claim_failures = 0
+                    self.claim_retry_at = 0.0
                     token = str(job["attempt_token"])
                     cancellation = Cancellation(self.stage_timeout)
                     self.queued_at.pop(identity, None)
@@ -1181,7 +1269,7 @@ class Lifecycle:
 
     def cancel(self, document_id: DocumentId) -> None:
         with self.condition:
-            previous = self.build_targets.get(document_id) or self.targets.get(document_id)
+            previous = self.document_target(document_id)
             if previous is None:
                 raise InvalidQuery("document has no task")
             if previous["state"] == "succeeded":
@@ -1221,7 +1309,7 @@ class Lifecycle:
                             (compact_json(debt), key),
                         )
             self.condition.notify_all()
-            previous = self.build_targets.get(document_id) or self.targets.get(document_id)
+            previous = self.document_target(document_id)
             if previous is None:
                 raise InvalidQuery("document has no task")
             if previous["state"] == "running":
@@ -1385,11 +1473,15 @@ class Lifecycle:
         with self.condition:
             if self.stopping:
                 raise Closed("MFS is closing")
-            ns = self.namespaces[identity.namespace]
+            ns = self.catalog.get_namespace(identity.namespace)
+            if ns is None:
+                raise Superseded("namespace was removed while preparing this input")
             if source.namespace_incarnation is not None and (
                 source.namespace_incarnation != ns["incarnation"]
             ):
                 raise Superseded("namespace was replaced while copying this input")
+            if excluded(tuple(IgnoreRule(**r) for r in ns.get("rules", [])), identity.doc_id):
+                raise SourceExcluded(f"{identity.namespace}:{identity.doc_id} is excluded")
             fingerprint = dict(
                 content_hash=source.content_hash,
                 media_type=source.media_type,
@@ -1672,7 +1764,7 @@ class ReadView:
         with self.condition:
             namespace = self._lifecycle.namespaces.get(identity.namespace)
             desired = self._lifecycle.targets.get(identity, {})
-            candidate = self._lifecycle.build_targets.get(identity, {})
+            candidate = self._lifecycle.current_candidate(identity) or {}
             return (
                 namespace is not None
                 and desired.get("kind") == "upsert"
@@ -1725,6 +1817,8 @@ class ReadView:
         def complete() -> bool:
             lifecycle = self._lifecycle
             self.require_modern_namespace(namespace)
+            if lifecycle.storage_error is not None:
+                raise lifecycle.storage_error
             if lifecycle.stopping:
                 raise Closed("MFS instance is closing")
             pending = False
@@ -1734,10 +1828,8 @@ class ReadView:
             for identity, desired in lifecycle.targets.items():
                 if identity.namespace != namespace or desired["kind"] != "upsert":
                     continue
-                candidate = lifecycle.build_targets.get(identity)
-                if building and (
-                    candidate is None or candidate.get("source_revision") != desired["revision"]
-                ):
+                candidate = lifecycle.current_candidate(identity)
+                if building and candidate is None:
                     pending = True
                     continue
                 job = candidate or desired

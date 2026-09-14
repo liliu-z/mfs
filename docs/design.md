@@ -48,7 +48,7 @@ mfs-state/
 
 External 只支持 sync，不提供 add/upsert/remove。MFS 记录原路径、观察到的 hash/stat 和处理状态，绝不复制外部原始数据；临时 staging、稳定快照、镜像、hardlink/reflink 备份和正文 JSON 缓存也不例外。外部文件随后改变、丢失或损坏由用户负责，读取可以失败。
 
-Internal 接收 upsert/remove，MFS 保存原件并负责其生命周期。
+Internal 接收 upsert/remove，MFS 保存原件并负责其生命周期。准备原件在状态锁外进行；最终接收在持锁时重新读取 SQLite 中的 namespace 与规则，再检查并写入目标。规则先提交则拒绝被排除输入，接收先提交则规则同步撤销其可见记录并写入删除目标；索引和无引用文件的物理清理异步执行。重开时将旧版本误接收的已排除目标归一为删除任务。
 
 Processor 路由决定哪些格式可以处理：显式 media type、注册的源后缀及 sniff 选择一个实现。没有对应 Processor 时不索引任意二进制文件。源从受支持变成不支持时仍撤销旧结果。
 
@@ -202,6 +202,10 @@ SQLite 自动升级至 schema 8，增加 active_runs、build_targets、build_doc
 
 状态命令在 SQLite 提交前或提交后抛错时，必须先从持久 namespace/target/document 重建内存资格，再释放 Lifecycle 锁。删除、规则、取消、重建和配置使用同一个事务核对入口；执行完成仍使用原有有条件重试/退休协议。核对失败就停止调度、撤销查询资格并报告 StorageFailed，旧许可不能继续提交。显式提供的新 Adapter 仅在持久 manifest 相符时绑定，包含重建已经提交但调用报错的情形。
 
+SQLite 是当前目标与配置的单一持久信源。内存刷新只更新缓存、执行取消信号和调度提示，不夹带候选成员的数据库写入；后台任务写入前在事务内核对持久目标与当前缓存，拒绝旧状态覆盖新目标。状态页按 namespace/doc_id 使用清理索引判断 cleanup_pending，不为每个文件反复解码整个清理队列。
+
+任务领取持久化失败由所有 Worker 共用连续失败预算和单调时钟退避期限，重试间隔为 0.25、0.5 秒，通知不能提前重试。连续三次失败后停止调度，status 显示 dirty，wait/strong 等待报告 StorageFailed；保留已接收输入，存储恢复后关闭并重开即可继续。一次成功领取清空预算；提交确认丢失时先核对持久值，已提交领取不计为失败。
+
 取消目标遇到索引重建时，用户取消门保持；已准备文字对应的索引阶段重置到 chunk，并清空旧计划及批次进度，不能在新的空 collection 上继续旧 publish。strong、wait_ready 和当前范围等待共享失败终态判断，failed/blocked/cancelled 立即报告 OperationFailed。
 
 External 准备以源 hash 和文件身份/变动时间建立校验。checkpoint 文件复制后、处理返回及缓存发布前重新检查；未被观察确认的改变，包括修改后恢复字节和 mtime，不能发布恢复数据或完整结果。兼容的同内容 sync 允许刷新 stat，并重新验证 hash。输入校验与外部写入并非原子快照：若其他写入者在处理期间改变、恢复内容并通过同内容观察更新 stat，MFS 无法证明 Processor 的全部读取属于同一瞬间。宿主自己的写入必须使用 Scope Lease 和路径互斥；需要更强读取语义的 Adapter 还须自行保证稳定输入。处理缓存使用新的格式键，避免继续复用旧版本未经此校验产生的条目。
@@ -236,13 +240,13 @@ checkpoint 仍持久保存恢复数据，并可在当前目录更紧急的任务
 
 configure_namespace(namespace, processors=..., chunker=..., embedder=..., indexing=...) 原子接收目标清单，返回 ConfigurationReport。比较兼容描述与模式，相同配置只换绑定。仅 Embedder 变动复用文字和兼容切片；Chunker 变动重切片；Processor 变化只重做受影响格式。reprocess_namespace 强制重处理，reindex 强制重建索引，两者复用同一协议。
 
-声明接收不逐个写入所有成员；维护线程每轮最多补齐 32 个缺失/过期候选目标，逐个释放生命周期锁，故障和重启均从持久声明恢复。成员目标和准备文字在同一事务保存；提交确认丢失时核对并采用精确的持久值。候选维护失败最多自动重试 5 次，以 pending_error/pending_failures/pending_retry_at 公开；重新提交相同清单重置故障预算，沿用原候选 revision。候选缺成员时 strong 文字就绪也必须等待补齐。重绑时在采用运行对象前原子复核 incarnation 和配置代，验证期间晋升/替换则拒绝过时绑定。
+声明接收不逐个写入所有成员；维护线程每轮最多处理 32 个与 SQLite 当前目标不一致的候选成员，包括新增、源替换、删除、取消和已准备文字复用，逐个释放生命周期锁，故障和重启均从持久声明恢复。成员目标和准备文字在同一事务保存；提交确认丢失时核对并采用精确的持久值。候选维护失败最多自动重试 5 次，以 pending_error/pending_failures/pending_retry_at 公开；重新提交相同清单重置故障预算，沿用原候选 revision。候选缺成员时 strong 文字就绪也必须等待补齐。重绑时在采用运行对象前原子复核 incarnation 和配置代，验证期间晋升/替换则拒绝过时绑定。
 
 维护重试计数覆盖晋升事务，只有完整一轮成功后才清除故障。成员尚未生成时，wait 等待候选补齐，不把活动代的旧失败误报为候选失败。晋升和 namespace 删除会移除不再使用的运行绑定；在途执行/查询保留自身对象引用到实际退出，闲置 Worker 不保留上一张执行许可。库不主动关闭宿主共享的 Adapter。
 
 grep_path 与内存索引文字并用时，已发布后的临时文字可释放。重开或配置变更需要该文字时，先退休 chunk/embed 阶段，再以 process 阶段重新申请 Processor/concurrency/资源额度；不能在切片或 embedding 的租约内直接运行 Processor。临时文字释放与同文件下一次执行领取受同一生命周期锁保护。
 
-G0 继续服务，G1 保存私有文字/索引。源变动更新两代的期望成员；同文件仍顺序执行。所有当前成员在 G1 成功才切换，失败或用户取消阻止切换而保留 G0。strong grep 可读取 G1 已完成的文字，不依赖其向量成功；eventual grep 留在 G0。
+G0 继续服务，G1 保存私有文字/索引。源变动更新两代的期望成员；同文件仍顺序执行。当前可用成员在 G1 成功后切换；已取消且两代均无有效准备文字的输入可以保持 cancelled 随新配置切换，不阻止其他文件获得新索引能力。存在准备文字的取消成员以及失败成员仍阻止切换，保留 G0。用户取消门始终保留，按文件/范围的 wait 仍报告取消，显式 retry 才恢复该输入。strong grep 可读取 G1 已完成的文字，不依赖其向量成功；eventual grep 留在 G0。
 
 configure_index 比较最新候选（无候选时比较 active），只改 paused 不覆盖候选模式；关闭后再开启同样以最后请求为准。开启自动追赶已接收输入，不触发 External sync；关闭保留准备文字，排名索引异步清理。再次改配置时只保留最新候选；过时调用在阶段边界和协作检查点提前退出；旧在途调用真实退出后才继续同文件。最多一个 active、一个 building，以及有界的 retiring generations；两代尚不能退休时暂停新 collection 创建。切换事务同时更新配置、collection 和 publication；提交后确认丢失也必须采用已持久配置对应的绑定。
 

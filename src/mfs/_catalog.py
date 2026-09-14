@@ -455,6 +455,16 @@ class Catalog:
         key = compact_json([namespace, doc_id, value["incarnation"], value["generation"], snapshot])
         self.execute("INSERT OR IGNORE INTO index_cleanup VALUES(?,?)", (key, compact_json(value)))
 
+    def cleanup_pending(self, namespace: str, doc_id: str) -> bool:
+        return (
+            self.one(
+                "SELECT 1 FROM index_cleanup WHERE json_extract(value,'$.namespace')=? "
+                "AND json_extract(value,'$.doc_id')=? LIMIT 1",
+                (namespace, doc_id),
+            )
+            is not None
+        )
+
     def cleanup_rows(self, namespace: str | None = None) -> list[tuple[str, dict[str, Any]]]:
         rows = self.query(
             "SELECT key,value FROM index_cleanup"

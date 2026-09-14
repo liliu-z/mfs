@@ -823,7 +823,7 @@ class MFS:
 
     def document_status(self, document_id: DocumentId) -> DocumentStatus | None:
         with self._call(activity=False), self._condition:
-            job = self._tasks.build_targets.get(document_id) or self._tasks.targets.get(document_id)
+            job = self._tasks.document_target(document_id)
             if job is None:
                 return None
             text_revision = self._catalog.get_document_revision(
@@ -832,6 +832,15 @@ class MFS:
                 candidate=bool(job.get("build_generation")),
             )
             progress = self._tasks.progress.get(document_id, job.get("progress"))
+            error = (
+                TaskError(
+                    job.get("error_code", "TaskFailed"), job["error"], bool(job.get("retryable"))
+                )
+                if job.get("error")
+                else TaskError("StorageFailed", str(self._tasks.storage_error), True)
+                if self._tasks.storage_error is not None and job["state"] != "succeeded"
+                else None
+            )
             return DocumentStatus(
                 document_id,
                 str(job["revision"]),
@@ -840,7 +849,7 @@ class MFS:
                 cast(TaskStage, job["stage"]),
                 cast(TaskState, job["state"]),
                 int(job["attempts"]),
-                job.get("error"),
+                error.message if error else None,
                 job.get("next_run") or None,
                 int(job.get("completed_batches", 0)),
                 int(job.get("batches", 0)),
@@ -849,21 +858,14 @@ class MFS:
                 job.get("media_type"),
                 job.get("source", {}).get("size"),
                 job.get("source", {}).get("mtime_ns"),
-                TaskError(
-                    job.get("error_code", "TaskFailed"), job["error"], bool(job.get("retryable"))
-                )
-                if job.get("error")
-                else None,
+                error,
                 Progress(float(progress["completed"]), progress.get("total"), progress.get("unit"))
                 if progress
                 else None,
                 tuple(job.get("artifacts", {})),
                 self._tasks.active.get(document_id, {}).get("active_run_id"),
                 self._tasks.active.get(document_id, {}).get("attempt_token"),
-                any(
-                    d["doc_id"] == document_id.doc_id
-                    for _, d in self._catalog.cleanup_rows(document_id.namespace)
-                ),
+                self._catalog.cleanup_pending(document_id.namespace, document_id.doc_id),
                 job.get("build_generation")
                 or self._tasks.namespaces.get(document_id.namespace, {}).get("index_epoch"),
             )

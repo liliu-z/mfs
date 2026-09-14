@@ -19,7 +19,6 @@ class Configuration:
     def __init__(self, lifecycle: Lifecycle, runtime: NamespaceRuntime) -> None:
         self.lifecycle, self.runtime = lifecycle, runtime
         self.catalog = lifecycle.catalog
-        lifecycle.target_changed = self.synchronize
         self.creating: set[str] = set()
         with lifecycle.condition, self.catalog.transaction():
             for namespace, record in lifecycle.namespaces.items():
@@ -120,11 +119,22 @@ class Configuration:
             rows = self.catalog.query(
                 "SELECT t.doc_id FROM targets t LEFT JOIN build_targets b "
                 "ON b.namespace=t.namespace AND b.doc_id=t.doc_id "
+                "LEFT JOIN documents d ON d.namespace=t.namespace AND d.doc_id=t.doc_id "
+                "LEFT JOIN cancel_gates c ON c.namespace=t.namespace AND c.doc_id=t.doc_id "
                 "WHERE t.namespace=? AND t.doc_id!='' "
-                "AND json_extract(t.value,'$.kind')='upsert' AND "
-                "(b.doc_id IS NULL OR json_extract(b.value,'$.source_revision')!=t.revision "
-                "OR json_extract(b.value,'$.build_generation')!=?) ORDER BY t.doc_id LIMIT 32",
-                (namespace, generation),
+                "AND ((json_extract(t.value,'$.kind')!='upsert' AND b.doc_id IS NOT NULL) OR "
+                "(json_extract(t.value,'$.kind')='upsert' AND "
+                "(b.doc_id IS NULL OR json_extract(b.value,'$.source_revision') IS NOT t.revision "
+                "OR json_extract(b.value,'$.build_generation') IS NOT ? "
+                "OR (c.doc_id IS NOT NULL "
+                "AND json_extract(b.value,'$.state') NOT IN ('cancelled','succeeded')) "
+                "OR (json_extract(b.value,'$.stage')='process' "
+                "AND json_extract(b.value,'$.state')!='running' "
+                "AND NOT coalesce(json_extract(b.value,'$.refresh_text'),0) AND NOT ? "
+                "AND json_extract(b.value,'$.processor') IS json_extract(t.value,'$.processor') "
+                "AND json_extract(d.value,'$.revision')=t.revision)))) "
+                "ORDER BY t.doc_id LIMIT 32",
+                (namespace, generation, bool(building.get("force_process"))),
             )
         for (doc_id,) in rows:
             with lifecycle.condition:
@@ -142,7 +152,7 @@ class Configuration:
         building = record.get("building")
         if not building or not identity.doc_id:
             return
-        desired = lifecycle.targets.get(identity, {})
+        desired = self.catalog.get_target(identity.namespace, identity.doc_id) or {}
         previous = lifecycle.build_targets.get(identity)
         if desired.get("kind") != "upsert":
             self.store_member(identity, None, None)
@@ -236,7 +246,7 @@ class Configuration:
         self, identity: DocumentId, job: dict[str, Any] | None, prepared: dict[str, Any] | None
     ) -> None:
         try:
-            with self.catalog.transaction():
+            with self.lifecycle.state_transaction():
                 self.catalog.put_build(identity.namespace, identity.doc_id, job)
                 self.catalog.put_build(identity.namespace, identity.doc_id, prepared, document=True)
         except Exception:
@@ -411,12 +421,24 @@ class Configuration:
             for i, j in lifecycle.targets.items()
             if i.namespace == namespace and j["kind"] == "upsert"
         }
-        if any(
-            lifecycle.build_targets.get(i, {}).get("state") != "succeeded"
-            or lifecycle.build_targets[i].get("source_revision") != j["revision"]
-            for i, j in members.items()
-        ):
+        if any(i.namespace == namespace and i not in members for i in lifecycle.build_targets):
+            # Removed members still own private records and cleanup. Reconcile them
+            # before publishing; a delayed maintenance pass cannot restore old intent.
             return
+        for identity, desired in members.items():
+            candidate = lifecycle.build_targets.get(identity, {})
+            if candidate.get("source_revision") != desired["revision"]:
+                return
+            if candidate.get("state") == "succeeded":
+                continue
+            if (
+                candidate.get("state") != "cancelled"
+                or self.catalog.get_document(namespace, identity.doc_id) is not None
+                or self.catalog.get_build(namespace, identity.doc_id, document=True) is not None
+            ):
+                return
+            # A stopped input with no prepared text has no result to preserve in G0.
+            # Carry its cancellation into G1 without blocking the usable members.
         if any(i.namespace == namespace for i, _ in lifecycle.executing):
             return
         updated = copy.deepcopy(previous)
